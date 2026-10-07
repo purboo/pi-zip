@@ -70,8 +70,8 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 	async function runCold(entries: Any[]) {
 		const r = await rig(entries, COLD_TS());
 		await r.fire("before_agent_start", {});
-		const req1 = await r.fire("context", { messages: flat(entries) });
-		const req2 = await r.fire("context", { messages: [...flat(entries), ...flat(tail)] });
+		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
+		const req2 = await r.fire("context_with_system", { messages: [...flat(entries), ...flat(tail)] });
 		const all = [...entries, ...tail, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6", 1));
 		return { r, req1, req2, all, te, projected: flat(project(all, te.entries)) };
@@ -89,7 +89,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 
 	test("after the persist the next request needs no local edit (the session projection already carries it)", async () => {
 		const { r, all, projected } = await runCold(cold);
-		const next = await r.fire("context", { messages: projected });
+		const next = await r.fire("context_with_system", { messages: projected });
 		expect(next).toBeUndefined();
 		expect(all.length).toBeGreaterThan(0);
 	});
@@ -108,7 +108,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.01 } } });
 		const r = await rig(big, COLD_TS(), { modelRegistry: { complete } });
 		await r.fire("before_agent_start", {});
-		const req1 = await r.fire("context", { messages: flat(big) });
+		const req1 = await r.fire("context_with_system", { messages: flat(big) });
 		expect(req1.messages[0].role).toBe("compactionSummary");
 		const all = [...big, A("a6")];
 		const te = await r.fire("turn_end", turnEnd(all, "a6"));
@@ -133,7 +133,7 @@ describe("F12 summary prepared while the user is away", () => {
 		r.ctx.sessionManager.getBranch = () => [...branchOf(done, COLD_TS()), settled.entries.at(-1)];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
 		await r.fire("before_agent_start", {});
-		const req = await r.fire("context", { messages: flat(back) });
+		const req = await r.fire("context_with_system", { messages: flat(back) });
 		expect(req.messages[0].role).toBe("compactionSummary");
 		expect(calls).toBe(1); // no second model call at return
 		await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
@@ -234,7 +234,7 @@ describe("I4 off is a strict no-op", () => {
 		r.notes.length = 0; // the command's own confirmation is the only message allowed
 		const msgs = flat(prevRun);
 		expect(await r.fire("before_agent_start", {})).toBeUndefined();
-		expect(await r.fire("context", { messages: msgs })).toBeUndefined();
+		expect(await r.fire("context_with_system", { messages: msgs })).toBeUndefined();
 		const all = [...prevRun, A("a4")];
 		expect(await r.fire("turn_end", turnEnd(all, "a4"))).toBeUndefined();
 		expect(await r.fire("agent_before_settle", { context: { contextEntries: all }, entries: [] })).toBeUndefined();
@@ -243,7 +243,7 @@ describe("I4 off is a strict no-op", () => {
 		// same scenario with zip on does change things (the test would be vacuous otherwise)
 		const on = await rig(prevRun, COLD_TS());
 		await on.fire("before_agent_start", {});
-		expect(await on.fire("context", { messages: msgs })).toBeDefined();
+		expect(await on.fire("context_with_system", { messages: msgs })).toBeDefined();
 		expect(await on.fire("before_provider_request", { payload: orphan })).toBeDefined();
 		await r.handlers.get("cmd:zip").handler("on", r.ctx); // and /zip on resumes
 		expect(r.appended.at(-1)).toMatchObject({ data: { off: false } });
@@ -256,7 +256,7 @@ describe("I4 off is a strict no-op", () => {
 		const r2 = await rig(prevRun, COLD_TS(), { branch: [...branchOf(prevRun, COLD_TS()), r.appended.at(-1)] });
 		await r2.fire("session_start", { reason: "startup" });
 		await r2.fire("before_agent_start", {});
-		expect(await r2.fire("context", { messages: flat(prevRun) })).toBeUndefined();
+		expect(await r2.fire("context_with_system", { messages: flat(prevRun) })).toBeUndefined();
 	});
 
 	test("the recall tool stays registered while off (earlier folds must stay recallable)", async () => {
@@ -399,7 +399,7 @@ describe("I6 warm cache: nothing changes unless the window is nearly full", () =
 		const stale = { type: "custom", customType: "pi-zip/plan", data: { policy: "pi-zip", targets: [], summary: null } };
 		const r = await rig(entries, WARM_TS(), { branch: [...branchOf(entries, WARM_TS()), stale] });
 		await r.fire("before_agent_start", {});
-		expect(await r.fire("context", { messages: flat(entries) })).toBeUndefined();
+		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
 		expect(r.notes).toEqual([]);
 		expect(planContext(entries, { mode: "hot", base: 0, cwd: ".", model: r.ctx.model })).toBeNull();
@@ -432,7 +432,7 @@ describe("coexistence (F14)", () => {
 		const r = await rig(entries, COLD_TS(), {}, other);
 		await r.fire("session_start", {});
 		await r.fire("before_agent_start", {});
-		expect(await r.fire("context", { messages: flat(entries) })).toBeUndefined();
+		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("a4")], "a4"))).toBeUndefined();
 		expect(await r.fire("before_provider_request", { payload: { messages: [{ role: "tool", tool_call_id: "gone", content: "x" }] } })).toBeDefined();
 		expect(r.notes).toHaveLength(1);

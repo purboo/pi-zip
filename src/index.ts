@@ -11,7 +11,7 @@ export default function piZip(pi: ExtensionAPI) {
 	registerZipCommand(pi, zip);
 	pi.on("session_start", (_e, ctx) => zip.sessionStart(ctx));
 	pi.on("before_agent_start", (_e, ctx) => zip.beforeAgentStart(ctx));
-	pi.on("context", (e, ctx) => zip.context(e, ctx));
+	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them
 	pi.on("turn_end", (e, ctx) => zip.turnEnd(e, ctx));
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
 	pi.on("before_provider_request", (e) => zip.providerRequest(e));

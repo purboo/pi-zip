@@ -1,6 +1,7 @@
 // Pure planning: session projection -> which outputs to fold, whether to summarise, where to cut (F5-F10).
 import { classifyRecoverability, type Recover } from "./classify.ts";
 import { handleFor, makePlaceholderFor, pickKeyLines, shortArgs } from "./placeholder.ts";
+import { createHash } from "node:crypto";
 import { type Any, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
 
@@ -83,6 +84,8 @@ export function toolCallIndex(blocks: Block[]): Calls {
 export interface FoldTarget {
 	entryId: string;
 	toolCallId: string;
+	visIdx: number; // index among the non-system projected messages when planned (-1 = unknown)
+	contentKey: string; // hash + length of the original text: some servers reuse tool call ids, so the id alone does not identify a result
 	tool: string;
 	args: string;
 	entryTokens: number;
@@ -117,6 +120,7 @@ export interface RunPlan {
 	persisted: boolean;
 	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
 	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
+	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 }
 
 export interface PlanOpts {
@@ -149,6 +153,12 @@ export interface PlanResult {
 	cutKeptFirstMsg: Any;
 }
 
+/** Identity of a tool result's text, independent of its tool call id. */
+export const contentKeyOf = (content: Any): string => {
+	const t = textOf(content);
+	return `${createHash("sha1").update(t).digest("hex")}:${t.length}`;
+};
+
 export const foldThreshold = (model: Any): number | null => (Number(model?.contextWindow) > 0 ? FOLD_AT * Number(model.contextWindow) : null);
 export const summaryThreshold = (model: Any): number | null => (Number(model?.contextWindow) > 0 ? SUMMARY_AT * Number(model.contextWindow) : null);
 
@@ -173,6 +183,16 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	if (mode === "hot" && !(foldAt !== null && ctxTokens > foldAt)) return null; // I6: warm cache below the pressure line -> never edit
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
+	const visOfBlock: number[] = []; // block idx -> index among the non-system projected messages (the numbering a request view uses)
+	{
+		let vis = 0;
+		for (const pe of entries) {
+			const msgs: Any[] = pe.messages ?? [];
+			if (!msgs.length) continue;
+			visOfBlock.push(vis);
+			for (const m of msgs) if (String(m?.role ?? "") !== "system") vis++;
+		}
+	}
 	const classify = (b: Block): Recover => {
 		const call = calls.get(b.msg.toolCallId);
 		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd);
@@ -185,7 +205,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		if (!(phTok < 0.9 * b.tokens)) return false;
 		tokOverride.set(b.idx, phTok);
 		const call = calls.get(b.msg.toolCallId);
-		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
+		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
 		return true;
 	};
 	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin;
@@ -273,35 +293,94 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 const sameMsg = (a: Any, b: Any): boolean =>
 	!!a && !!b && String(a?.role ?? "") === String(b?.role ?? "") && JSON.stringify(a?.content ?? "") === JSON.stringify(b?.content ?? "");
 
+const isSystem = (m: Any) => String(m?.role ?? "") === "system";
+
 /**
- * Request-local view of a plan: fold its targets and (when planned) replace the summarised prefix with the compaction
- * message, which is exactly what the persisted edits project after turn_end (I1). null = nothing to apply. A cut whose
- * kept boundary cannot be located in the given messages is dropped (folds still apply); an inconsistent split is never sent.
+ * Replay every system message into the one leading message Pi puts at the head of a compacted projection
+ * (same rules as pi-ai getCurrentSystemMessage; the integration test checks the two agree).
+ */
+export function collapseSystem(messages: Any[]): Any | undefined {
+	const content: string[] = [];
+	const sections = new Map<string, string>();
+	const tools = new Map<string, Any>();
+	let timestamp: number | undefined;
+	for (const m of messages) {
+		if (!isSystem(m)) continue;
+		timestamp ??= m.timestamp;
+		const text = textOf(m.content);
+		if (text.length > 0) content.push(text);
+		for (const [name, value] of Object.entries(m.sections ?? {})) {
+			if (value === null) sections.delete(name);
+			else sections.set(name, value as string);
+		}
+		for (const t of m.toolsRemoved ?? []) tools.delete(t.name);
+		for (const t of m.toolsAdded ?? []) tools.set(t.name, t);
+	}
+	if (timestamp === undefined && tools.size === 0) return undefined;
+	return {
+		role: "system",
+		content: content.join("\n\n"),
+		...(sections.size > 0 ? { sections: Object.fromEntries(sections) } : {}),
+		...(tools.size > 0 ? { toolsAdded: [...tools.values()] } : {}),
+		timestamp: timestamp ?? 0,
+	};
+}
+
+/**
+ * Request-local view of a plan over the COMPLETE transcript (the `context_with_system` form): fold targets are replaced
+ * in place, system messages stay exactly where they are (so the request is byte-identical before and after turn_end
+ * persists the same edits, I1). With a cut, the view is what Pi projects after the compaction: the replayed system
+ * message, the summary, then the kept non-system messages. null = nothing to apply. A cut whose kept boundary cannot be
+ * located is dropped (folds still apply); an inconsistent split is never sent.
  */
 export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; droppedCut: boolean } | null {
 	if (!plan || plan.persisted || (!plan.folds.length && !plan.cut)) return null;
-	let cutIdx = -1;
+	const vis: number[] = []; // indices of the non-system messages
+	messages.forEach((m, i) => { if (!isSystem(m)) vis.push(i); });
+	let cutAt = -1; // index into `messages`
 	let droppedCut = false;
 	if (plan.cut) {
-		cutIdx = plan.cutVisibleIdx ?? -1;
-		if (cutIdx < 0 || cutIdx >= messages.length || !sameMsg(messages[cutIdx], plan.cutKeptFirstMsg)) {
+		const v = plan.cutVisibleIdx ?? -1;
+		cutAt = v >= 0 && v < vis.length ? vis[v] : -1;
+		if (cutAt < 0 || !sameMsg(messages[cutAt], plan.cutKeptFirstMsg)) {
 			plan.cut = null;
-			cutIdx = -1;
+			cutAt = -1;
 			droppedCut = true;
 		}
 	}
-	const byCall = new Map(plan.folds.map((t) => [t.toolCallId, t]));
+	// match each result to its target: by position when the position still holds the same result, else by (call id, content) when that is unique
+	const used = new Set<FoldTarget>();
+	const byKey = new Map<string, FoldTarget[]>();
+	const key = (id: string, ck: string) => `${id}|${ck}`;
+	for (const t of plan.folds) {
+		const k = key(t.toolCallId, t.contentKey);
+		byKey.set(k, [...(byKey.get(k) ?? []), t]);
+	}
+	const byPos = new Map<number, FoldTarget>();
+	for (const t of plan.folds) if (t.visIdx >= 0) byPos.set(t.visIdx, t);
 	let changed = false;
+	let v = -1;
 	const folded = messages.map((m: Any, i: number) => {
-		if (cutIdx >= 0 && i < cutIdx) return m; // replaced by the compaction message below
-		const t = m?.role === "toolResult" ? byCall.get(m.toolCallId) : undefined;
-		if (!t || textOf(m.content).startsWith(PH_MARK)) return m; // not ours, or the persisted edit already folded it
+		if (isSystem(m)) return m;
+		v++;
+		if (cutAt >= 0 && i < cutAt) return m; // replaced by the compaction message below
+		if (m?.role !== "toolResult" || textOf(m.content).startsWith(PH_MARK)) return m; // not ours, or the persisted edit already folded it
+		const ck = contentKeyOf(m.content);
+		let t = byPos.get(v);
+		if (!t || used.has(t) || t.toolCallId !== m.toolCallId || t.contentKey !== ck) {
+			const c = byKey.get(key(m.toolCallId, ck));
+			t = c && c.length === 1 && !used.has(c[0]) ? c[0] : undefined;
+		}
+		if (!t) return m;
+		used.add(t);
 		changed = true;
 		return { ...m, content: [{ type: "text", text: t.ph }] };
 	});
-	if (cutIdx >= 0) {
+	if (cutAt >= 0) {
 		const c = plan.cut!;
-		return { messages: [{ role: "compactionSummary", summary: c.text, tokensBefore: c.prefixTokens, timestamp: Date.now() }, ...folded.slice(cutIdx)], droppedCut };
+		const head = collapseSystem(messages);
+		const kept = folded.slice(cutAt).filter((m: Any) => !isSystem(m));
+		return { messages: [...(head ? [head] : []), { role: "compactionSummary", summary: c.text, tokensBefore: c.prefixTokens, timestamp: plan.cutTs ??= Date.now() }, ...kept], droppedCut };
 	}
 	return changed || droppedCut ? { messages: folded, droppedCut } : null;
 }
