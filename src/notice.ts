@@ -9,7 +9,7 @@ export interface NoticeAction {
 	tokensAfter: number;
 	ms: number;
 	prepared?: boolean; // summary computed while the user was away
-	pressure?: boolean; // done because the context window is nearly full, not because the cache was cold
+	pressure?: boolean; // done by the warm valve (the context is above V while the cache is still warm), not because the cache was cold
 }
 
 export const fmtK = (tokens: number): string => `${tokens >= 99_500 ? Math.round(tokens / 1000) : Math.round(tokens / 100) / 10}K`;
@@ -19,7 +19,7 @@ export function noticeText(actions: NoticeAction[]): string {
 		const sizes = `${fmtK(a.tokensBefore)} → ${fmtK(a.tokensAfter)} tokens`;
 		if (a.kind === "fold") {
 			const ms = a.ms < 10 ? (Math.round(a.ms * 10) / 10).toFixed(1) : String(Math.round(a.ms));
-			return `folded ${a.count} old output${a.count === 1 ? "" : "s"} · ${sizes} · ${ms} ms · originals recallable${a.pressure ? " · context window nearly full" : ""}`;
+			return `folded ${a.count} old output${a.count === 1 ? "" : "s"} · ${sizes} · ${ms} ms · originals recallable${a.pressure ? " · context over the warm-cache limit" : ""}`;
 		}
 		const s = (Math.round(a.ms / 100) / 10).toFixed(1);
 		return `summarized ${a.count} request${a.count === 1 ? "" : "s"} · ${sizes} · ${a.prepared ? `${s} s (done while you were away)` : `waited ${s} s`}`;
@@ -42,14 +42,14 @@ export class Stats {
 	summaryUsd = 0; // what the narrative model calls cost
 	recalls = 0;
 	recallChars = 0;
-	pressureEdits = 0;
-	pressureRewriteTokens = 0; // upper bound: a pressure edit may rewrite the whole context
+	pressureEdits = 0; // warm-valve edits
+	pressureRewriteTokens = 0; // upper bound: a valve edit on a warm cache may rewrite the whole context
 	writeSavedTokens = 0; // tokens NOT rewritten at a cold return
 	readSavedTokens = 0; // tokens NOT read, summed over every request sent after an edit
 	activeSaved = 0; // tokens currently removed from the context by our edits
 	notices = 0;
 
-	/** Estimated $ saved versus doing nothing: avoided cache writes and reads, minus summary calls, recalled content re-entering the context, and pressure rewrites. */
+	/** Estimated $ saved versus doing nothing: avoided cache writes and reads, minus summary calls, recalled content re-entering the context, and warm-valve rewrites. */
 	savedUsd(p: Prices | null): number | null {
 		if (!p) return null;
 		const gross = (this.writeSavedTokens * p.cacheWrite + this.readSavedTokens * p.cacheRead) / 1e6;
@@ -73,7 +73,7 @@ export function statsText(s: Stats, model: Any): string {
 		`${PRODUCT} stats (since pi started): folded ${s.folds} output${s.folds === 1 ? "" : "s"} (${fmtK(s.foldedTokens)} tokens), ` +
 		`${s.summaries} summar${s.summaries === 1 ? "y" : "ies"} (${fmtK(s.summarizedTokens)} tokens, ${(s.summaryMs / 1000).toFixed(1)} s waited, $${s.summaryUsd.toFixed(4)}), ` +
 		`${s.recalls} recall${s.recalls === 1 ? "" : "s"} (~${fmtK(s.recallChars / 4)} tokens re-read). ` +
-		`Estimated saved vs doing nothing: ${money}, counting avoided cache writes and reads minus summary calls, recalled content and window-pressure rewrites; token counts are chars/4 estimates.`
+		`Estimated saved vs doing nothing: ${money}, counting avoided cache writes and reads minus summary calls, recalled content and warm-valve rewrites; token counts are chars/4 estimates.`
 	);
 }
 
@@ -102,7 +102,7 @@ export function registerZipCommand(pi: ExtensionAPI, zip: ZipControl) {
 					return;
 				} catch {}
 			}
-			process.stdout.write(text + "\n");
+			process.stderr.write(text + "\n"); // stdout carries the program's own output (JSON mode): never mix command text into it
 		},
 	});
 }
