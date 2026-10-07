@@ -1,0 +1,31 @@
+{
+  "name": "pi-zip",
+  "version": "0.1.0",
+  "description": "Keeps long Pi sessions cheap without losing anything: folds old tool output only when the prompt cache has already gone cold, and every fold can be recalled byte for byte. Zero config.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context",
+    "cache",
+    "compaction"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "build-check": "bun build src/index.ts --target=node --external '@earendil-works/*' --outfile /dev/null"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
