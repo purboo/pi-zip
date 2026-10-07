@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { applyPlanToMessages, buildBlocks, planContext, RELAX_PREV_TURN, summaryGainOk, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { A, AX, flat, R, U } from "./helpers.ts";
 
-const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, base: 0, cwd: process.cwd(), promptPending: true, ...over });
+const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, sys: 0, cwd: process.cwd(), promptPending: true, ...over });
 
 // settle view of a finished run: 2 user turns, big outputs in both
 const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];

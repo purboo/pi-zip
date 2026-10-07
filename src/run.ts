@@ -6,11 +6,11 @@ import { dirname } from "node:path";
 import { detectCold, modelKey, ttlFor } from "./cache.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { Stats, noticeText, statsText, type NoticeAction, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, countUserTurns, planContext, reserveTokensFor, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, planContext, reserveTokensFor, type Block, type Calibration, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
 import { handleFor } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, PRODUCT, clamp, tok4 } from "./util.ts";
+import { type Any, PRODUCT, tok4 } from "./util.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
@@ -26,18 +26,6 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
 	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
 	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
-}
-
-/** Tokens of the request view that preceded block `upTo`, with a not-yet-persisted plan applied (that is what was really sent). */
-export function viewTokensBefore(blocks: Block[], upTo: number, plan: RunPlan | null): number {
-	const cutIdx = plan?.cut ? blocks.findIndex((b) => b.entryId === plan.cut!.firstKeptEntryId) : -1;
-	const folded = new Map((plan?.folds ?? []).filter((t) => !plan!.applied || plan!.applied.has(t.entryId)).map((t) => [t.entryId, t.phTokens]));
-	let sum = cutIdx > 0 && cutIdx <= upTo ? plan!.cut!.summaryTokens : 0;
-	for (let i = Math.max(cutIdx, 0); i < upTo; i++) {
-		const id = blocks[i].entryId;
-		sum += (id ? folded.get(id) : undefined) ?? blocks[i].tokens;
-	}
-	return sum;
 }
 
 /** A summary being prepared (or finished) while the user is away. It has its own AbortController: no run owns it. */
@@ -71,7 +59,6 @@ export class Zip implements ZipControl {
 	private runChecked = true; // the first request of the run has been looked at
 	private runEdits = false; // this run carries an edit plan that turn_end has yet to persist
 	private runPlan: RunPlan | null = null;
-	private base = 0;
 	private lastReqMs = 0; // the real-time cache clock: newest request start or end
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
 	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
@@ -125,8 +112,19 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm"): PlanOpts {
-		return { mode, base: this.base || tok4(ctx.getSystemPrompt?.() ?? "") + 1500, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, reserve: this.reserve(ctx), steerIds: this.steerIds };
+	private sysTokens(ctx: Any): number {
+		try {
+			return tok4(ctx.getSystemPrompt?.() ?? "");
+		} catch {
+			return 0;
+		}
+	}
+
+	/** Plan options with the token scale read from the branch (stateless: a fresh process calibrates exactly like a long-lived one). */
+	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[]): { o: PlanOpts; cal: Calibration } {
+		const sys = this.sysTokens(ctx);
+		const cal = calibrate(entries, sys);
+		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, reserve: this.reserve(ctx), steerIds: this.steerIds } };
 	}
 
 	private detectConflict(ctx: Any) {
@@ -196,7 +194,6 @@ export class Zip implements ZipControl {
 			if (en?.type !== "custom" || en.customType !== PLAN_CUSTOM) continue;
 			if (en.data?.policy === PRODUCT) {
 				if (cold && Array.isArray(en.data.targets)) this.settleIds = en.data.targets.map((t: Any) => (typeof t === "string" ? t : t?.entryId)).filter((x: Any) => typeof x === "string");
-				if (cold && en.data.baseTokens && !this.base) this.base = en.data.baseTokens; // same ctx math at settle and at return
 			}
 			break;
 		}
@@ -265,7 +262,8 @@ export class Zip implements ZipControl {
 	private async computeRunPlan(ctx: Any) {
 		const t0 = performance.now();
 		const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-		const p = planContext(entries, this.opts(ctx, false, this.cold ? "cold" : "warm"));
+		const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries);
+		const p = planContext(entries, o);
 		if (!this.cold && !p) {
 			this.discardBg(); // a warm return below the valve: a prepared summary does not pay back
 			return;
@@ -295,9 +293,14 @@ export class Zip implements ZipControl {
 				else { folds = []; cut = null; }
 			}
 		}
-		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
-		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, persisted: false, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg };
-		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
+		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - cal.k * (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
+		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, k: cal.k, persisted: false, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg };
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ...this.calOf(cal), ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
+	}
+
+	/** Ledger form of a calibration; ctxBefore/ctxAfter next to it are already scaled (k x estimate). */
+	private calOf(cal: Calibration) {
+		return { k: Math.round(cal.k * 1000) / 1000, calReal: cal.real, calEst: Math.round(cal.est), calSource: cal.source };
 	}
 
 	private usageOf(cut: Cut) {
@@ -314,7 +317,8 @@ export class Zip implements ZipControl {
 		if (!this.active() || !ctx.hasUI) return undefined;
 		try {
 			const t0 = performance.now();
-			const p = planContext(e.context.contextEntries, this.opts(ctx, true, "cold"));
+			const { o, cal } = this.opts(ctx, true, "cold", e.context.contextEntries);
+			const p = planContext(e.context.contextEntries, o);
 			if (!p) return undefined;
 			this.cancelTimer();
 			let scheduledMs: number | null = null;
@@ -328,10 +332,10 @@ export class Zip implements ZipControl {
 			} else {
 				this.discardBg();
 			}
-			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, timerMs: scheduledMs, ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
+			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, timerMs: scheduledMs, ...this.calOf(cal), ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
 			if (!p.folds.length && p.cutIdx === null) return undefined;
 			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
-			const data = { policy: PRODUCT, ts: Date.now(), baseTokens: Math.round(this.base || p.ctxTokens - p.blocks.reduce((a, b) => a + b.tokens, 0)), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
+			const data = { policy: PRODUCT, ts: Date.now(), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
 			return { entries: [...e.entries, { type: "custom", customType: PLAN_CUSTOM, data }] };
 		} catch (err) {
 			this.ledger({ type: "error", where: "settle", error: errText(err) });
@@ -399,19 +403,9 @@ export class Zip implements ZipControl {
 		const blocks = buildBlocks(e.context.contextEntries, this.steerIds);
 		if (!blocks.length) return undefined;
 		const userTurns = countUserTurns(blocks);
-		// calibrate the base overhead from the real usage of the request that produced this assistant message: what was SENT is the
-		// view with this run's plan applied, not the unedited projection
-		const ai = blocks.findIndex((b) => b.entryId === e.messageEntryId);
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
-		const carrying = this.runEdits && !!this.runPlan && !this.runPlan.persisted;
-		if (!failed && ai >= 0 && usageTotal > 0) {
-			const b = usageTotal - viewTokensBefore(blocks, ai, carrying ? this.runPlan : null);
-			if (b > 0) this.base = clamp(b, 0, 40_000); // a non-positive difference is an estimate error, not a zero base: keep the old one
-		}
-		if (!this.base) this.base = tok4(ctx.getSystemPrompt?.() ?? "") + 1500;
-		const ctxTokens = this.base + blocks.reduce((a, b) => a + b.tokens, 0);
-		const o = { t0, blocks, userTurns, ctxTokens, usageTotal };
+		const o = { t0, blocks, userTurns, sys: this.sysTokens(ctx), usageTotal };
 		if (this.runEdits) {
 			this.runEdits = false;
 			if (!this.runPlan?.sent && this.runPlan && (this.runPlan.folds.length || this.runPlan.cut)) {
@@ -424,26 +418,29 @@ export class Zip implements ZipControl {
 		}
 		if (failed) return undefined;
 		// warm cache: nothing, unless the context passed the valve V (I6, F10): then the same plan as cold, from the next request on
-		const p = planContext(e.context.contextEntries, this.opts(ctx, false, "warm"));
+		const { o: popts } = this.opts(ctx, false, "warm", e.context.contextEntries); // the message that just ended carries the newest usage
+		const p = planContext(e.context.contextEntries, popts);
 		if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
 		let cut: Cut | null = null;
 		if (p.cutIdx !== null) {
 			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal);
 			cut = got.cut ?? (await buildCut(p, ctx)); // the user is here and the cache is warm; the alternative is Pi's lossy compaction
 		} else this.discardBg();
-		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, persisted: false };
+		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, k: p.k, persisted: false };
 		return this.commit(e, ctx, plan, o);
 	}
 
-	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; ctxTokens: number; usageTotal: number }) {
+	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; sys: number; usageTotal: number }) {
 		plan.persisted = true;
+		const k = plan.k; // one scale for the whole run: stats, notices and the ledger agree with what the plan compared against the limits
+		const ctxTokens = k * (o.sys + o.blocks.reduce((a, b) => a + b.tokens, 0));
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
 		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
 		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
 		const stale = plan.folds.length - live.length; // e.g. Pi auto-compaction removed them from the projection
 		const cut = plan.cut && byId.has(plan.cut.firstKeptEntryId) ? plan.cut : null;
 		if (!live.length && !cut) {
-			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: o.ctxTokens, ...(stale ? { staleTargets: stale } : {}) });
+			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: Math.round(ctxTokens), ...(stale ? { staleTargets: stale } : {}) });
 			return undefined;
 		}
 		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
@@ -454,9 +451,9 @@ export class Zip implements ZipControl {
 		}
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
 		if (cut) ours.push({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger }, usage: cut.usage });
-		const before = live.reduce((a, t) => a + t.entryTokens, 0);
-		const after = live.reduce((a, t) => a + t.phTokens, 0);
-		const cutSaved = cut ? cut.prefixTokens - cut.summaryTokens : 0;
+		const before = Math.round(k * live.reduce((a, t) => a + t.entryTokens, 0));
+		const after = Math.round(k * live.reduce((a, t) => a + t.phTokens, 0));
+		const cutSaved = cut ? Math.round(k * (cut.prefixTokens - cut.summaryTokens)) : 0;
 		const waitMs = cut ? (plan.source === "settle" ? this.bgWaitMs : cut.ms) : 0;
 		const s = this.stats;
 		s.folds += live.length;
@@ -464,7 +461,7 @@ export class Zip implements ZipControl {
 		s.activeSaved += before - after + cutSaved;
 		if (plan.source === "valve") {
 			s.pressureEdits++;
-			s.pressureRewriteTokens += o.ctxTokens;
+			s.pressureRewriteTokens += ctxTokens;
 		} else {
 			s.writeSavedTokens += before - after + cutSaved;
 		}
@@ -477,16 +474,16 @@ export class Zip implements ZipControl {
 		if (live.length) this.ledger({
 			type: "fold", trigger: plan.source, turnIndex: e.turnIndex, count: live.length, entries: live.map((t) => t.entryId), tools: live.map((t) => t.tool),
 			recoverability: live.map((t) => t.recover ?? "?"), trigs: live.map((t) => t.trig), handles: live.map((t) => handleFor(t.entryId)),
-			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: o.ctxTokens, ctxAfter: o.ctxTokens - (before - after) - cutSaved, usageTotal: o.usageTotal,
+			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: Math.round(ctxTokens), ctxAfter: Math.round(ctxTokens - (before - after) - cutSaved), k: Math.round(k * 1000) / 1000, usageTotal: o.usageTotal,
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
 		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 		const valve = plan.source === "valve";
 		const notices: NoticeAction[] = [];
-		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: o.ctxTokens, tokensAfter: o.ctxTokens - (before - after), ms: plan.ms + (performance.now() - o.t0), pressure: valve });
+		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: ctxTokens - (before - after), ms: plan.ms + (performance.now() - o.t0), pressure: valve });
 		if (cut) {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: o.ctxTokens - (before - after), tokensAfter: o.ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
 		}
 		if (notices.length && !this.quiet) this.notify(ctx, noticeText(notices));
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts

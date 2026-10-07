@@ -1,4 +1,5 @@
 // Test helpers: projected-entry builders (the shape Pi hands to handlers) and a tiny session projector (context_edit + compaction).
+import { buildBlocks } from "../src/plan.ts";
 export type Any = any;
 
 export const U = (id: string, t: string) => ({ sourceEntry: { id, type: "message", message: { role: "user", content: t } }, messages: [{ role: "user", content: t }] });
@@ -68,4 +69,17 @@ export function fakeCtx(entries: Any[], over: Any = {}) {
 		...over,
 	};
 	return { ctx, notes };
+}
+
+/**
+ * Stamp usage on the newest assistant message so the extension calibrates to `k` real tokens per estimated token: real = k x
+ * (system prompt "sys" = 1 + the view before that message). Messages are shared with `messages`, so the entry is updated in place.
+ */
+export function withK(entries: Any[], k: number, over: Any = {}) {
+	const blocks = buildBlocks(entries);
+	let i = blocks.length - 1;
+	while (i >= 0 && blocks[i].kind !== "assistant") i--;
+	const est = 1 + blocks.slice(0, i).reduce((a, b) => a + b.tokens, 0);
+	Object.assign(blocks[i].raw, { stopReason: "stop", usage: { input: Math.round(est * k), cacheRead: 0, cacheWrite: 0, output: 50 }, ...over });
+	return entries;
 }

@@ -4,8 +4,7 @@ import { repairPayload, validateEdits } from "../src/guard.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, valveTokens, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
-import { viewTokensBefore } from "../src/run.ts";
-import { A, AX, fakeCtx, fakePi, flat, project, R, U, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, project, R, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN"];
 let saved: Record<string, string | undefined> = {};
@@ -264,7 +263,7 @@ describe("I2 lossless: zip_recall(handle) returns the original, byte for byte", 
 	test.each(SEEDS)("random session, seed %i", async (seed) => {
 		process.env.PI_ZIP_COLD_CAP = "1000";
 		const entries = [...randomSession(seed), U("uN", "back")];
-		const p = planContext(entries, { base: 0, cwd: process.cwd(), coldCap: 1000 })!;
+		const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 1000 })!;
 		const r = await rig(entries, COLD_TS());
 		const tool = r.handlers.get("tool:zip_recall");
 		const originals = new Map(entries.filter((e) => e.messages[0].role === "toolResult").map((e) => [e.sourceEntry.id, e.messages[0].content[0].text as string]));
@@ -285,7 +284,7 @@ describe("I2 lossless: zip_recall(handle) returns the original, byte for byte", 
 describe("I3 untouched: user messages, tool-call arguments, thinking and the payload's system/tools never change", () => {
 	test.each(SEEDS)("random session, seed %i", (seed) => {
 		const entries = [...randomSession(seed), U("uN", "back")];
-		const p = planContext(entries, { base: 0, cwd: process.cwd(), coldCap: 1000 })!;
+		const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 1000 })!;
 		const before = flat(entries);
 		const plan: RunPlan = { source: "runstart", folds: p.folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false };
 		const view = applyPlanToMessages(before, plan)?.messages ?? before;
@@ -519,7 +518,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
 		expect(r.notes).toEqual([]);
-		expect(planContext(entries, { mode: "warm", base: 0, cwd: ".", model: r.ctx.model })).toBeNull();
+		expect(planContext(entries, { mode: "warm", sys: 0, cwd: ".", model: r.ctx.model })).toBeNull();
 	});
 
 	test("above V the warm cache is edited with the cold plan: first request carries it, turn_end persists exactly it (one valve, no 0.85 threshold)", async () => {
@@ -539,7 +538,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 	});
 
 	test("the valve follows the window: 128K window -> 102K, 1M -> 160K; a small window stays below Pi's compaction trigger", async () => {
-		const mid = session(50); // ~112K tokens
+		const mid = withK(session(50), 1); // ~112K tokens
 		const warmMid = await rig(mid, WARM_TS(), { model: model(128_000) });
 		await warmMid.fire("before_agent_start", {});
 		expect(await warmMid.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // 112K > 102K
@@ -552,9 +551,9 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
 		// the cold cap never exceeds Pi's compaction room either
 		const prose = [U("u1", "one"), A("a1"), AX("x1", 60_000), U("u2", "two"), A("a2"), AX("x2", 60_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
-		const clamped = planContext(prose, { mode: "cold", base: 0, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
+		const clamped = planContext(prose, { mode: "cold", sys: 0, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
 		expect(clamped!.sumTrigger).not.toBeNull(); // 30K > the compaction room (7.4K): the 60K default cap is clamped
-		const roomy = planContext(prose, { mode: "cold", base: 0, cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
+		const roomy = planContext(prose, { mode: "cold", sys: 0, cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
 		expect(roomy!.sumTrigger).toBeNull(); // the same context at a 1M window is under the cap
 	});
 
@@ -573,7 +572,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 });
 
 // =============================================================================================================
-describe("run lifecycle: failures, calibration, steering", () => {
+describe("run lifecycle: failures, steering", () => {
 	const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];
 	const cold = [...prevRun, U("u3", "back after the idle")];
 
@@ -615,33 +614,6 @@ describe("run lifecycle: failures, calibration, steering", () => {
 		expect(foldedIds).toEqual(["c1"]); // c2 (write, previous turn) stays: not re-readable
 	});
 
-	test("calibration at the first cold turn_end uses the view that was SENT, so the base is not clamped to 0", async () => {
-		const ledger = `/tmp/pi-zip-test-ledger-${process.pid}.jsonl`;
-		process.env.PI_ZIP_LEDGER = ledger;
-		try { require("node:fs").unlinkSync(ledger); } catch {}
-		const r = await rig(cold, COLD_TS());
-		await r.fire("before_agent_start", {});
-		await r.fire("context_with_system", { messages: flat(cold) });
-		const te = { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason: "stop", usage: { input: 9_000, cacheRead: 0, cacheWrite: 0 } } };
-		await r.fire("turn_end", te);
-		const line = require("node:fs").readFileSync(ledger, "utf8").trim().split("\n").map((l: string) => JSON.parse(l)).find((l: Any) => l.type === "fold");
-		// the sent view = prompt + folded r1 + r2 + ... ~ 2.4K tokens, so the base is ~ 9000 - that (thousands), never 0 and never the 40K clamp
-		const unfolded = buildBlocks([...cold, A("a5")]).reduce((a, b) => a + b.tokens, 0);
-		expect(line.ctxBefore).toBeGreaterThan(unfolded + 3000);
-		expect(line.ctxBefore).toBeLessThan(unfolded + 9000);
-		require("node:fs").unlinkSync(ledger);
-	});
-
-	test("viewTokensBefore: folds and a cut shrink what was sent; an unapplied fold does not", () => {
-		const b = buildBlocks([U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 8000), A("a2"), U("u2", "two")]);
-		const t = { entryId: "r1", phTokens: 100 } as Any;
-		const total = b.reduce((a, x) => a + x.tokens, 0) - b[b.length - 1].tokens;
-		expect(viewTokensBefore(b, 4, null)).toBe(total);
-		expect(viewTokensBefore(b, 4, { folds: [t], cut: null } as Any)).toBe(total - b[2].tokens + 100);
-		expect(viewTokensBefore(b, 4, { folds: [t], applied: new Set(), cut: null } as Any)).toBe(total);
-		expect(viewTokensBefore(b, 4, { folds: [], cut: { firstKeptEntryId: "a2", summaryTokens: 50 } } as Any)).toBe(50 + b[3].tokens);
-	});
-
 	test("steering messages typed during a run are not new user turns: marked at turn_end, persisted, restored on resume", async () => {
 		const withTs = (e: Any, ts: number) => { (e.sourceEntry.message as Any).timestamp = ts; (e.messages[0] as Any).timestamp = ts; return e; };
 		const prompt = withTs(U("u3", "back"), 1000);
@@ -659,7 +631,7 @@ describe("run lifecycle: failures, calibration, steering", () => {
 		const resumed = await rig(entries, COLD_TS(), { branch: [...branchOf(entries, COLD_TS()), { type: "custom", customType: "pi-zip/steer", data: { ids: ["u3s"] } }] });
 		await resumed.fire("session_start", {});
 		// ... and the plan counts 3 turns, not 4: the steering message is part of turn 3
-		const asTurns = (steerIds?: Set<string>) => planContext(entries, { base: 0, cwd: ".", promptPending: false, steerIds })!.userTurns;
+		const asTurns = (steerIds?: Set<string>) => planContext(entries, { sys: 0, cwd: ".", promptPending: false, steerIds })!.userTurns;
 		expect(asTurns()).toBe(4);
 		expect(asTurns(new Set(["u3s"]))).toBe(3);
 		const blocks = buildBlocks(entries, new Set(["u3s"]));
@@ -670,10 +642,10 @@ describe("run lifecycle: failures, calibration, steering", () => {
 		const prompt = U("u3", "back");
 		const steer = U("u3s", "also");
 		const base = [...prevRun, prompt, A("a5", ["c5"]), R("r5", "c5"), A("a6")];
-		const without = planContext(base, { base: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
-		const withSteer = planContext([...base, steer, A("a7")], { base: 0, cwd: ".", promptPending: false, steerIds: new Set(["u3s"]) })!.folds.map((t) => t.entryId);
+		const without = planContext(base, { sys: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		const withSteer = planContext([...base, steer, A("a7")], { sys: 0, cwd: ".", promptPending: false, steerIds: new Set(["u3s"]) })!.folds.map((t) => t.entryId);
 		expect(withSteer).toEqual(without);
-		const counted = planContext([...base, steer, A("a7")], { base: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		const counted = planContext([...base, steer, A("a7")], { sys: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
 		expect(counted).not.toEqual(without); // unmarked, the same message would shift the protected window
 	});
 });

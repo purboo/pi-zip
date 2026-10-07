@@ -2,7 +2,7 @@
 import { classifyRecoverability, type Recover } from "./classify.ts";
 import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { createHash } from "node:crypto";
-import { type Any, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
+import { type Any, PRODUCT, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
 
 /** Default: when a cold return is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest first.
@@ -41,6 +41,56 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 export function valveTokens(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number {
 	const w = Number(model?.contextWindow);
 	return w > 0 ? Math.min(VALVE_MAX, VALVE_RATIO * w, compactionRoom(model, reserve)!) : VALVE_MAX;
+}
+
+// Token scale. Every size in this file is a chars/4 estimate, and chars/4 undercounts real tokens (JSON-heavy tool calls, code,
+// identifiers, tool definitions that are not in the text at all). `k` = real tokens per estimated token; every limit (cold cap, V,
+// compaction room, min gain) is compared against k x estimate, so they mean REAL tokens. k is read from the branch itself (the
+// usage of the newest assistant message), so it survives a restart and needs no stored state. With no usage to read, DEFAULT_K
+// applies: 1.7 is the ratio measured on recorded coding sessions (real first-request context / chars/4 estimate: 1.72 after cold
+// returns, 1.71 for previous-prompt peaks), and a too-high k only folds a little deeper, a too-low k leaves the context over the cap.
+export const DEFAULT_K = 1.7;
+export const K_MIN = 1; // an estimate above the real count is not trusted: never scale down
+export const K_MAX = 2.5;
+
+export interface Calibration {
+	k: number;
+	real: number; // input + cacheRead + cacheWrite of the request that produced the newest usable assistant message (0 = none)
+	est: number; // estimate of what that request carried: system prompt + the view blocks before that message
+	source: "usage" | "default";
+}
+
+/**
+ * k from the branch: the newest assistant message with usage says how many real tokens its request carried; the estimate of the
+ * view blocks before it (the projection, with the folds and cut as persisted, which are exactly what that request carried, I1)
+ * says how many we would have guessed. Only the INPUT side is used: that message's own output is not part of the request it
+ * answered, and thinking tokens may or may not be sent back, so including output would add noise to the ratio.
+ * Skipped: errored messages, messages without input usage, and messages older than a compaction Pi made (not ours): their
+ * request carried text the projection no longer has.
+ */
+export function calibrate(entries: Any[], sys = 0): Calibration {
+	const none: Calibration = { k: DEFAULT_K, real: 0, est: 0, source: "default" };
+	const blocks = buildBlocks(entries);
+	let foreignCompactionMs = 0;
+	for (const pe of entries) {
+		const src = pe.sourceEntry;
+		if (src?.type === "compaction" && src.details?.by !== PRODUCT) foreignCompactionMs = Math.max(foreignCompactionMs, Date.parse(src.timestamp) || 0);
+	}
+	const before: number[] = []; // estimate of blocks[0..i)
+	let acc = 0;
+	for (const b of blocks) { before.push(acc); acc += b.tokens; }
+	for (let i = blocks.length - 1; i >= 0; i--) {
+		if (blocks[i].kind !== "assistant") continue;
+		const m = blocks[i].raw ?? blocks[i].msg;
+		const u = m?.usage;
+		const real = u ? (Number(u.input) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0) : 0;
+		if (!(real > 0) || m.stopReason === "error") continue;
+		if (foreignCompactionMs && typeof m.timestamp === "number" && m.timestamp < foreignCompactionMs) return none;
+		const est = sys + before[i];
+		if (!(est > 0)) return none;
+		return { k: clamp(real / est, K_MIN, K_MAX), real, est, source: "usage" };
+	}
+	return none;
 }
 
 export const settings = () => ({
@@ -147,6 +197,7 @@ export interface RunPlan {
 	ctxBefore: number;
 	ctxAfter: number;
 	ms: number;
+	k: number; // the token scale the plan was made with (stats and notices of this run use the same one)
 	persisted: boolean;
 	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
 	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
@@ -159,7 +210,8 @@ export interface PlanOpts {
 	mode?: "cold" | "warm"; // cold: cache already gone (default). warm: only when the context is above the valve V; then the same plan as cold.
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
-	base: number; // system prompt + tools + estimation error, in tokens
+	sys: number; // estimated tokens of the system prompt (same chars/4 scale as the blocks; tool definitions are covered by k)
+	k?: number; // real tokens per estimated token (calibrate); default 1 = the estimates are taken as real
 	cwd: string;
 	coldCap?: number;
 	foldMin?: number;
@@ -177,11 +229,12 @@ export interface PlanResult {
 	folds: FoldTarget[];
 	cutIdx: number | null;
 	firstKeptEntryId: string | null;
-	prefixTokens: number;
+	prefixTokens: number; // estimate units (x k = real), like summaryTokensPlanned
 	summaryTokensPlanned: number;
 	sumTrigger: "cold" | "valve" | null;
-	ctxTokens: number;
-	ctxAfterFolds: number;
+	k: number;
+	ctxTokens: number; // calibrated: k x (sys + blocks)
+	ctxAfterFolds: number; // calibrated
 	userTurns: number;
 	cutVisibleIdx: number;
 	cutKeptFirstMsg: Any;
@@ -200,8 +253,11 @@ export const contentKeyOf = (content: Any): string => {
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
+	// limits are in real tokens; the plan works in estimate units, so they are divided by k once, here
+	const k = o.k ?? 1;
 	const room = compactionRoom(o.model, o.reserve);
-	const coldCap = Math.min(o.coldCap ?? s.coldCap, room ?? Infinity);
+	const coldCap = Math.min(o.coldCap ?? s.coldCap, room ?? Infinity) / k;
+	const minGain = (o.minGain ?? s.minGain) / k;
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
 	const relax = o.relax ?? RELAX_PREV_TURN;
@@ -210,8 +266,8 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
-	const ctxTokens = o.base + blocks.reduce((a, b) => a + b.tokens, 0);
-	if (mode === "warm" && !(ctxTokens > valveTokens(o.model, o.reserve))) return null; // I6: warm cache below the valve -> never edit
+	const ctxEst = o.sys + blocks.reduce((a, b) => a + b.tokens, 0);
+	if (mode === "warm" && !(ctxEst > valveTokens(o.model, o.reserve) / k)) return null; // I6: warm cache below the valve -> never edit
 	const trig = mode === "warm" ? "valve" : "cold";
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
@@ -250,7 +306,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	if (relax) {
 		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
 		// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
-		let est = ctxTokens - savings();
+		let est = ctxEst - savings();
 		if (est > coldCap) {
 			const prev = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable");
 			for (const b of prev.sort((x, y) => y.tokens - x.tokens)) {
@@ -259,7 +315,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			}
 		}
 	}
-	let ctxAfterFolds = ctxTokens - savings();
+	let ctxAfterFolds = ctxEst - savings();
 	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > coldCap ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
@@ -278,12 +334,12 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			pre[i] = acc;
 			acc += tokOverride.get(i) ?? blocks[i].tokens;
 		}
-		const total = o.base + acc;
+		const total = o.sys + acc;
 		const S = (x: number) => clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP);
 		if (cuts.length) {
 			let pick = cuts[cuts.length - 1];
 			for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
-			if (pre[pick] >= 2 * S(pre[pick]) && summaryGainOk(pre[pick], S(pre[pick]), total, o.minGain)) {
+			if (pre[pick] >= 2 * S(pre[pick]) && summaryGainOk(pre[pick], S(pre[pick]), total, minGain)) {
 				cutIdx = pick;
 				prefixTokens = pre[pick];
 				summaryTokensPlanned = S(pre[pick]);
@@ -291,7 +347,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 					const bi = blocks.findIndex((b) => b.entryId === folds[i].entryId);
 					if (bi < pick) { tokOverride.delete(bi); folds.splice(i, 1); } // the prefix is replaced: its folds are void
 				}
-				ctxAfterFolds = ctxTokens - savings();
+				ctxAfterFolds = ctxEst - savings();
 			}
 		}
 	}
@@ -312,7 +368,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			bi++;
 		}
 	}
-	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, ctxTokens, ctxAfterFolds, userTurns, cutVisibleIdx, cutKeptFirstMsg };
+	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, k, ctxTokens: k * ctxEst, ctxAfterFolds: k * ctxAfterFolds, userTurns, cutVisibleIdx, cutKeptFirstMsg };
 }
 
 const sameMsg = (a: Any, b: Any): boolean =>
