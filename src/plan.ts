@@ -1,6 +1,6 @@
 // Pure planning: session projection -> which outputs to fold, whether to summarise, where to cut (F5-F10).
 import { classifyRecoverability, type Recover } from "./classify.ts";
-import { handleFor, makePlaceholderFor, pickKeyLines, shortArgs } from "./placeholder.ts";
+import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { createHash } from "node:crypto";
 import { type Any, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
@@ -208,7 +208,9 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		folds.push({ entryId: b.entryId!, toolCallId: b.msg.toolCallId, visIdx: visOfBlock[b.idx] ?? -1, contentKey: contentKeyOf(b.msg.content), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", entryTokens: b.tokens, phTokens: phTok, ph, trig, recover: classify(b) });
 		return true;
 	};
-	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin;
+	// a zip_recall result IS content the model just asked for: folding it would undo the recall (and loop); never
+	const isRecall = (b: Block) => (calls.get(b.msg.toolCallId)?.name ?? b.msg.toolName) === RECALL_TOOL;
+	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b);
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
@@ -356,6 +358,12 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 		const k = key(t.toolCallId, t.contentKey);
 		byKey.set(k, [...(byKey.get(k) ?? []), t]);
 	}
+	const seenKey = new Map<string, number>(); // how many results in THIS request carry each (id, content): more than one = ambiguous
+	for (const m of messages) {
+		if (m?.role !== "toolResult" || !byKey.has(key(m.toolCallId, contentKeyOf(m.content)))) continue;
+		const k = key(m.toolCallId, contentKeyOf(m.content));
+		seenKey.set(k, (seenKey.get(k) ?? 0) + 1);
+	}
 	const byPos = new Map<number, FoldTarget>();
 	for (const t of plan.folds) if (t.visIdx >= 0) byPos.set(t.visIdx, t);
 	let changed = false;
@@ -368,8 +376,9 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 		const ck = contentKeyOf(m.content);
 		let t = byPos.get(v);
 		if (!t || used.has(t) || t.toolCallId !== m.toolCallId || t.contentKey !== ck) {
-			const c = byKey.get(key(m.toolCallId, ck));
-			t = c && c.length === 1 && !used.has(c[0]) ? c[0] : undefined;
+			const k = key(m.toolCallId, ck);
+			const c = byKey.get(k);
+			t = c && c.length === 1 && seenKey.get(k) === 1 && !used.has(c[0]) ? c[0] : undefined;
 		}
 		if (!t) return m;
 		used.add(t);

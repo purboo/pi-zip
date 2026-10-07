@@ -132,6 +132,43 @@ describe("applyPlanToMessages", () => {
 		expect(shiftedPlan.cut).toBeNull();
 	});
 });
+describe("recall results and reused tool call ids", () => {
+	test("a zip_recall result is never folded (it is the content the model just asked for)", () => {
+		const rec = R("r1", "c1");
+		(rec.messages[0] as any).toolName = "zip_recall";
+		(rec.sourceEntry.message as any).toolName = "zip_recall";
+		const call = A("a1", ["c1"]);
+		(call.messages[0] as any).content[1].name = "zip_recall";
+		const ctx = [U("u1", "one"), call, rec, R("r2", "c2"), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
+		ctx.splice(3, 1, { ...R("r2", "c2"), messages: [{ ...R("r2", "c2").messages[0], toolCallId: "c2" }] });
+		const folds = planContext(ctx, opts({ promptPending: false }))!.folds.map((t) => t.entryId);
+		expect(folds).not.toContain("r1");
+	});
+	test("a server that reuses tool call ids (call_0): each result is folded by its own position and content", () => {
+		const mk = (id: string, ch: string) => R(id, "call_0", 9000, `${ch} `.repeat(4500));
+		const ctx = [U("u1", "one"), A("a1", ["call_0"]), mk("r1", "x"), A("a2"), U("u2", "two"), A("a3", ["call_0"]), mk("r2", "y"), A("a4"), U("u3", "three"), A("a5", ["call_0"]), mk("r3", "z"), A("a6"), U("u4", "four"), A("a7")];
+		const p = planContext(ctx, opts({ promptPending: false }))!;
+		expect(p.folds.map((t) => t.entryId)).toEqual(["r1", "r2"]);
+		const plan: RunPlan = { source: "runstart", folds: p.folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false };
+		const out = applyPlanToMessages(flat(ctx), plan)!.messages.filter((m: any) => m.role === "toolResult");
+		expect(out[0].content[0].text).toBe(p.folds[0].ph);
+		expect(out[1].content[0].text).toBe(p.folds[1].ph);
+		expect(out[2].content[0].text.startsWith("z z")).toBe(true); // the third result, same id, untouched
+		// the request view shifted (steering message in front): position no longer matches, content still does
+		const shifted = applyPlanToMessages([{ role: "user", content: "steering" }, ...flat(ctx)], plan)!.messages.filter((m: any) => m.role === "toolResult");
+		expect(shifted[0].content[0].text).toBe(p.folds[0].ph);
+		expect(shifted[1].content[0].text).toBe(p.folds[1].ph);
+		expect(shifted[2].content[0].text.startsWith("z z")).toBe(true);
+		// two identical results under one id and only one planned: ambiguity is never guessed (left unfolded)
+		const dupe = [U("u1", "one"), A("a1", ["call_0"]), mk("r1", "x"), A("a2"), U("u2", "two"), A("a3", ["call_0"]), mk("r2", "x"), A("a4"), U("u3", "three"), A("a5"), U("u4", "four"), A("a6")];
+		const pd = planContext(dupe, opts({ promptPending: false }))!;
+		const onlyFirst: RunPlan = { source: "runstart", folds: [pd.folds[0]], cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false };
+		expect(applyPlanToMessages([{ role: "user", content: "steering" }, ...flat(dupe)], onlyFirst)).toBeNull(); // nothing applied
+		const inPlace = applyPlanToMessages(flat(dupe), onlyFirst)!.messages.filter((m: any) => m.role === "toolResult"); // unshifted: position decides
+		expect(inPlace[0].content[0].text).toBe(pd.folds[0].ph);
+		expect(inPlace[1].content[0].text.startsWith("x x")).toBe(true);
+	});
+});
 const buildBlocksEntries = () => [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
 
 test("buildBlocks flags our placeholders as ours and foreign edits as edited", () => {
