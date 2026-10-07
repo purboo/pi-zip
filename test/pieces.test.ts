@@ -68,8 +68,84 @@ describe("recall", () => {
 		const huge = sliceRecall("z".repeat(60_000), {});
 		expect(huge.clipped).toBe(true);
 		expect(huge.text.length).toBeLessThan(21_000);
-		expect(huge.text).toContain("clipped");
+		expect(huge.text).toContain("offset=20000"); // the no-argument page says how to get the rest
+		expect(huge.nextOffset).toBe(20_000);
 		expect(parseRange("3-1")).toBeNull();
+	});
+	// reassemble every page of a selection through the public slicer, following the hint's offset each time
+	const pages = (text: string, opts: Record<string, unknown> = {}) => {
+		let out = "";
+		let off: number | null = 0;
+		let n = 0;
+		while (off !== null && n++ < 100_000) {
+			const sl = sliceRecall(text, { ...opts, offset: off });
+			out += sl.body;
+			off = sl.nextOffset;
+		}
+		return out;
+	};
+	test("a single 45,000-character line is recallable in full: pages reassemble byte for byte (I2)", () => {
+		const line = Array.from({ length: 45_000 }, (_, i) => String.fromCharCode(33 + ((i * 7) % 90))).join("");
+		const text = `head\n${line}\ntail`;
+		expect(pages(text)).toBe(text);
+		expect(pages(text, { limit: 777 })).toBe(text);
+		expect(pages(text, { range: "2" })).toBe(line);
+		expect(pages(text, { range: "2", limit: 4096 })).toBe(line);
+		expect(pages(text, { grep: "head|tail" })).toBe("1: head\n3: tail");
+		const first = sliceRecall(text, {});
+		expect(first.text).toContain("[chars 0-20000 of 45010]");
+		expect(first.text).toContain("offset=20000");
+		const mid = sliceRecall(text, { offset: 20_000, limit: 100 });
+		expect(mid.body).toBe(text.slice(20_000, 20_100));
+		expect(mid.text).toContain("[chars 20000-20100 of 45010]");
+		expect(sliceRecall(text, { offset: 45_000 }).nextOffset).toBeNull();
+		expect(sliceRecall(text, { offset: 99_999_999 }).body).toBe(""); // past the end: empty page, not an error
+		expect(sliceRecall(text, { offset: "20000", limit: "10" }).body).toBe(text.slice(20_000, 20_010)); // models sometimes send numbers as strings
+		expect(sliceRecall(text, { limit: 99_999_999 }).body.length).toBe(50_000 > text.length ? text.length : 50_000);
+	});
+	test("paging never splits a surrogate pair (byte-exact for non-BMP text)", () => {
+		const text = "😀".repeat(30_000); // each is two UTF-16 code units
+		for (const limit of [1, 2, 3, 999, 20_000]) {
+			const out = pages(text.slice(0, 5000), { limit });
+			expect(out).toBe(text.slice(0, 5000));
+			expect(out.includes("\ufffd")).toBe(false);
+		}
+	});
+	test("the zip_recall tool pages a long line through the real execute path and reports how to continue", async () => {
+		const { registerRecallTool } = await import("../src/recall.ts");
+		const line = "L".repeat(45_000);
+		const entry = { type: "message", id: "e1", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: line }] } };
+		let def: any;
+		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: () => {} });
+		const ctx = { sessionManager: { getBranch: () => [entry] } };
+		const h = handleFor("e1");
+		let got = "";
+		let offset = 0;
+		for (let i = 0; i < 10; i++) {
+			const res = await def.execute("t", { handle: h, offset }, undefined, undefined, ctx);
+			const body = res.content[0].text.split("\n").slice(2).join("\n"); // [handle ...] line, [chars ...] line, then the page
+			const more = /\n\[… (\d+) more chars: call zip_recall again with offset=(\d+)/.exec(body);
+			got += more ? body.slice(0, more.index) : body;
+			if (!more) break;
+			offset = Number(more[2]);
+		}
+		expect(got).toBe(line);
+	});
+	test("grep: catastrophic patterns are searched as literal text and cannot hang; ordinary regexes still work", () => {
+		const evil = "a".repeat(40) + "!";
+		const t0 = Date.now();
+		for (const p of ["(a+)+$", "(a|aa)+$", "(.*)*x", "(a*)*b", "^(\\w+\\s?)*$", "(x+x+)+y", "(a)\\1"]) {
+			const r = sliceRecall(evil, { grep: p });
+			expect(r.matched).toBe(0);
+			expect(r.text).toContain("literal");
+		}
+		expect(Date.now() - t0).toBeLessThan(1000);
+		expect(sliceRecall("x".repeat(300), { grep: "x".repeat(300) }).text).toContain("literal"); // overlong pattern
+		expect(sliceRecall("price (a+)+ here", { grep: "(a+)+" }).matched).toBe(1); // literal search finds the literal text
+		const ok = sliceRecall("ERROR 12\nfine\nFAIL 7", { grep: "error|fail" });
+		expect(ok.matched).toBe(2);
+		expect(ok.text).not.toContain("literal");
+		expect(sliceRecall("a.b\naxb", { grep: "a\\.b" }).matched).toBe(1);
 	});
 	const tool = (id: string, text: string) => ({ type: "message", id, message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text }] } });
 	test("recall resolves entries before a compaction, batches, and labels missing handles", () => {
