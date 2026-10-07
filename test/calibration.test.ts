@@ -160,7 +160,7 @@ describe("regression (fresh process, print mode): the last usage says ~88K real 
 		return { req, plan: lines.find((l: Any) => l.type === "cold_plan") };
 	}
 
-	test("the plan folds down to <= 60K real-equivalent, where the uncalibrated estimate (k = 1) would have stopped far above it", async () => {
+	test("the plan folds down to <= 40K real-equivalent, where the uncalibrated estimate (k = 1) would have stopped far above it", async () => {
 		const all = entries();
 		const last = all.find((x) => x.sourceEntry.id === "a2e")!;
 		const view = est(all, all.findIndex((x) => x.sourceEntry.id === "a2e"));
@@ -175,14 +175,14 @@ describe("regression (fresh process, print mode): the last usage says ~88K real 
 		expect(plan.k).toBeGreaterThan(1.6);
 		expect(plan.k).toBeLessThan(1.8);
 		expect(plan.ctxBefore).toBeGreaterThan(REAL - 1_000); // scaled: the whole view incl. the new prompt, in real tokens
-		expect(plan.ctxAfter).toBeLessThanOrEqual(60_000);
+		expect(plan.ctxAfter).toBeLessThanOrEqual(40_000);
 		expect(plan.folds).toBeGreaterThanOrEqual(4); // the old output + 3 of the previous turn's (relax), biggest first, until the cap
 		expect(req.messages.filter((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded by pi-zip")).length).toBe(plan.folds);
 
-		// what the old estimate did: k = 1 sees ~51K <= 60K and stops folding the previous turn, leaving ~1.7 x that in real tokens
+		// what the old estimate did: k = 1 sees ~51K, stops folding once under 40K (~36K, 3 folds), which is ~62K in real tokens
 		const old = planContext(all, { sys: 0, cwd: process.cwd(), promptPending: false, k: 1 })!;
-		expect(1.7 * old.ctxAfterFolds).toBeGreaterThan(60_000);
-		expect(old.folds.length).toBe(1); // only the old output: nothing relaxed into the previous turn
+		expect(1.7 * old.ctxAfterFolds).toBeGreaterThan(40_000);
+		expect(old.folds.length).toBeLessThan(plan.folds); // k = 1 stops folding the previous turn earlier than the calibrated plan
 	});
 
 	test("without usage in the branch the default k applies (the same fold depth, never the old additive ~3K base)", async () => {
@@ -190,7 +190,7 @@ describe("regression (fresh process, print mode): the last usage says ~88K real 
 		expect(plan.calSource).toBe("default");
 		expect(plan.k).toBe(DEFAULT_K);
 		expect(plan.calReal).toBe(0);
-		expect(plan.ctxAfter).toBeLessThanOrEqual(60_000);
+		expect(plan.ctxAfter).toBeLessThanOrEqual(40_000);
 	});
 });
 

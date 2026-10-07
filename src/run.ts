@@ -265,7 +265,7 @@ export class Zip implements ZipControl {
 		const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries);
 		const p = planContext(entries, o);
 		if (!this.cold && !p) {
-			this.discardBg(); // a warm return below the valve: a prepared summary does not pay back
+			this.discardBg(); // a warm return where the valve does not fire (below V, or the plan cuts too little): a prepared summary does not pay back
 			return;
 		}
 		this.runEdits = true;
@@ -417,7 +417,7 @@ export class Zip implements ZipControl {
 			return this.commit(e, ctx, this.runPlan, o);
 		}
 		if (failed) return undefined;
-		// warm cache: nothing, unless the context passed the valve V (I6, F10): then the same plan as cold, from the next request on
+		// warm cache: nothing, unless the context passed the valve V and the plan cuts enough (valveAllows; I6, F10): then the same plan as cold, from the next request on
 		const { o: popts } = this.opts(ctx, false, "warm", e.context.contextEntries); // the message that just ended carries the newest usage
 		const p = planContext(e.context.contextEntries, popts);
 		if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;

@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, planContext, RELAX_PREV_TURN, summaryGainOk, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
-import { A, AX, flat, R, U } from "./helpers.ts";
+import { afterEach, describe, expect, test } from "bun:test";
+import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, valveAllows, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { A, AX, flat, R, U, type Any } from "./helpers.ts";
 
 const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, sys: 0, cwd: process.cwd(), promptPending: true, ...over });
 
@@ -177,4 +177,98 @@ test("buildBlocks flags our placeholders as ours and foreign edits as edited", (
 	const foreign = { sourceEntry: e.sourceEntry, messages: [{ ...e.messages[0], content: [{ type: "text", text: "someone else" }] }] };
 	expect(buildBlocks([folded])[0]).toMatchObject({ edited: true, ours: true });
 	expect(buildBlocks([foreign])[0]).toMatchObject({ edited: true, ours: false });
+});
+
+// =============================================================================================================
+describe("cold cap default", () => {
+	const saved = process.env.PI_ZIP_COLD_CAP;
+	afterEach(() => { if (saved === undefined) delete process.env.PI_ZIP_COLD_CAP; else process.env.PI_ZIP_COLD_CAP = saved; });
+
+	test("40K real tokens by default; PI_ZIP_COLD_CAP still overrides", () => {
+		delete process.env.PI_ZIP_COLD_CAP;
+		expect(settings().coldCap).toBe(40_000);
+		process.env.PI_ZIP_COLD_CAP = "25000";
+		expect(settings().coldCap).toBe(25_000);
+	});
+
+	test("a ~45K context is over the default cap (it would have been under the old 60K)", () => {
+		delete process.env.PI_ZIP_COLD_CAP;
+		const prose = [U("u1", "one"), AX("x1", 90_000), U("u2", "two"), AX("x2", 90_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~45K tokens of prose
+		const p = planContext(prose, { sys: 0, cwd: ".", promptPending: false })!;
+		expect(p.ctxTokens).toBeGreaterThan(40_000);
+		expect(p.ctxTokens).toBeLessThan(60_000);
+		expect(p.sumTrigger).toBe("cold");
+		expect(planContext(prose, { sys: 0, cwd: ".", promptPending: false, coldCap: 60_000 })!.sumTrigger).toBeNull();
+	});
+});
+
+// =============================================================================================================
+describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
+	test("the rule is one pure function: fire only when after <= 0.5 x before", () => {
+		expect(VALVE_MIN_REDUCTION).toBe(0.5);
+		expect(valveAllows(183_000, 131_000, null)).toBe(false); // a 28% cut does not pay back the rewrite of a warm cache
+		expect(valveAllows(200_000, 90_000, null)).toBe(true); // 55%
+		expect(valveAllows(200_000, 100_000, null)).toBe(true); // exactly r = 0.5
+		expect(valveAllows(200_000, 100_001, null)).toBe(false);
+		expect(valveAllows(200_000, 200_000, null)).toBe(false); // nothing removed
+		expect(valveAllows(200_000, 210_000, null)).toBe(false);
+	});
+
+	test("hard floor: at or above Pi's compaction room any reduction fires, nothing still does not", () => {
+		const room = compactionRoom({ contextWindow: 200_000 })!; // 200000 - 16384 - 8192
+		expect(room).toBe(175_424);
+		expect(valveAllows(room, room - 1, room)).toBe(true);
+		expect(valveAllows(180_000, 170_000, room)).toBe(true);
+		expect(valveAllows(180_000, 180_000, room)).toBe(false);
+		expect(valveAllows(room - 1, room - 10_000, room)).toBe(false); // just below the danger zone the ordinary rule applies
+		expect(valveAllows(183_000, 131_000, null)).toBe(false); // unknown window: no floor
+	});
+
+	// old turns: `oldOutputs` foldable 9000-char reads; the previous user turn holds one `bigChars` write result that can never be folded
+	// (not re-readable), so it stays and decides how much of the context a plan can remove
+	const session = (oldOutputs: number, bigChars: number) => {
+		const e: Any[] = [];
+		for (let t = 0; t < oldOutputs; t++) e.push(U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9000), A(`z${t}`));
+		const call = A("aw", ["cw"]);
+		(call.messages[0] as Any).content[1].name = "write";
+		const big = R("rw", "cw", bigChars);
+		(big.messages[0] as Any).toolName = "write";
+		e.push(U("uw", "write it"), call, big, A("zw"), U("uN", "now"));
+		return e;
+	};
+	const warm = (entries: Any[], contextWindow?: number) => planContext(entries, { mode: "warm", sys: 0, cwd: ".", promptPending: false, model: contextWindow ? { provider: "p", id: "m", contextWindow } : undefined });
+
+	test("planner: 183K -> 131K is blocked, 200K -> 90K fires (unknown window, V = 160K)", () => {
+		const blocked = session(24, 512_000); // ~54K of foldable reads + a ~128K protected write
+		const cold = planContext(blocked, { sys: 0, cwd: ".", promptPending: false, coldCap: 1000 })!;
+		expect(cold.ctxTokens).toBeGreaterThan(180_000);
+		expect(cold.ctxTokens).toBeLessThan(186_000);
+		expect(cold.ctxAfterFolds).toBeGreaterThan(128_000);
+		expect(cold.ctxAfterFolds).toBeLessThan(134_000);
+		expect(warm(blocked)).toBeNull(); // above V, but the plan only cuts ~28%
+
+		const allowed = session(49, 352_000); // ~110K of foldable reads + a ~88K protected write
+		const p = warm(allowed)!;
+		expect(p).not.toBeNull();
+		expect(p.ctxTokens).toBeGreaterThan(195_000);
+		expect(p.ctxAfterFolds).toBeLessThan(0.5 * p.ctxTokens);
+		expect(p.folds.length).toBe(49);
+	});
+
+	test("planner: inside the danger zone (window 200K) a 15% cut still fires; the same context at a 1M window is blocked", () => {
+		const entries = session(13, 600_000); // ~29K of foldable reads + a 150K protected write: ~180K, above room 175,424
+		const p = warm(entries, 200_000)!;
+		expect(p).not.toBeNull();
+		expect(p.ctxTokens).toBeGreaterThanOrEqual(compactionRoom({ contextWindow: 200_000 })!);
+		expect(p.ctxAfterFolds).toBeGreaterThan(0.5 * p.ctxTokens); // small reduction: the ordinary rule would block it
+		expect(p.folds.length).toBe(13);
+		expect(warm(entries, 1_000_000)).toBeNull(); // V = 160K is passed, but nothing makes the cut worth a rewrite
+	});
+
+	test("planner: in the danger zone with nothing to remove the valve has nothing to do", () => {
+		const entries = [U("u0", "q"), A("a0", ["cw"]), R("rw", "cw", 720_000), A("z0"), U("uN", "now")];
+		(entries[1].messages[0] as Any).content[1].name = "write";
+		(entries[2].messages[0] as Any).toolName = "write";
+		expect(warm(entries, 200_000)).toBeNull();
+	});
 });

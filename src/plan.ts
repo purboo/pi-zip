@@ -37,6 +37,21 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
 }
 
+// Rewriting a warm cache costs a full cache write of what is left, so an edit only pays back when it removes a large share of the
+// context. Offline sweep of cold cap x valve rule over recorded sessions (cache TTL 300 s and 3600 s): r = 0.5 blocks the folds
+// that lose money (protected recent turns hold most of the context, so the cut is small: e.g. 183K -> 131K, 28%), keeps the large
+// ones that make TTL-3600 sessions cheaper, and caused no extra Pi compactions. Needs no prices and no guess of requests left.
+// Hard floor: inside Pi's compaction danger zone the valve is the last lossless defence, so any reduction is allowed there.
+export const VALVE_MIN_REDUCTION = 0.5;
+
+/** Whether a warm edit may fire: ctx before -> after (real tokens) must cut at least VALVE_MIN_REDUCTION of the context, or, when
+ *  before >= `room` (compactionRoom: window - reserve - margin, null = unknown window), merely reduce it. */
+export function valveAllows(before: number, after: number, room: number | null): boolean {
+	if (!(after < before)) return false;
+	if (room !== null && before >= room) return true;
+	return after <= (1 - VALVE_MIN_REDUCTION) * before;
+}
+
 /** V = min(160K, 0.8 x window, window - reserve - margin); an unknown window gives 160K. */
 export function valveTokens(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number {
 	const w = Number(model?.contextWindow);
@@ -94,7 +109,7 @@ export function calibrate(entries: Any[], sys = 0): Calibration {
 }
 
 export const settings = () => ({
-	coldCap: envInt("COLD_CAP", 60_000), // cold: fold, then summarise, down to this many tokens
+	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many tokens
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
 	minGain: envInt("MIN_GAIN", 10_000), // a summary must remove at least max(minGain, 15% of the context)
@@ -207,7 +222,7 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
-	mode?: "cold" | "warm"; // cold: cache already gone (default). warm: only when the context is above the valve V; then the same plan as cold.
+	mode?: "cold" | "warm"; // cold: cache already gone (default). warm: only when the context is above the valve V and valveAllows; then the same plan as cold.
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	sys: number; // estimated tokens of the system prompt (same chars/4 scale as the blocks; tool definitions are covered by k)
@@ -247,8 +262,8 @@ export const contentKeyOf = (content: Any): string => {
 };
 
 /** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
- *  summarise only if folds cannot reach the cap and the gain gate passes. Warm: null unless the context is above the valve V;
- *  above it, exactly the cold plan (one valve, no second threshold). The cap never exceeds Pi's compaction room.
+ *  summarise only if folds cannot reach the cap and the gain gate passes. Warm: null unless the context is above the valve V and
+ *  the plan passes valveAllows; then exactly the cold plan (one valve, one reduction gate). The cap never exceeds Pi's compaction room.
  *  Returns null when there is nothing to plan on. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
@@ -367,6 +382,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			}
 			bi++;
 		}
+	}
+	if (mode === "warm") {
+		const after = k * (ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0));
+		if (!valveAllows(k * ctxEst, after, room)) return null; // F10: the rewrite of a warm cache would not pay back
 	}
 	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, k, ctxTokens: k * ctxEst, ctxAfterFolds: k * ctxAfterFolds, userTurns, cutVisibleIdx, cutKeptFirstMsg };
 }

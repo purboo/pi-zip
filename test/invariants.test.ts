@@ -537,6 +537,20 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(r.notes[0]).toContain("context over the warm-cache limit");
 	});
 
+	test("above V but the plan would cut under 50% (the bulk is a protected, non-re-readable result): nothing is edited, at the first request or at turn_end", async () => {
+		const entries = session(24);
+		const call = A("aw", ["cw"]);
+		(call.messages[0] as Any).content[1].name = "write";
+		const big = R("rw", "cw", 512_000); // ~128K protected tokens next to ~54K of foldable reads: 183K -> 131K
+		(big.messages[0] as Any).toolName = "write";
+		entries.splice(entries.length - 1, 0, U("uw", "write it"), call, big, A("zw"));
+		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
+		await r.fire("before_agent_start", {});
+		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
+		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
+		expect(r.notes).toEqual([]);
+	});
+
 	test("the valve follows the window: 128K window -> 102K, 1M -> 160K; a small window stays below Pi's compaction trigger", async () => {
 		const mid = withK(session(50), 1); // ~112K tokens
 		const warmMid = await rig(mid, WARM_TS(), { model: model(128_000) });
