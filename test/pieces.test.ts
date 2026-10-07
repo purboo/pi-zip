@@ -113,11 +113,43 @@ describe("classify", () => {
 describe("cache", () => {
 	test("promptCache is in SECONDS (reading it as ms would make every prompt cold)", () => {
 		expect(cacheTtlMs({ short: 300 }, 1)).toBe(300_000);
-		expect(cacheTtlMs({ long: 3600 }, 1)).toBe(3_600_000);
 		expect(cacheTtlMs(undefined, 300_000)).toBe(300_000);
 		const t0 = 1_000_000;
 		expect(isColdByTtl(t0, t0 + 9_000, cacheTtlMs({ short: 300 }))).toBe(false);
 		expect(isColdByTtl(t0, t0 + 360_000, cacheTtlMs({ short: 300 }))).toBe(true);
+	});
+	test("the TTL tier follows Pi's getPromptCacheTtlMs: cacheRetention, else PI_CACHE_RETENTION=long, else short; no fallthrough between tiers", () => {
+		const pc = { short: 300, long: 3600 };
+		expect(cacheTtlMs(pc, 1, { env: {} })).toBe(300_000);
+		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "long" } })).toBe(3_600_000);
+		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "short" } })).toBe(300_000);
+		expect(cacheTtlMs(pc, 1, { env: { PI_CACHE_RETENTION: "long" }, cacheRetention: "short" })).toBe(300_000); // the request option beats the env
+		expect(cacheTtlMs(pc, 1, { env: {}, cacheRetention: "long" })).toBe(3_600_000);
+		expect(cacheTtlMs(pc, 1, { env: {}, cacheRetention: "none" })).toBe(0);
+		expect(cacheTtlMs({ long: 3600 }, 7, { env: {} })).toBe(7); // short is not declared: not the long tier's value
+		expect(cacheTtlMs({ short: 300 }, 7, { env: { PI_CACHE_RETENTION: "long" } })).toBe(7);
+		process.env.PI_CACHE_RETENTION = "long";
+		try {
+			expect(detectCold({ promptCache: pc }, 0, [{ type: "message", message: { timestamp: 10_000_000 - 1_000_000 } }], 10_000_000).cold).toBe(false); // 1000 s < 3600 s
+		} finally {
+			delete process.env.PI_CACHE_RETENTION;
+		}
+		expect(detectCold({ promptCache: pc }, 0, [{ type: "message", message: { timestamp: 10_000_000 - 1_000_000 } }], 10_000_000).cold).toBe(true); // 1000 s > 300 s
+	});
+	test("Pi's cache-warm usage entries touch the cache; a model switch is cold", () => {
+		const now = 10_000_000;
+		const model = { provider: "p", id: "m", promptCache: { short: 300 } };
+		const old = { type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: now - 1_000_000 } };
+		expect(detectCold(model, 0, [old], now).cold).toBe(true);
+		const warmed = { type: "usage", kind: "cache_warm", timestamp: new Date(now - 100_000).toISOString() };
+		expect(detectCold(model, 0, [old, warmed], now).cold).toBe(false);
+		expect(detectCold(model, 0, [old, { type: "usage", kind: "other", timestamp: new Date(now - 100_000).toISOString() }], now).cold).toBe(true);
+		const fresh = { type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: now - 1000 } };
+		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ cold: false });
+		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, reason: expect.stringContaining("model switch") });
+		expect(detectCold({ provider: "q", id: "m", promptCache: { short: 300 } }, 0, [fresh], now).cold).toBe(true);
+		expect(detectCold({ provider: "p", id: "other" }, now - 1000, [], now, "p/m").cold).toBe(true); // in-process memory of the last request's model
+		expect(detectCold(model, 0, [], now).cold).toBe(false); // no prior request
 	});
 	test("exactly the TTL is still warm; no prior request is warm", () => {
 		expect(isColdByTtl(1000, 4001, 3000)).toBe(true);

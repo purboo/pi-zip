@@ -2,7 +2,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { detectCold, ttlFor } from "./cache.ts";
+import { detectCold, modelKey, ttlFor } from "./cache.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { Stats, noticeText, statsText, type NoticeAction, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, planContext, type Block, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "./plan.ts";
@@ -41,7 +41,8 @@ export class Zip implements ZipControl {
 	private coldDone = true;
 	private coldReason = "";
 	private base = 0;
-	private lastReqMs = 0;
+	private lastReqMs = 0; // the real-time cache clock: newest request start or end
+	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
 	private settlePlan: Any = null;
 	private runPlan: RunPlan | null = null;
 	private runPlanned = false;
@@ -134,7 +135,7 @@ export class Zip implements ZipControl {
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
-		const { cold, reason } = detectCold(ctx.model, this.lastReqMs, branch);
+		const { cold, reason } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey);
 		this.cold = cold;
 		this.coldDone = !cold;
 		this.coldReason = reason;
@@ -354,7 +355,8 @@ export class Zip implements ZipControl {
 	}
 
 	providerRequest(e: Any): Any {
-		this.lastReqMs = Date.now(); // the real-time cache clock
+		this.lastReqMs = Date.now();
+		this.lastModelKey = modelKey(this.model);
 		this.stats.readSavedTokens += this.stats.activeSaved;
 		const p: Any = e.payload;
 		if (process.env.PI_ZIP_LEDGER && this.cold && !this.wireLedgered && p && Array.isArray(p.messages)) {
@@ -373,6 +375,7 @@ export class Zip implements ZipControl {
 	}
 
 	messageEnd(m: Any) {
+		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		const u = m?.usage;
 		if (m?.role === "assistant" && u) this.ledger({ type: "usage", stop: m.stopReason, input: u.input, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output });
 	}
