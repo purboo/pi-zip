@@ -9,7 +9,7 @@ pi-zip folds old tool output out of the context **only when the prompt cache has
 ```bash
 pi install npm:pi-zip
 # or
-pi install git:github.com/<owner>/pi-zip
+pi install git:github.com/purboo/pi-zip
 ```
 
 Try it for one run without installing: `pi -e npm:pi-zip`.
