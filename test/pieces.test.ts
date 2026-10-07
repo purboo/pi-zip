@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { fmtK, noticeText, Stats, statsText, type NoticeAction } from "../src/notice.ts";
@@ -166,6 +167,51 @@ describe("recall", () => {
 		const call = (id: string, name: string, args: object) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "toolCall", id: "t" + id, name, arguments: args }] } });
 		const set = recalledHandlesFromBranch([call("1", "zip_recall", { handle: "aaaaaaaaaa" }), call("2", "zip_recall", { handles: ["bbbbbbbbbb", "cccccccccc"] }), call("3", "other", { handle: "dddddddddd" })]);
 		expect([...set].sort()).toEqual(["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"]);
+	});
+});
+
+describe("payload repair covers every request shape Pi's providers produce", () => {
+	test("OpenAI Responses (input items): an output without its call becomes user text; a matched pair is untouched", () => {
+		const ok = { input: [{ role: "user", content: [{ type: "input_text", text: "q" }] }, { type: "function_call", call_id: "c1", name: "bash", arguments: "{}" }, { type: "function_call_output", call_id: "c1", output: "fine" }] };
+		expect(repairPayload(ok)).toBeNull();
+		const broken = { input: [ok.input[0], ok.input[2]] };
+		const r = repairPayload(broken)!;
+		expect(r.repaired).toBe(1);
+		expect(r.payload.input[1]).toEqual({ role: "user", content: [{ type: "input_text", text: "[tool result, call folded]\nfine" }] });
+		expect(broken.input[1].type).toBe("function_call_output"); // the original object is not mutated
+		const custom = repairPayload({ input: [{ type: "custom_tool_call_output", call_id: "z", output: [{ type: "input_text", text: "o" }] }] })!;
+		expect(custom.payload.input[0].content[0].text).toContain("o");
+	});
+	test("Google Gemini/Vertex (contents): matched by id when present, else by name; Cloud Code Assist nests contents under request", () => {
+		const call = (name: string, id?: string) => ({ functionCall: { name, args: {}, ...(id ? { id } : {}) } });
+		const resp = (name: string, out: string, id?: string) => ({ functionResponse: { name, response: { output: out }, ...(id ? { id } : {}) } });
+		const ok = { contents: [{ role: "user", parts: [{ text: "q" }] }, { role: "model", parts: [call("bash", "a"), call("read", "b")] }, { role: "user", parts: [resp("bash", "x", "a"), resp("read", "y", "b")] }] };
+		expect(repairPayload(ok)).toBeNull();
+		expect(repairPayload({ contents: [{ role: "model", parts: [call("bash")] }, { role: "user", parts: [resp("bash", "x")] }] })).toBeNull(); // no ids: by name
+		const orphan = { contents: [ok.contents[0], { role: "user", parts: [resp("bash", "lost", "a")] }] };
+		const r = repairPayload(orphan)!;
+		expect(r.payload.contents[1].parts[0]).toEqual({ text: "[tool result, call folded]\nlost" });
+		const half = { contents: [ok.contents[0], { role: "model", parts: [call("bash", "a")] }, { role: "user", parts: [resp("bash", "x", "a"), resp("read", "y", "b")] }] };
+		const h = repairPayload(half)!;
+		expect(h.repaired).toBe(1);
+		expect(h.payload.contents[2].parts[0].functionResponse).toBeDefined();
+		expect(h.payload.contents[2].parts[1].text).toContain("y");
+		const nested = repairPayload({ request: { contents: orphan.contents } })!;
+		expect(nested.payload.request.contents[1].parts[0].text).toContain("lost");
+	});
+	test("Bedrock Converse (toolUse/toolResult blocks)", () => {
+		const ok = { messages: [{ role: "user", content: [{ text: "q" }] }, { role: "assistant", content: [{ toolUse: { toolUseId: "t1", name: "bash", input: {} } }] }, { role: "user", content: [{ toolResult: { toolUseId: "t1", content: [{ text: "fine" }], status: "success" } }] }] };
+		expect(repairPayload(ok)).toBeNull();
+		const r = repairPayload({ messages: [ok.messages[0], ok.messages[2]] })!;
+		expect(r.payload.messages[1].content[0]).toEqual({ text: "[tool result, call folded]\nfine" });
+	});
+	test("Mistral wire messages share the chat shape; unknown shapes and non-objects are left alone", () => {
+		const r = repairPayload({ messages: [{ role: "user", content: "q" }, { role: "tool", tool_call_id: "t9", content: "lost" }] })!;
+		expect(r.payload.messages[1]).toEqual({ role: "user", content: "[tool result, call folded]\nlost" });
+		expect(repairPayload({ prompt: "x" })).toBeNull();
+		expect(repairPayload(null)).toBeNull();
+		expect(repairPayload("text")).toBeNull();
+		expect(repairPayload({ messages: "nope" })).toBeNull();
 	});
 });
 
