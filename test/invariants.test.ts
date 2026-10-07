@@ -1,9 +1,10 @@
 // One group per invariant of design §6 (I1-I6), driven through the real extension with a fake Pi.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { repairPayload, validateEdits } from "../src/guard.ts";
-import { buildBlocks, planContext, applyPlanToMessages, type Block, type RunPlan } from "../src/plan.ts";
+import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, valveTokens, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
+import { viewTokensBefore } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, project, R, U, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN"];
@@ -120,40 +121,141 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 	});
 });
 
-describe("F12 summary prepared while the user is away", () => {
-	test("the background summary built at settle is adopted by the next cold return and reported with its real duration", async () => {
-		process.env.PI_ZIP_COLD_CAP = "6000";
-		const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
-		let calls = 0;
-		const complete = async () => (calls++, { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { cost: { total: 0.02 } } });
-		const r = await rig(done, COLD_TS(), { modelRegistry: { complete } });
-		const settled = await r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
-		expect(settled.entries.at(-1).customType).toBe("pi-zip/plan");
-		const back = [...done, U("u4", "back")];
-		r.ctx.sessionManager.getBranch = () => [...branchOf(done, COLD_TS()), settled.entries.at(-1)];
+describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () => {
+	const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
+	const back = [...done, U("u4", "back")];
+	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+	const mkComplete = (state: { calls: number; delay?: number; signals?: Any[] }) => async (_m: Any, _c: Any, o: Any) => {
+		state.calls++;
+		state.signals?.push(o?.signal);
+		if (state.delay) await sleep(state.delay);
+		return { stopReason: "stop", content: [{ type: "text", text: "## Decisions\nnarrative" }], usage: { input: 11, output: 22, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } };
+	};
+	const settle = (r: Any) => r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
+	const comeBack = async (r: Any, settled: Any, ts: number) => {
+		r.ctx.sessionManager.getBranch = () => [...branchOf(done, ts), ...(settled?.entries?.length ? [settled.entries.at(-1)] : [])];
 		r.ctx.sessionManager.buildSessionProjection = () => ({ entries: back });
 		await r.fire("before_agent_start", {});
-		const req = await r.fire("context_with_system", { messages: flat(back) });
+		return r.fire("context_with_system", { messages: flat(back) });
+	};
+	beforeEach(() => { process.env.PI_ZIP_COLD_CAP = "6000"; process.env.PI_ZIP_TTL_SECS = "0.1"; });
+
+	test("settle only plans: no model call yet; the timer builds the summary at 0.8 x TTL; the next cold return adopts it with no second call", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		expect(settled.entries.at(-1).customType).toBe("pi-zip/plan");
+		expect(st.calls).toBe(0); // nothing is started at settle itself
+		await sleep(200); // 0.8 x 100 ms has passed: the user is still away
+		expect(st.calls).toBe(1);
+		const req = await comeBack(r, settled, COLD_TS());
 		expect(req.messages[0].role).toBe("compactionSummary");
-		expect(calls).toBe(1); // no second model call at return
+		expect(st.calls).toBe(1); // adopted, not rebuilt
 		await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
 		expect(r.notes.at(-1)).toMatch(/summarized 2 requests · [\d.]+K → [\d.]+K tokens · [\d.]+ s \(done while you were away\)/);
-		expect(r.handlers.get("cmd:zip")).toBeDefined();
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("1 summary");
 		expect(r.notes.at(-1)).toContain("$0.0200");
 	});
 
-	test("a background summary that a warm return never needs is still booked as cost", async () => {
-		process.env.PI_ZIP_COLD_CAP = "6000";
-		const done = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
-		const complete = async () => ({ stopReason: "stop", content: [{ type: "text", text: "n" }], usage: { cost: { total: 0.02 } } });
-		const r = await rig(done, WARM_TS(), { modelRegistry: { complete } });
-		await r.fire("agent_before_settle", { context: { contextEntries: done }, entries: [] });
-		await r.fire("before_agent_start", {}); // warm: discard
-		await new Promise((res) => setTimeout(res, 20));
+	test("the settle entry stores entry ids only: no placeholder text, no summary text", async () => {
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
+		const settled = await settle(r);
+		const data = settled.entries.at(-1).data;
+		expect(data.policy).toBe("pi-zip");
+		expect(data.targets.every((t: unknown) => typeof t === "string")).toBe(true);
+		expect(data).not.toHaveProperty("summary");
+		expect(JSON.stringify(data)).not.toContain("[folded by pi-zip");
+		expect(JSON.stringify(data).length).toBeLessThan(400);
+	});
+
+	test("the user returns before the timer: before_agent_start cancels it and no summary call is ever made", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		await r.fire("before_provider_request", { payload: {} }); // the cache clock: a request just went out
+		await r.fire("before_agent_start", {});
+		await sleep(250);
+		expect(st.calls).toBe(0);
+		void settled;
+	});
+
+	test("the timer is unref'd (it never keeps the process alive)", async () => {
+		const realSet = globalThis.setTimeout;
+		const timers: Any[] = [];
+		(globalThis as Any).setTimeout = (...a: Any[]) => { const h = (realSet as Any)(...a); timers.push(h); return h; };
+		try {
+			const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } });
+			process.env.PI_ZIP_TTL_SECS = "3600";
+			await settle(r);
+			await r.fire("before_agent_start", {}); // cancel before it could fire
+			expect(timers.some((h) => typeof h.hasRef === "function" && h.hasRef() === false)).toBe(true);
+		} finally {
+			globalThis.setTimeout = realSet;
+		}
+	});
+
+	test("a summary the warm return never needs (context below the valve) is discarded and still booked as cost", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		await sleep(200);
+		expect(st.calls).toBe(1);
+		await r.fire("before_provider_request", { payload: {} }); // a fresh request: the cache is warm again
+		const req = await comeBack(r, settled, Date.now());
+		expect(req).toBeUndefined(); // 1M window, ~100K tokens: below V, so nothing is edited
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("$0.0200");
+		expect(st.calls).toBe(1);
+	});
+
+	test("a summary still being written when the cold user returns: only the remainder is waited for, and nothing is built twice", async () => {
+		const st = { calls: 0, delay: 250 };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		await sleep(150); // timer fired at ~80 ms; the call needs 250 ms
+		expect(st.calls).toBe(1);
+		const t0 = Date.now();
+		const req = await comeBack(r, settled, COLD_TS());
+		expect(Date.now() - t0).toBeLessThan(250); // less than a full call
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1);
+	});
+
+	test("Esc while waiting stops the waiting, not the work: the request goes on without the cut and the summary stays usable", async () => {
+		const st = { calls: 0, delay: 300, signals: [] as Any[] };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		const settled = await settle(r);
+		await sleep(150);
+		const esc = new AbortController();
+		(r.ctx as Any).signal = esc.signal;
+		setTimeout(() => esc.abort(), 30);
+		const t0 = Date.now();
+		const req = await comeBack(r, settled, COLD_TS());
+		expect(Date.now() - t0).toBeLessThan(250);
+		expect(req === undefined || req.messages[0].role !== "compactionSummary").toBe(true); // folds only; no summary yet
+		expect(st.calls).toBe(1);
+		expect(st.signals[0]?.aborted).toBe(false); // the background call has its own controller: Esc did not cancel it
+	});
+
+	test("print/json mode (no UI): settle does nothing and starts nothing; a cold return that needs a summary computes it then", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, COLD_TS(), { hasUI: false, mode: "print", modelRegistry: { complete: mkComplete(st) } });
+		expect(await settle(r)).toBeUndefined();
+		await sleep(200);
+		expect(st.calls).toBe(0); // no timer, no background work
+		const req = await comeBack(r, undefined, COLD_TS());
+		expect(req.messages[0].role).toBe("compactionSummary");
+		expect(st.calls).toBe(1); // built at the cold return, awaited
+	});
+
+	test("/zip off cancels a pending timer", async () => {
+		const st = { calls: 0 };
+		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete(st) } });
+		await settle(r);
+		await r.handlers.get("cmd:zip").handler("off", r.ctx);
+		await sleep(200);
+		expect(st.calls).toBe(0);
 	});
 });
 
@@ -386,15 +488,30 @@ describe("I5 valid: every tool_use keeps its tool_result", () => {
 });
 
 // =============================================================================================================
-describe("I6 warm cache: nothing changes unless the window is nearly full", () => {
+describe("I6 / F10 warm cache: nothing changes unless the context passes the valve V", () => {
 	const session = (outputs: number) => {
 		const e: Any[] = [];
 		for (let t = 0; t < outputs; t++) e.push(U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9000), A(`z${t}`));
 		e.push(U("uN", "now"));
 		return e;
 	};
+	const model = (contextWindow?: number) => ({ provider: "p", id: "m", ...(contextWindow ? { contextWindow } : {}), cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } });
 
-	test("a hot request at 1M window: no local edit, no persisted edit, even with a stale cold plan in the branch", async () => {
+	test("V = min(160K, 0.8 x window, window - reserve - margin); unknown window = 160K; the reserve is Pi's setting", () => {
+		expect(valveTokens(undefined)).toBe(160_000);
+		expect(valveTokens({})).toBe(160_000);
+		expect(valveTokens({ contextWindow: 1_000_000 })).toBe(160_000);
+		expect(valveTokens({ contextWindow: 200_000 })).toBe(160_000);
+		expect(valveTokens({ contextWindow: 128_000 })).toBe(102_400);
+		expect(valveTokens({ contextWindow: 64_000 })).toBe(64_000 - 16_384 - 8_192); // 39.4K: below both 160K and 0.8 x 64K = 51.2K
+		expect(valveTokens({ contextWindow: 64_000 }, 30_000)).toBe(64_000 - 30_000 - 8_192);
+		for (const w of [16_000, 32_000, 64_000, 128_000, 200_000, 1_000_000]) expect(valveTokens({ contextWindow: w })).toBeLessThan(Math.max(w - 16_384, 4_096 + 1));
+		expect(reserveTokensFor({}, undefined)).toBe(16_384);
+		expect(reserveTokensFor({ compaction: { reserveTokens: 5000 } }, undefined)).toBe(5000);
+		expect(reserveTokensFor({ compaction: { reserveTokens: 5000, modelOverrides: { "p/m": { reserveTokens: 9000 } } } }, { provider: "p", id: "m" })).toBe(9000);
+	});
+
+	test("a warm request below V: no local edit, no persisted edit, even with a stale cold plan in the branch", async () => {
 		const entries = session(8);
 		const stale = { type: "custom", customType: "pi-zip/plan", data: { policy: "pi-zip", targets: [], summary: null } };
 		const r = await rig(entries, WARM_TS(), { branch: [...branchOf(entries, WARM_TS()), stale] });
@@ -402,25 +519,162 @@ describe("I6 warm cache: nothing changes unless the window is nearly full", () =
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 		expect(await r.fire("turn_end", turnEnd([...entries, A("zN")], "zN"))).toBeUndefined();
 		expect(r.notes).toEqual([]);
-		expect(planContext(entries, { mode: "hot", base: 0, cwd: ".", model: r.ctx.model })).toBeNull();
+		expect(planContext(entries, { mode: "warm", base: 0, cwd: ".", model: r.ctx.model })).toBeNull();
 	});
 
-	test("below 80% of the window: nothing; above: newest eligible outputs fold down to 80%, protected turns stay", async () => {
-		const entries = session(9); // ~9 x 2.25K tokens
+	test("above V the warm cache is edited with the cold plan: first request carries it, turn_end persists exactly it (one valve, no 0.85 threshold)", async () => {
+		const entries = session(80); // ~180K tokens: above 160K at an unknown window
+		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
+		await r.fire("before_agent_start", {});
+		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
+		const foldedIds = req1.messages.filter((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded by pi-zip")).map((m: Any) => m.toolCallId);
+		expect(foldedIds.length).toBe(79); // the cold plan folds every eligible output (all but the latest turn's... r79 is the previous turn: protected)
+		expect(foldedIds).not.toContain("c79");
 		const all = [...entries, A("zN")];
-		const small = await rig(entries, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 30_000, cost: { cacheWrite: 3, cacheRead: 0.3 } } });
-		await small.fire("before_agent_start", {});
-		expect(await small.fire("turn_end", turnEnd(all, "zN"))).toBeUndefined(); // 21K < 24K
-		const tight = await rig(entries, WARM_TS(), { model: { provider: "p", id: "m", contextWindow: 20_000, cost: { cacheWrite: 3, cacheRead: 0.3 } } });
-		await tight.fire("before_agent_start", {});
-		const te = await tight.fire("turn_end", turnEnd(all, "zN"));
-		const ids = te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId);
-		expect(ids.length).toBeGreaterThan(0);
-		const nums = ids.map((x: string) => Number(x.slice(1)));
-		expect(nums).toEqual([...nums].sort((a, b) => b - a)); // newest first
-		expect(ids).not.toContain("r8"); // r8 belongs to the previous user turn: protected
-		expect(ids[0]).toBe("r7");
-		expect(tight.notes[0]).toContain("context window nearly full");
+		const te = await r.fire("turn_end", turnEnd(all, "zN"));
+		const ids = te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId).sort();
+		expect(ids.length).toBe(79);
+		expect(JSON.stringify(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(JSON.stringify(req1.messages));
+		expect(r.notes[0]).toContain("context over the warm-cache limit");
+	});
+
+	test("the valve follows the window: 128K window -> 102K, 1M -> 160K; a small window stays below Pi's compaction trigger", async () => {
+		const mid = session(50); // ~112K tokens
+		const warmMid = await rig(mid, WARM_TS(), { model: model(128_000) });
+		await warmMid.fire("before_agent_start", {});
+		expect(await warmMid.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // 112K > 102K
+		const big = await rig(mid, WARM_TS(), { model: model(1_000_000) });
+		await big.fire("before_agent_start", {});
+		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeUndefined(); // 112K < 160K
+		const small = session(6); // ~14K tokens
+		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // V = 8192
+		await tiny.fire("before_agent_start", {});
+		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
+		// the cold cap never exceeds Pi's compaction room either
+		const prose = [U("u1", "one"), A("a1"), AX("x1", 60_000), U("u2", "two"), A("a2"), AX("x2", 60_000), U("u3", "three"), A("a3"), U("u4", "now")]; // ~30K tokens of prose
+		const clamped = planContext(prose, { mode: "cold", base: 0, cwd: ".", model: model(32_000), coldCap: 60_000, promptPending: false });
+		expect(clamped!.sumTrigger).not.toBeNull(); // 30K > the compaction room (7.4K): the 60K default cap is clamped
+		const roomy = planContext(prose, { mode: "cold", base: 0, cwd: ".", model: model(1_000_000), coldCap: 60_000, promptPending: false });
+		expect(roomy!.sumTrigger).toBeNull(); // the same context at a 1M window is under the cap
+	});
+
+	test("a context that grows past V in the middle of a warm run is edited at turn_end, for the next request", async () => {
+		const entries = session(80);
+		const r = await rig(entries, WARM_TS(), { model: model(undefined) });
+		await r.fire("before_agent_start", {});
+		// the run started small (first request saw a short session), then grew
+		const first = await rig(session(3), WARM_TS(), { model: model(undefined) });
+		await first.fire("before_agent_start", {});
+		expect(await first.fire("context_with_system", { messages: flat(session(3)) })).toBeUndefined();
+		const te = await first.fire("turn_end", turnEnd([...entries, A("zN")], "zN"));
+		expect(te.entries.filter((e: Any) => e.type === "context_edit").length).toBe(79);
+		expect(first.notes[0]).toContain("context over the warm-cache limit");
+	});
+});
+
+// =============================================================================================================
+describe("run lifecycle: failures, calibration, steering", () => {
+	const prevRun = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4")];
+	const cold = [...prevRun, U("u3", "back after the idle")];
+
+	test("an aborted or errored first turn still persists the plan its first request already sent", async () => {
+		for (const stopReason of ["aborted", "error"]) {
+			const r = await rig(cold, COLD_TS());
+			await r.fire("before_agent_start", {});
+			const req = await r.fire("context_with_system", { messages: flat(cold) });
+			expect(req.messages.some((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded"))).toBe(true);
+			const te = await r.fire("turn_end", { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason, usage: { input: 0, cacheRead: 0, cacheWrite: 0 } } });
+			expect(te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId)).toEqual(["r1"]);
+		}
+	});
+
+	test("a failed turn that never sent a plan persists nothing; when planning threw, the edit run simply ends", async () => {
+		const r = await rig(cold, COLD_TS());
+		await r.fire("before_agent_start", {});
+		// the request failed before the context hook ran: no plan was sent
+		expect(await r.fire("turn_end", { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason: "error", usage: {} } })).toBeUndefined();
+		const t = await rig(cold, COLD_TS());
+		t.ctx.sessionManager.buildSessionProjection = () => { throw new Error("projection exploded"); };
+		await t.fire("before_agent_start", {});
+		expect(await t.fire("context_with_system", { messages: flat(cold) })).toBeUndefined();
+		expect(await t.fire("turn_end", turnEnd([...cold, A("a5")], "a5"))).toBeUndefined(); // nothing was sent, so nothing is persisted
+	});
+
+	test("only re-readable previous-turn outputs are folded (planner and guard agree)", async () => {
+		// a previous-turn output that is not re-readable stays: the planner never picks it and the guard would refuse it
+		const nonRereadable = cold.map((e) => e);
+		const r1 = nonRereadable.find((e) => e.sourceEntry.id === "r2")!;
+		(r1.messages[0] as Any).toolName = "write";
+		const call = nonRereadable.find((e) => e.sourceEntry.id === "a3")!;
+		(call.messages[0] as Any).content[1].name = "write";
+		process.env.PI_ZIP_COLD_CAP = "1000";
+		const r = await rig(nonRereadable, COLD_TS());
+		await r.fire("before_agent_start", {});
+		const req = await r.fire("context_with_system", { messages: flat(nonRereadable) });
+		const foldedIds = req.messages.filter((m: Any) => m.role === "toolResult" && m.content[0].text.startsWith("[folded")).map((m: Any) => m.toolCallId);
+		expect(foldedIds).toEqual(["c1"]); // c2 (write, previous turn) stays: not re-readable
+	});
+
+	test("calibration at the first cold turn_end uses the view that was SENT, so the base is not clamped to 0", async () => {
+		const ledger = `/tmp/pi-zip-test-ledger-${process.pid}.jsonl`;
+		process.env.PI_ZIP_LEDGER = ledger;
+		try { require("node:fs").unlinkSync(ledger); } catch {}
+		const r = await rig(cold, COLD_TS());
+		await r.fire("before_agent_start", {});
+		await r.fire("context_with_system", { messages: flat(cold) });
+		const te = { ...turnEnd([...cold, A("a5")], "a5"), message: { role: "assistant", stopReason: "stop", usage: { input: 9_000, cacheRead: 0, cacheWrite: 0 } } };
+		await r.fire("turn_end", te);
+		const line = require("node:fs").readFileSync(ledger, "utf8").trim().split("\n").map((l: string) => JSON.parse(l)).find((l: Any) => l.type === "fold");
+		// the sent view = prompt + folded r1 + r2 + ... ~ 2.4K tokens, so the base is ~ 9000 - that (thousands), never 0 and never the 40K clamp
+		const unfolded = buildBlocks([...cold, A("a5")]).reduce((a, b) => a + b.tokens, 0);
+		expect(line.ctxBefore).toBeGreaterThan(unfolded + 3000);
+		expect(line.ctxBefore).toBeLessThan(unfolded + 9000);
+		require("node:fs").unlinkSync(ledger);
+	});
+
+	test("viewTokensBefore: folds and a cut shrink what was sent; an unapplied fold does not", () => {
+		const b = buildBlocks([U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 8000), A("a2"), U("u2", "two")]);
+		const t = { entryId: "r1", phTokens: 100 } as Any;
+		const total = b.reduce((a, x) => a + x.tokens, 0) - b[b.length - 1].tokens;
+		expect(viewTokensBefore(b, 4, null)).toBe(total);
+		expect(viewTokensBefore(b, 4, { folds: [t], cut: null } as Any)).toBe(total - b[2].tokens + 100);
+		expect(viewTokensBefore(b, 4, { folds: [t], applied: new Set(), cut: null } as Any)).toBe(total);
+		expect(viewTokensBefore(b, 4, { folds: [], cut: { firstKeptEntryId: "a2", summaryTokens: 50 } } as Any)).toBe(50 + b[3].tokens);
+	});
+
+	test("steering messages typed during a run are not new user turns: marked at turn_end, persisted, restored on resume", async () => {
+		const withTs = (e: Any, ts: number) => { (e.sourceEntry.message as Any).timestamp = ts; (e.messages[0] as Any).timestamp = ts; return e; };
+		const prompt = withTs(U("u3", "back"), 1000);
+		const steer = withTs(U("u3s", "also do this"), 2000);
+		const entries = [...prevRun, prompt, A("a5", ["c5"]), R("r5", "c5", 300), steer];
+		const r = await rig(entries, COLD_TS());
+		await r.fire("before_agent_start", {});
+		await r.fire("message_end", { message: { role: "user", timestamp: 1000, content: "back" } });
+		await r.fire("message_end", { message: { role: "user", timestamp: 2000, content: "also do this" } });
+		const all = [...entries, A("a6")];
+		const te = await r.fire("turn_end", turnEnd(all, "a6"));
+		const marker = te.entries.find((e: Any) => e.customType === "pi-zip/steer");
+		expect(marker.data.ids).toEqual(["u3s"]);
+		// a new pi started on this session: the markers come back from the branch
+		const resumed = await rig(entries, COLD_TS(), { branch: [...branchOf(entries, COLD_TS()), { type: "custom", customType: "pi-zip/steer", data: { ids: ["u3s"] } }] });
+		await resumed.fire("session_start", {});
+		// ... and the plan counts 3 turns, not 4: the steering message is part of turn 3
+		const asTurns = (steerIds?: Set<string>) => planContext(entries, { base: 0, cwd: ".", promptPending: false, steerIds })!.userTurns;
+		expect(asTurns()).toBe(4);
+		expect(asTurns(new Set(["u3s"]))).toBe(3);
+		const blocks = buildBlocks(entries, new Set(["u3s"]));
+		expect(blocks.find((b) => b.entryId === "u3s")!.userTurn).toBe(3);
+	});
+
+	test("a steering message does not unprotect or protect the wrong turn: folds are chosen as if it were absent", () => {
+		const prompt = U("u3", "back");
+		const steer = U("u3s", "also");
+		const base = [...prevRun, prompt, A("a5", ["c5"]), R("r5", "c5"), A("a6")];
+		const without = planContext(base, { base: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		const withSteer = planContext([...base, steer, A("a7")], { base: 0, cwd: ".", promptPending: false, steerIds: new Set(["u3s"]) })!.folds.map((t) => t.entryId);
+		expect(withSteer).toEqual(without);
+		const counted = planContext([...base, steer, A("a7")], { base: 0, cwd: ".", promptPending: false })!.folds.map((t) => t.entryId);
+		expect(counted).not.toEqual(without); // unmarked, the same message would shift the protected window
 	});
 });
 

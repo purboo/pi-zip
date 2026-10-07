@@ -1,11 +1,12 @@
-// The per-session state machine behind index.ts: cold detection, the run plan (F8), persistence at turn_end, settle preparation (F12).
+// The per-session state machine behind index.ts: cold detection, the run plan (F8), the warm valve (F10), persistence at turn_end,
+// settle preparation and the away-timer for the summary (F12).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { detectCold, modelKey, ttlFor } from "./cache.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { Stats, noticeText, statsText, type NoticeAction, type ZipControl } from "./notice.ts";
-import { applyPlanToMessages, buildBlocks, planContext, type Block, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "./plan.ts";
+import { applyPlanToMessages, buildBlocks, countUserTurns, planContext, reserveTokensFor, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
 import { handleFor } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
@@ -13,6 +14,8 @@ import { type Any, PRODUCT, clamp, tok4 } from "./util.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
+export const STEER_CUSTOM = "pi-zip/steer";
+export const AWAY_FRACTION = 0.8; // the away-timer fires this far into the cache lifetime
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
 const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compact|context-prune|pi-vcc|context-mode|prefix-cache/i;
 
@@ -25,11 +28,37 @@ export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget
 	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
 }
 
+/** Tokens of the request view that preceded block `upTo`, with a not-yet-persisted plan applied (that is what was really sent). */
+export function viewTokensBefore(blocks: Block[], upTo: number, plan: RunPlan | null): number {
+	const cutIdx = plan?.cut ? blocks.findIndex((b) => b.entryId === plan.cut!.firstKeptEntryId) : -1;
+	const folded = new Map((plan?.folds ?? []).filter((t) => !plan!.applied || plan!.applied.has(t.entryId)).map((t) => [t.entryId, t.phTokens]));
+	let sum = cutIdx > 0 && cutIdx <= upTo ? plan!.cut!.summaryTokens : 0;
+	for (let i = Math.max(cutIdx, 0); i < upTo; i++) {
+		const id = blocks[i].entryId;
+		sum += (id ? folded.get(id) : undefined) ?? blocks[i].tokens;
+	}
+	return sum;
+}
+
+/** A summary being prepared (or finished) while the user is away. It has its own AbortController: no run owns it. */
 interface Bg {
-	key: string | null;
+	key: string | null; // firstKeptEntryId of the cut it was written for
 	done: Cut | null;
 	promise: Promise<Cut | null>;
+	controller: AbortController;
 }
+
+/** Resolves with the promise's value, or null as soon as the signal aborts (Esc cancels the waiting, not the work). */
+function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | null> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) return resolve(null);
+		const onAbort = () => resolve(null);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		promise.then(resolve, () => resolve(null)).finally(() => signal?.removeEventListener("abort", onAbort));
+	});
+}
+
+const errText = (err: unknown) => (err instanceof Error ? (err.stack ?? err.message) : String(err));
 
 export class Zip implements ZipControl {
 	off = false;
@@ -38,19 +67,24 @@ export class Zip implements ZipControl {
 	readonly stats = new Stats();
 	readonly recalled = new Set<string>();
 	private cold = false;
-	private coldDone = true;
 	private coldReason = "";
+	private runChecked = true; // the first request of the run has been looked at
+	private runEdits = false; // this run carries an edit plan that turn_end has yet to persist
+	private runPlan: RunPlan | null = null;
 	private base = 0;
 	private lastReqMs = 0; // the real-time cache clock: newest request start or end
 	private lastModelKey = ""; // provider/model of the newest request: a cache entry belongs to one model
-	private settlePlan: Any = null;
-	private runPlan: RunPlan | null = null;
-	private runPlanned = false;
+	private settleIds: string[] = []; // entries the settle plan folded: only used to label a plan as prepared
 	private bg: Bg | null = null;
 	private bgWaitMs = 0;
+	private timer: ReturnType<typeof setTimeout> | null = null;
+	private timerGen = 0;
 	private wireLedgered = false;
 	private model: Any;
 	private conflictNoticed = false;
+	private runUserSeen = 0;
+	private steerTs = new Set<number>(); // timestamps of steering/follow-up user messages not yet marked in the session
+	private steerIds = new Set<string>(); // marked: user entries that are NOT new user turns
 
 	constructor(private pi: ExtensionAPI) {}
 
@@ -83,8 +117,16 @@ export class Zip implements ZipControl {
 		}
 	}
 
-	private opts(ctx: Any, pending: boolean, mode: "cold" | "hot"): PlanOpts {
-		return { mode, base: this.base || tok4(ctx.getSystemPrompt?.() ?? "") + 1500, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending };
+	private reserve(ctx: Any): number {
+		try {
+			return reserveTokensFor(this.pi.getSettings?.(), ctx?.model);
+		} catch {
+			return reserveTokensFor(undefined, ctx?.model);
+		}
+	}
+
+	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm"): PlanOpts {
+		return { mode, base: this.base || tok4(ctx.getSystemPrompt?.() ?? "") + 1500, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, reserve: this.reserve(ctx), steerIds: this.steerIds };
 	}
 
 	private detectConflict(ctx: Any) {
@@ -116,192 +158,288 @@ export class Zip implements ZipControl {
 				break;
 			}
 		}
+		for (const en of branch) if (en?.type === "custom" && en.customType === STEER_CUSTOM && Array.isArray(en.data?.ids)) for (const id of en.data.ids) if (typeof id === "string") this.steerIds.add(id);
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		this.model = ctx?.model;
 		this.detectConflict(ctx);
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict });
 	}
 
+	shutdown() {
+		this.cancelTimer();
+		this.bg?.controller.abort();
+		this.bg = null;
+	}
+
 	beforeAgentStart(ctx: Any) {
+		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.model = ctx?.model;
 		this.cold = false;
-		this.coldDone = true;
+		this.runChecked = true;
+		this.runEdits = false;
 		this.runPlan = null;
-		this.runPlanned = false;
-		this.settlePlan = null;
+		this.settleIds = [];
 		this.bgWaitMs = 0;
 		this.wireLedgered = false;
+		this.runUserSeen = 0;
 		if (!this.active()) return;
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
 		const { cold, reason } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey);
 		this.cold = cold;
-		this.coldDone = !cold;
+		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the valve)
 		this.coldReason = reason;
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
-		if (!cold) this.discardBg();
-		if (cold) {
-			for (let i = branch.length - 1; i >= 0; i--) {
-				const en = branch[i];
-				if (en?.type !== "custom" || en.customType !== PLAN_CUSTOM) continue;
-				if (en.data?.policy === PRODUCT) this.settlePlan = en.data;
-				break;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const en = branch[i];
+			if (en?.type !== "custom" || en.customType !== PLAN_CUSTOM) continue;
+			if (en.data?.policy === PRODUCT) {
+				if (cold && Array.isArray(en.data.targets)) this.settleIds = en.data.targets.map((t: Any) => (typeof t === "string" ? t : t?.entryId)).filter((x: Any) => typeof x === "string");
+				if (cold && en.data.baseTokens && !this.base) this.base = en.data.baseTokens; // same ctx math at settle and at return
 			}
-			if (this.settlePlan?.baseTokens && !this.base) this.base = this.settlePlan.baseTokens; // same ctx math at settle and at return
+			break;
 		}
-		this.ledger({ type: "prompt", cold, reason, settleTargets: this.settlePlan?.targets?.length ?? 0 });
+		this.ledger({ type: "prompt", cold, reason, settleTargets: this.settleIds.length });
 	}
 
-	/** A background summary nobody adopted still cost money: book it. */
+	private cancelTimer() {
+		this.timerGen++;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = null;
+	}
+
+	/** A summary nobody adopted still cost money: abort it if it is still running, book it if it finished. */
 	private discardBg() {
 		const b = this.bg;
 		this.bg = null;
-		b?.promise.then((c) => { if (c) this.stats.summaryUsd += c.costUsd; });
+		if (!b) return;
+		if (!b.done) b.controller.abort();
+		b.promise.then((c) => { if (c) this.stats.summaryUsd += c.costUsd; });
 	}
 
 	async context(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
-		if (!this.runPlanned && this.cold && !this.coldDone) {
-			this.runPlanned = true;
+		if (!this.runChecked) {
+			this.runChecked = true;
 			try {
 				await this.computeRunPlan(ctx);
 			} catch (err) {
-				this.ledger({ type: "error", where: "context/run_plan", error: err instanceof Error ? (err.stack ?? err.message) : String(err) });
+				// no plan was sent, so none may be persisted: end the edit run here
+				this.runPlan = null;
+				this.runEdits = false;
+				this.ledger({ type: "error", where: "context/run_plan", error: errText(err) });
 			}
 		}
 		if (this.runPlan && !this.runPlan.persisted) {
 			const out = applyPlanToMessages(e.messages, this.runPlan);
-			if (out) return { messages: out.messages };
+			if (out) {
+				this.runPlan.sent = true;
+				this.runPlan.applied = out.applied;
+				return { messages: out.messages };
+			}
 		}
 		return undefined;
 	}
 
-	/** ONE plan per cold run: computed at the first request (the new prompt is in the session), applied to every request until turn_end persists the same set. */
+	/** A prepared summary for this cut, or null. A summary still being written is waited for (only the remainder); Esc stops the waiting, not the work. */
+	private async takeBg(key: string | null, signal?: AbortSignal): Promise<{ cut: Cut | null; adopted: boolean }> {
+		const b = this.bg;
+		if (!b || key === null || b.key !== key) {
+			this.discardBg();
+			return { cut: null, adopted: false };
+		}
+		const w0 = performance.now();
+		const cut = b.done ?? (await waitFor(b.promise, signal));
+		this.bgWaitMs = performance.now() - w0;
+		if (cut) {
+			this.bg = null;
+			return { cut, adopted: true };
+		}
+		if (signal?.aborted) return { cut: null, adopted: false }; // keep it running: a retry of the prompt can still use it
+		this.discardBg();
+		return { cut: null, adopted: false };
+	}
+
+	/** ONE plan per edit run: computed at the first request (the new prompt is in the session), applied to every request until turn_end persists the same set. */
 	private async computeRunPlan(ctx: Any) {
 		const t0 = performance.now();
 		const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
-		const p = planContext(entries, this.opts(ctx, false, "cold"));
+		const p = planContext(entries, this.opts(ctx, false, this.cold ? "cold" : "warm"));
+		if (!this.cold && !p) {
+			this.discardBg(); // a warm return below the valve: a prepared summary does not pay back
+			return;
+		}
+		this.runEdits = true;
+		const trigger = this.cold ? "cold" : "valve";
 		let folds: FoldTarget[] = p?.folds ?? [];
 		let cut: Cut | null = null;
-		let source: RunPlan["source"] = "runstart";
-		const settleFolds: FoldTarget[] = Array.isArray(this.settlePlan?.targets) ? this.settlePlan.targets : [];
-		const sameSet = settleFolds.length === folds.length && settleFolds.every((t) => folds.some((u) => u.entryId === t.entryId));
 		let adopted = false;
-		if (this.settlePlan && sameSet) {
-			let settleCut: Cut | null = this.settlePlan.summary ?? null;
-			if (!settleCut && this.bg && p && p.cutIdx !== null && this.bg.key === p.firstKeptEntryId) {
-				const w0 = performance.now();
-				settleCut = this.bg.done ?? (await this.bg.promise); // usually ready; else wait only for the remainder
-				this.bgWaitMs = performance.now() - w0;
-				adopted = !!settleCut;
-			}
-			if (settleCut && p && p.cutIdx !== null && settleCut.firstKeptEntryId === p.firstKeptEntryId) {
-				source = "settle"; // adopt the prepared summary and the settle view's byte-identical placeholders
-				folds = settleFolds;
-				cut = settleCut;
-			} else if (!settleCut && p?.cutIdx === null) {
-				source = "settle";
-				folds = settleFolds;
-			}
+		if (p && p.cutIdx !== null) {
+			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal);
+			cut = got.cut;
+			adopted = got.adopted;
+		} else {
+			this.discardBg();
 		}
-		if (this.bg && !adopted) this.discardBg();
+		const sameSet = this.settleIds.length === folds.length && this.settleIds.every((id) => folds.some((u) => u.entryId === id));
+		const source: RunPlan["source"] = !this.cold ? "valve" : adopted || (this.settleIds.length > 0 && sameSet) ? "settle" : "runstart";
 		const foldMs = performance.now() - t0;
-		if (!cut && p && p.cutIdx !== null) cut = await buildCut(p, ctx); // produced now, before the first request: the user waits
+		if (!cut && p && p.cutIdx !== null && !ctx.signal?.aborted) cut = await buildCut(p, ctx); // produced now, before the first request: the user waits
 		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
-		let invalid: string | null = null;
 		if (p) {
-			invalid = checkEdits(p.blocks, p.userTurns, folds, cut);
-			if (invalid && cut) {
-				cut = null;
-				const again = checkEdits(p.blocks, p.userTurns, folds, null);
-				if (again) { folds = []; cut = null; }
+			const invalid = checkEdits(p.blocks, p.userTurns, folds, cut);
+			if (invalid) {
+				this.ledger({ type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length, summary: !!cut });
+				if (cut && checkEdits(p.blocks, p.userTurns, folds, null) === null) cut = null;
+				else { folds = []; cut = null; }
 			}
-			if (invalid) this.ledger({ type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length });
 		}
 		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
 		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, persisted: false, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg };
-		this.ledger({ type: "cold_plan", source, folds: folds.length, summary: !!cut, ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(source === "settle" ? this.bgWaitMs : cut.ms) } : {}) });
+		this.ledger({ type: "cold_plan", trigger, source, folds: folds.length, summary: !!cut, ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(adopted ? this.bgWaitMs : cut.ms), ...this.usageOf(cut) } : {}) });
 	}
 
-	/** Prepare the next cold return while the user is away: pure computation, and (interactive) the summary in the background. */
+	private usageOf(cut: Cut) {
+		const u = cut.usage;
+		return u ? { summaryUsage: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } } : {};
+	}
+
+	/**
+	 * Prepare the next cold return while the user is away (interactive only; print and json mode exit right after settle, so there is
+	 * nothing to prepare and nothing is ever started in the background). The plan itself is local and free; only a summary needs
+	 * a model call, and that is started by a timer 0.8 x TTL after the last request, if the user has not come back by then.
+	 */
 	async settle(e: Any, ctx: Any): Promise<Any> {
-		if (!this.active()) return undefined;
+		if (!this.active() || !ctx.hasUI) return undefined;
 		try {
 			const t0 = performance.now();
 			const p = planContext(e.context.contextEntries, this.opts(ctx, true, "cold"));
 			if (!p) return undefined;
-			this.discardBg();
-			let summary: Cut | null = null;
+			this.cancelTimer();
+			let scheduledMs: number | null = null;
 			if (p.cutIdx !== null) {
-				if (ctx.hasUI) {
-					// never hold the turn open for a model call: build in the background; the next cold run adopts it, a warm return discards it
-					const bg: Bg = { key: p.firstKeptEntryId, done: null, promise: Promise.resolve(null) };
-					bg.promise = buildCut(p, ctx).then((c) => ((bg.done = c), c)).catch((err) => {
-						this.ledger({ type: "error", where: "settle/bg_summary", error: err instanceof Error ? err.message : String(err) });
-						return null;
-					});
-					this.bg = bg;
+				if (this.bg && this.bg.key === p.firstKeptEntryId) {
+					// the summary for this very cut is already in flight or done: keep it
 				} else {
-					summary = await buildCut(p, ctx); // print/json mode exits right after settle: a background call would be lost
+					this.discardBg();
+					scheduledMs = this.scheduleSummary(p, ctx);
 				}
+			} else {
+				this.discardBg();
 			}
-			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: !!summary, background: !!this.bg, ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
-			if (!p.folds.length && !summary && !this.bg) return undefined;
-			const data = { policy: PRODUCT, ts: Date.now(), baseTokens: Math.round(this.base || p.ctxTokens - p.blocks.reduce((a, b) => a + b.tokens, 0)), targets: p.folds, summary };
+			this.ledger({ type: "settle_plan", folds: p.folds.length, summary: p.cutIdx !== null, timerMs: scheduledMs, ctxBefore: Math.round(p.ctxTokens), ms: Math.round(performance.now() - t0) });
+			if (!p.folds.length && p.cutIdx === null) return undefined;
+			// ids only: placeholders and summary text are recomputed (they are pure functions of the session), never stored a second time
+			const data = { policy: PRODUCT, ts: Date.now(), baseTokens: Math.round(this.base || p.ctxTokens - p.blocks.reduce((a, b) => a + b.tokens, 0)), targets: p.folds.map((t) => t.entryId), cutKey: p.firstKeptEntryId };
 			return { entries: [...e.entries, { type: "custom", customType: PLAN_CUSTOM, data }] };
 		} catch (err) {
-			this.ledger({ type: "error", where: "settle", error: err instanceof Error ? (err.stack ?? err.message) : String(err) });
+			this.ledger({ type: "error", where: "settle", error: errText(err) });
 			return undefined; // never break the session
 		}
+	}
+
+	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
+	private scheduleSummary(p: PlanResult, ctx: Any): number {
+		const ttl = ttlFor(ctx.model);
+		const delay = Math.max(0, (this.lastReqMs || Date.now()) + AWAY_FRACTION * ttl - Date.now());
+		const gen = ++this.timerGen;
+		this.timer = setTimeout(() => void this.runAway(p, ctx, gen), delay);
+		this.timer.unref?.();
+		return Math.round(delay);
+	}
+
+	private async runAway(p: PlanResult, ctx: Any, gen: number) {
+		this.timer = null;
+		if (gen !== this.timerGen || !this.active()) return; // the user came back, or we were switched off
+		const controller = new AbortController();
+		const bg: Bg = { key: p.firstKeptEntryId, done: null, promise: Promise.resolve(null), controller };
+		bg.promise = buildCut(p, ctx, controller.signal)
+			.then((c) => ((bg.done = c), this.ledger({ type: "away_summary", ms: c.ms, llmOk: c.llmOk, costUsd: c.costUsd, ...this.usageOf(c) }), c))
+			.catch((err) => {
+				this.ledger({ type: "error", where: "away_summary", error: err instanceof Error ? err.message : String(err) });
+				return null;
+			});
+		this.bg = bg;
+		this.ledger({ type: "away_summary_start" });
 	}
 
 	async turnEnd(e: Any, ctx: Any): Promise<Any> {
 		if (!this.active()) return undefined;
 		try {
-			return await this.onTurnEnd(e, ctx);
+			const fresh = this.collectSteer(e); // marked before anything is validated: a steering message is part of its turn
+			const out = await this.onTurnEnd(e, ctx);
+			if (!fresh.length) return out;
+			this.ledger({ type: "steer", ids: fresh });
+			return { entries: [...(out?.entries ?? e.entries), { type: "custom", customType: STEER_CUSTOM, data: { ids: fresh } }] };
 		} catch (err) {
-			this.ledger({ type: "error", where: "turn_end", error: err instanceof Error ? (err.stack ?? err.message) : String(err) });
+			this.ledger({ type: "error", where: "turn_end", error: errText(err) });
 			return undefined;
 		}
 	}
 
+	/** Steering and follow-up user messages (typed during a run) are not new user turns; Pi does not mark them, so we persist the ids. */
+	private collectSteer(e: Any): string[] {
+		if (!this.steerTs.size) return [];
+		const ids: string[] = [];
+		for (const pe of e.context?.contextEntries ?? []) {
+			const src = pe.sourceEntry;
+			const m = src?.type === "message" ? src.message : null;
+			if (m?.role === "user" && typeof m.timestamp === "number" && this.steerTs.has(m.timestamp) && src.id && !this.steerIds.has(src.id)) ids.push(src.id);
+		}
+		this.steerTs.clear();
+		for (const id of ids) this.steerIds.add(id);
+		return ids;
+	}
+
 	private async onTurnEnd(e: Any, ctx: Any) {
 		const msg: Any = e.message;
-		if (msg?.stopReason === "error" || msg?.stopReason === "aborted") return undefined;
+		const failed = msg?.stopReason === "error" || msg?.stopReason === "aborted";
 		const t0 = performance.now();
-		const blocks = buildBlocks(e.context.contextEntries);
+		const blocks = buildBlocks(e.context.contextEntries, this.steerIds);
 		if (!blocks.length) return undefined;
-		const userTurns = blocks.filter((b) => b.kind === "user").length;
-		// calibrate the base overhead from the real usage of the request that produced this assistant message
+		const userTurns = countUserTurns(blocks);
+		// calibrate the base overhead from the real usage of the request that produced this assistant message: what was SENT is the
+		// view with this run's plan applied, not the unedited projection
 		const ai = blocks.findIndex((b) => b.entryId === e.messageEntryId);
 		const u = msg?.usage;
 		const usageTotal = u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0;
-		if (ai >= 0 && usageTotal > 0) this.base = clamp(usageTotal - blocks.slice(0, ai).reduce((a, b) => a + b.tokens, 0), 0, 40_000);
-		else if (!this.base) this.base = tok4(ctx.getSystemPrompt?.() ?? "") + 1500;
+		const carrying = this.runEdits && !!this.runPlan && !this.runPlan.persisted;
+		if (!failed && ai >= 0 && usageTotal > 0) {
+			const b = usageTotal - viewTokensBefore(blocks, ai, carrying ? this.runPlan : null);
+			if (b > 0) this.base = clamp(b, 0, 40_000); // a non-positive difference is an estimate error, not a zero base: keep the old one
+		}
+		if (!this.base) this.base = tok4(ctx.getSystemPrompt?.() ?? "") + 1500;
 		const ctxTokens = this.base + blocks.reduce((a, b) => a + b.tokens, 0);
 		const o = { t0, blocks, userTurns, ctxTokens, usageTotal };
-		if (this.cold && !this.coldDone) {
-			// the run has carried its plan since the first request: persist EXACTLY it, so request N+1's prefix equals this run's
-			if (!this.runPlan) {
-				const p = planContext(e.context.contextEntries, this.opts(ctx, false, "cold")); // defensive: a continuation path skipped the context event
-				this.runPlan = { source: "runstart", folds: p?.folds ?? [], cut: null, ctxBefore: p?.ctxTokens ?? ctxTokens, ctxAfter: p?.ctxAfterFolds ?? ctxTokens, ms: 0, persisted: false };
+		if (this.runEdits) {
+			this.runEdits = false;
+			if (!this.runPlan?.sent && this.runPlan && (this.runPlan.folds.length || this.runPlan.cut)) {
+				this.runPlan = null; // never sent (the request failed before the context hook, or nothing matched): persisting it would change a prefix nobody saw
+				return undefined;
 			}
-			this.coldDone = true;
+			if (!this.runPlan) return undefined;
+			// the run has carried its plan since the first request: persist EXACTLY it, even when this turn failed (the prefix was sent and cached)
 			return this.commit(e, ctx, this.runPlan, o);
 		}
-		// warm cache: nothing, unless the window is nearly full (I6)
-		const p = planContext(e.context.contextEntries, this.opts(ctx, false, "hot"));
+		if (failed) return undefined;
+		// warm cache: nothing, unless the context passed the valve V (I6, F10): then the same plan as cold, from the next request on
+		const p = planContext(e.context.contextEntries, this.opts(ctx, false, "warm"));
 		if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
-		const cut = p.cutIdx !== null ? await buildCut(p, ctx) : null; // emergency only: the alternative is Pi's lossy compaction
-		const plan: RunPlan = { source: "pressure", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, persisted: false };
+		let cut: Cut | null = null;
+		if (p.cutIdx !== null) {
+			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal);
+			cut = got.cut ?? (await buildCut(p, ctx)); // the user is here and the cache is warm; the alternative is Pi's lossy compaction
+		} else this.discardBg();
+		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, persisted: false };
 		return this.commit(e, ctx, plan, o);
 	}
 
 	private commit(e: Any, ctx: Any, plan: RunPlan, o: { t0: number; blocks: Block[]; userTurns: number; ctxTokens: number; usageTotal: number }) {
 		plan.persisted = true;
 		const byId = new Map(o.blocks.map((b) => [b.entryId, b]));
-		const live = plan.folds.filter((t) => byId.has(t.entryId));
+		const wasApplied = (t: FoldTarget) => !plan.applied || plan.applied.has(t.entryId); // persist what the requests actually carried
+		const live = plan.folds.filter((t) => byId.has(t.entryId) && wasApplied(t));
 		const stale = plan.folds.length - live.length; // e.g. Pi auto-compaction removed them from the projection
 		const cut = plan.cut && byId.has(plan.cut.firstKeptEntryId) ? plan.cut : null;
 		if (!live.length && !cut) {
@@ -324,7 +462,7 @@ export class Zip implements ZipControl {
 		s.folds += live.length;
 		s.foldedTokens += before - after;
 		s.activeSaved += before - after + cutSaved;
-		if (plan.source === "pressure") {
+		if (plan.source === "valve") {
 			s.pressureEdits++;
 			s.pressureRewriteTokens += o.ctxTokens;
 		} else {
@@ -342,13 +480,13 @@ export class Zip implements ZipControl {
 			entryTokensBefore: before, entryTokensAfter: after, ctxBefore: o.ctxTokens, ctxAfter: o.ctxTokens - (before - after) - cutSaved, usageTotal: o.usageTotal,
 			coldReason: this.coldReason, prepared: plan.source === "settle", ...(stale ? { staleTargets: stale } : {}),
 		});
-		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd });
-		const pressure = plan.source === "pressure";
+		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
+		const valve = plan.source === "valve";
 		const notices: NoticeAction[] = [];
-		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: o.ctxTokens, tokensAfter: o.ctxTokens - (before - after), ms: plan.ms + (performance.now() - o.t0), pressure });
+		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: o.ctxTokens, tokensAfter: o.ctxTokens - (before - after), ms: plan.ms + (performance.now() - o.t0), pressure: valve });
 		if (cut) {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: o.ctxTokens - (before - after), tokensAfter: o.ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure });
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: o.ctxTokens - (before - after), tokensAfter: o.ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
 		}
 		if (notices.length && !this.quiet) this.notify(ctx, noticeText(notices));
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
@@ -376,6 +514,10 @@ export class Zip implements ZipControl {
 
 	messageEnd(m: Any) {
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
+		if (m?.role === "user" && this.active()) {
+			// the first user message of a run is the prompt; later ones (steering, follow-up) are part of that run's turn. Pi does not mark them, we do.
+			if (this.runUserSeen++ > 0 && typeof m.timestamp === "number") this.steerTs.add(m.timestamp);
+		}
 		const u = m?.usage;
 		if (m?.role === "assistant" && u) this.ledger({ type: "usage", stop: m.stopReason, input: u.input, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output });
 	}
@@ -400,7 +542,7 @@ export class Zip implements ZipControl {
 	statsLine = () => statsText(this.stats, this.model);
 	setOff(off: boolean): string {
 		this.off = off;
-		if (off) { this.runPlan = null; this.discardBg(); }
+		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.discardBg(); }
 		this.persistState();
 		return off ? `${PRODUCT}: off. Nothing is folded or summarised and requests are left untouched; earlier folds stay recallable (/zip on to resume)` : `${PRODUCT}: on`;
 	}
@@ -410,4 +552,3 @@ export class Zip implements ZipControl {
 		return `${PRODUCT}: per-turn notices ${this.quiet ? "off" : "on"} (folding continues)`;
 	}
 }
-

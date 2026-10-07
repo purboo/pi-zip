@@ -16,4 +16,5 @@ export default function piZip(pi: ExtensionAPI) {
 	pi.on("agent_before_settle", (e, ctx) => zip.settle(e, ctx));
 	pi.on("before_provider_request", (e) => zip.providerRequest(e));
 	pi.on("message_end", (e) => zip.messageEnd(e.message));
+	pi.on("session_shutdown", () => zip.shutdown());
 }

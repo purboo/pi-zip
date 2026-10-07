@@ -13,8 +13,35 @@ const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are 
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
-export const FOLD_AT = 0.8; // hot: fold only above this share of the context window
-export const SUMMARY_AT = 0.85; // hot: summarise only above this share of the context window
+
+// The warm valve (F10): a warm cache is never touched unless the context is already so large that every later request pays
+// to read it. V is also kept below Pi's own compaction trigger (window - reserveTokens), otherwise Pi's lossy compaction
+// would always get there first.
+export const VALVE_MAX = 160_000;
+export const VALVE_RATIO = 0.8;
+export const DEFAULT_RESERVE_TOKENS = 16_384; // Pi's compaction reserve default
+export const COMPACT_MARGIN = 8_192; // estimates are chars/4: stay clear of the trigger
+const MIN_TARGET = 4_096;
+
+/** Pi's compaction reserve for this model: compaction.modelOverrides["provider/id"], else compaction.reserveTokens, else 16384. */
+export function reserveTokensFor(settings: Any, model: Any): number {
+	const c = settings?.compaction;
+	const key = model ? `${model.provider}/${model.id}` : "";
+	for (const v of [c?.modelOverrides?.[key]?.reserveTokens, c?.reserveTokens]) if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+	return DEFAULT_RESERVE_TOKENS;
+}
+
+/** Highest context size that stays clear of Pi's compaction trigger; null when the window is unknown. */
+export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number | null {
+	const w = Number(model?.contextWindow);
+	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
+}
+
+/** V = min(160K, 0.8 x window, window - reserve - margin); an unknown window gives 160K. */
+export function valveTokens(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number {
+	const w = Number(model?.contextWindow);
+	return w > 0 ? Math.min(VALVE_MAX, VALVE_RATIO * w, compactionRoom(model, reserve)!) : VALVE_MAX;
+}
 
 export const settings = () => ({
 	coldCap: envInt("COLD_CAP", 60_000), // cold: fold, then summarise, down to this many tokens
@@ -44,7 +71,10 @@ export interface Block {
 }
 export type Calls = Map<string, { name: string; args: Any }>;
 
-export function buildBlocks(contextEntries: Any[]): Block[] {
+/** User turns so far: the real prompts. Steering and follow-up messages typed during a run belong to that run's turn. */
+export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) => Math.max(a, b.userTurn), 0);
+
+export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Block[] {
 	const blocks: Block[] = [];
 	let userTurn = 0;
 	for (const pe of contextEntries) {
@@ -65,7 +95,7 @@ export function buildBlocks(contextEntries: Any[]): Block[] {
 			kind = r === "user" ? "user" : r === "assistant" ? "assistant" : r === "toolResult" ? "toolResult" : "other";
 			edited = msg !== raw && msg.content !== raw.content;
 		}
-		if (kind === "user") userTurn++;
+		if (kind === "user" && !(src.id && steerIds?.has(src.id))) userTurn++;
 		const ours = edited && kind === "toolResult" && textOf(msg.content).startsWith(PH_MARK);
 		blocks.push({ idx: blocks.length, entryId: src.id ?? null, kind, msg, raw, tokens: msgs.reduce((a, m) => a + tokensOf(m), 0), userTurn, edited, ours });
 	}
@@ -98,7 +128,7 @@ export interface FoldTarget {
 export interface Cut {
 	firstKeptEntryId: string;
 	text: string; // summary text: byte-identical in the request-local view and the persisted compaction
-	trigger: "cold" | "hard";
+	trigger: "cold" | "valve";
 	count: number; // user requests carried verbatim in the summary
 	prefixTokens: number;
 	summaryTokens: number;
@@ -111,7 +141,7 @@ export interface Cut {
 
 /** What a run sends from its first request on and persists verbatim at turn_end (F8). */
 export interface RunPlan {
-	source: "settle" | "runstart" | "pressure";
+	source: "settle" | "runstart" | "valve";
 	folds: FoldTarget[];
 	cut: Cut | null;
 	ctxBefore: number;
@@ -120,11 +150,15 @@ export interface RunPlan {
 	persisted: boolean;
 	cutVisibleIdx?: number; // where the kept part starts among the projected non-system messages
 	cutKeptFirstMsg?: Any; // ... and that message itself (a disagreeing request view drops the cut)
+	sent?: boolean; // a request view carrying this plan has gone out
+	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
 	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
 }
 
 export interface PlanOpts {
-	mode?: "cold" | "hot"; // cold: cache already gone (default). hot: window pressure only.
+	mode?: "cold" | "warm"; // cold: cache already gone (default). warm: only when the context is above the valve V; then the same plan as cold.
+	reserve?: number; // Pi's compaction reserveTokens (default 16384)
+	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	base: number; // system prompt + tools + estimation error, in tokens
 	cwd: string;
 	coldCap?: number;
@@ -145,7 +179,7 @@ export interface PlanResult {
 	firstKeptEntryId: string | null;
 	prefixTokens: number;
 	summaryTokensPlanned: number;
-	sumTrigger: "cold" | "hard" | null;
+	sumTrigger: "cold" | "valve" | null;
 	ctxTokens: number;
 	ctxAfterFolds: number;
 	userTurns: number;
@@ -159,28 +193,26 @@ export const contentKeyOf = (content: Any): string => {
 	return `${createHash("sha1").update(t).digest("hex")}:${t.length}`;
 };
 
-export const foldThreshold = (model: Any): number | null => (Number(model?.contextWindow) > 0 ? FOLD_AT * Number(model.contextWindow) : null);
-export const summaryThreshold = (model: Any): number | null => (Number(model?.contextWindow) > 0 ? SUMMARY_AT * Number(model.contextWindow) : null);
-
 /** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
- *  summarise only if folds cannot reach the cap and the gain gate passes. Hot: nothing below 80% of the window; above it
- *  fold newest-first down to 80%, summarise only above 85%. Returns null when there is nothing to plan on. */
+ *  summarise only if folds cannot reach the cap and the gain gate passes. Warm: null unless the context is above the valve V;
+ *  above it, exactly the cold plan (one valve, no second threshold). The cap never exceeds Pi's compaction room.
+ *  Returns null when there is nothing to plan on. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
-	const coldCap = o.coldCap ?? s.coldCap;
+	const room = compactionRoom(o.model, o.reserve);
+	const coldCap = Math.min(o.coldCap ?? s.coldCap, room ?? Infinity);
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
 	const relax = o.relax ?? RELAX_PREV_TURN;
-	const blocks = buildBlocks(entries);
+	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
-	const userTurns = blocks.filter((b) => b.kind === "user").length + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
+	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxTokens = o.base + blocks.reduce((a, b) => a + b.tokens, 0);
-	const foldAt = foldThreshold(o.model);
-	const hardAt = summaryThreshold(o.model);
-	if (mode === "hot" && !(foldAt !== null && ctxTokens > foldAt)) return null; // I6: warm cache below the pressure line -> never edit
+	if (mode === "warm" && !(ctxTokens > valveTokens(o.model, o.reserve))) return null; // I6: warm cache below the valve -> never edit
+	const trig = mode === "warm" ? "valve" : "cold";
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
 	const visOfBlock: number[] = []; // block idx -> index among the non-system projected messages (the numbering a request view uses)
@@ -214,30 +246,21 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
-	if (mode === "cold") {
-		for (const b of cands) addFold(b, "cold");
-		if (relax) {
-			// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
-			// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
-			let est = ctxTokens - savings();
-			if (est > coldCap) {
-				const prev = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable");
-				for (const b of prev.sort((x, y) => y.tokens - x.tokens)) {
-					if (est <= coldCap) break;
-					if (addFold(b, "cold(relax)")) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
-				}
+	for (const b of cands) addFold(b, trig);
+	if (relax) {
+		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
+		// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
+		let est = ctxTokens - savings();
+		if (est > coldCap) {
+			const prev = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable");
+			for (const b of prev.sort((x, y) => y.tokens - x.tokens)) {
+				if (est <= coldCap) break;
+				if (addFold(b, `${trig}(relax)`)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 			}
-		}
-	} else {
-		let est = ctxTokens; // newest first: the cache boundary that snaps back stays close to the tail
-		for (const b of [...cands].reverse()) {
-			if (est <= foldAt!) break;
-			if (addFold(b, "pressure")) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 		}
 	}
 	let ctxAfterFolds = ctxTokens - savings();
-	let sumTrigger: "cold" | "hard" | null = mode === "cold" && ctxAfterFolds > coldCap ? "cold" : null;
-	if (!sumTrigger && hardAt !== null && ctxAfterFolds > hardAt) sumTrigger = "hard";
+	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > coldCap ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
@@ -335,7 +358,7 @@ export function collapseSystem(messages: Any[]): Any | undefined {
  * message, the summary, then the kept non-system messages. null = nothing to apply. A cut whose kept boundary cannot be
  * located is dropped (folds still apply); an inconsistent split is never sent.
  */
-export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; droppedCut: boolean } | null {
+export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { messages: Any[]; droppedCut: boolean; applied: Set<string> } | null {
 	if (!plan || plan.persisted || (!plan.folds.length && !plan.cut)) return null;
 	const vis: number[] = []; // indices of the non-system messages
 	messages.forEach((m, i) => { if (!isSystem(m)) vis.push(i); });
@@ -352,6 +375,7 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 	}
 	// match each result to its target: by position when the position still holds the same result, else by (call id, content) when that is unique
 	const used = new Set<FoldTarget>();
+	const applied = new Set<string>();
 	const byKey = new Map<string, FoldTarget[]>();
 	const key = (id: string, ck: string) => `${id}|${ck}`;
 	for (const t of plan.folds) {
@@ -382,6 +406,7 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 		}
 		if (!t) return m;
 		used.add(t);
+		applied.add(t.entryId);
 		changed = true;
 		return { ...m, content: [{ type: "text", text: t.ph }] };
 	});
@@ -389,9 +414,9 @@ export function applyPlanToMessages(messages: Any[], plan: RunPlan | null): { me
 		const c = plan.cut!;
 		const head = collapseSystem(messages);
 		const kept = folded.slice(cutAt).filter((m: Any) => !isSystem(m));
-		return { messages: [...(head ? [head] : []), { role: "compactionSummary", summary: c.text, tokensBefore: c.prefixTokens, timestamp: plan.cutTs ??= Date.now() }, ...kept], droppedCut };
+		return { messages: [...(head ? [head] : []), { role: "compactionSummary", summary: c.text, tokensBefore: c.prefixTokens, timestamp: plan.cutTs ??= Date.now() }, ...kept], droppedCut, applied };
 	}
-	return changed || droppedCut ? { messages: folded, droppedCut } : null;
+	return changed || droppedCut ? { messages: folded, droppedCut, applied } : null;
 }
 
 export { pickKeyLines };

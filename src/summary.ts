@@ -102,7 +102,7 @@ export interface Narrative {
 }
 
 /** Narrative sections written by the current model in a separate, uncached call. Never throws. */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number): Promise<Narrative> {
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
@@ -123,7 +123,9 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number)
 			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words. Do not call tools.`;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
-		if (ctx.signal) signals.push(ctx.signal);
+		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
+		const outer = ownSignal ?? ctx.signal;
+		if (outer) signals.push(outer);
 		const signal = AbortSignal.any(signals);
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
@@ -150,7 +152,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number)
 }
 
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
-export async function buildCut(p: PlanResult, ctx: Any): Promise<Cut> {
+export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): Promise<Cut> {
 	const { foldMin, keepLines } = settings();
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
@@ -164,7 +166,7 @@ export async function buildCut(p: PlanResult, ctx: Any): Promise<Cut> {
 		});
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
-	const nar = await narrative(prefix, ctx, nb);
+	const nar = await narrative(prefix, ctx, nb, signal);
 	let text = sk.text;
 	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and re-read files as needed)`;
 	const table = handleTable(rows);
