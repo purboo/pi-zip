@@ -16,6 +16,15 @@ export const STATE_CUSTOM = "pi-zip/state";
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
 const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compact|context-prune|pi-vcc|context-mode|prefix-cache/i;
 
+/** The guard's view of a candidate edit set; folds whose entry left the projection are ignored. */
+export function checkEdits(blocks: Block[], userTurns: number, folds: FoldTarget[], cut: Cut | null): string | null {
+	const byId = new Map(blocks.map((b) => [b.entryId, b]));
+	const live = folds.filter((t) => byId.has(t.entryId));
+	const cutBlock = cut ? byId.get(cut.firstKeptEntryId) : undefined;
+	if (cut && !cutBlock) return `cut target ${cut.firstKeptEntryId} is not in the projection`;
+	return validateEdits(blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), recover: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.recover])), cut: cutBlock ? cutBlock.idx : null }, userTurns);
+}
+
 interface Bg {
 	key: string | null;
 	done: Cut | null;
@@ -198,6 +207,17 @@ export class Zip implements ZipControl {
 		if (this.bg && !adopted) this.discardBg();
 		const foldMs = performance.now() - t0;
 		if (!cut && p && p.cutIdx !== null) cut = await buildCut(p, ctx); // produced now, before the first request: the user waits
+		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
+		let invalid: string | null = null;
+		if (p) {
+			invalid = checkEdits(p.blocks, p.userTurns, folds, cut);
+			if (invalid && cut) {
+				cut = null;
+				const again = checkEdits(p.blocks, p.userTurns, folds, null);
+				if (again) { folds = []; cut = null; }
+			}
+			if (invalid) this.ledger({ type: "guard_drop", where: "run_plan", reason: invalid, folds: folds.length });
+		}
 		const ctxAfter = cut ? (p?.ctxAfterFolds ?? 0) - (cut.prefixTokens - cut.summaryTokens) : (p?.ctxAfterFolds ?? 0);
 		this.runPlan = { source, folds, cut, ctxBefore: p?.ctxTokens ?? 0, ctxAfter, ms: foldMs, persisted: false, cutVisibleIdx: p?.cutVisibleIdx ?? -1, cutKeptFirstMsg: p?.cutKeptFirstMsg };
 		this.ledger({ type: "cold_plan", source, folds: folds.length, summary: !!cut, ctxBefore: Math.round(this.runPlan.ctxBefore), ctxAfter: Math.round(ctxAfter), ms: Math.round(foldMs), ...(cut ? { summaryMs: cut.ms, llmOk: cut.llmOk, waitedMs: Math.round(source === "settle" ? this.bgWaitMs : cut.ms) } : {}) });
@@ -287,7 +307,7 @@ export class Zip implements ZipControl {
 			this.ledger({ type: "cold_noop", turnIndex: e.turnIndex, ctx: o.ctxTokens, ...(stale ? { staleTargets: stale } : {}) });
 			return undefined;
 		}
-		const bad = validateEdits(o.blocks, { folds: new Map(live.map((t) => [byId.get(t.entryId)!.idx, t.ph])), cut: cut ? byId.get(cut.firstKeptEntryId)!.idx : null }, o.userTurns);
+		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run

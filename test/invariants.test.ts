@@ -1,7 +1,7 @@
 // One group per invariant of design §6 (I1-I6), driven through the real extension with a fake Pi.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { repairPayload, validateEdits } from "../src/guard.ts";
-import { buildBlocks, planContext, applyPlanToMessages, type RunPlan } from "../src/plan.ts";
+import { buildBlocks, planContext, applyPlanToMessages, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
 import { A, AX, fakeCtx, fakePi, flat, project, R, U, type Any } from "./helpers.ts";
@@ -289,42 +289,70 @@ describe("I5 valid: every tool_use keeps its tool_result", () => {
 		expect(ok([], "r2")).not.toBeNull(); // cut at a toolResult orphans it
 		expect(validateEdits(blocks, { folds: new Map(), cut: 0 }, N)).not.toBeNull();
 	});
-	test("the latest user turn's own output is never a fold target; the previous turn's may be", () => {
+	test("the latest user turn's own output is never a fold target; the previous turn's only when re-readable", () => {
 		const three = buildBlocks([U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4"), U("u3", "three"), A("a5", ["c3"]), R("r3", "c3")]);
 		const at = (id: string) => three.findIndex((b) => b.entryId === id);
-		expect(validateEdits(three, { folds: new Map([[at("r2"), "[ph]"]]), cut: null }, 3)).toBeNull();
-		expect(validateEdits(three, { folds: new Map([[at("r3"), "[ph]"]]), cut: null }, 3)).toMatch(/latest user turn/);
+		const rec = (r: string) => new Map([[at("r2"), r]]);
+		expect(validateEdits(three, { folds: new Map([[at("r2"), "[ph]"]]), recover: rec("rereadable"), cut: null }, 3)).toBeNull();
+		expect(validateEdits(three, { folds: new Map([[at("r2"), "[ph]"]]), recover: rec("nonrereadable"), cut: null }, 3)).toMatch(/previous user turn/);
+		expect(validateEdits(three, { folds: new Map([[at("r2"), "[ph]"]]), cut: null }, 3)).toMatch(/previous user turn/); // unknown = not proven re-readable
+		expect(validateEdits(three, { folds: new Map([[at("r2"), "[ph]"]]), recover: rec("rereadable"), relax: false, cut: null }, 3)).toMatch(/previous user turn/);
+		expect(validateEdits(three, { folds: new Map([[at("r1"), "[ph]"]]), cut: null }, 3)).toBeNull(); // older turns need no proof
+		expect(validateEdits(three, { folds: new Map([[at("r3"), "[ph]"]]), recover: new Map([[at("r3"), "rereadable"]]), cut: null }, 3)).toMatch(/latest user turn/);
 	});
 	test("a target another extension already edited is rejected", () => {
 		const b = buildBlocks(ctx);
 		b[idx("r1")].edited = true;
 		expect(validateEdits(b, { folds: new Map([[idx("r1"), "[ph]"]]), cut: null }, N)).toMatch(/already edited/);
 	});
-	test("a base context that is already broken is rejected (missing result, orphan result), but a cut after the orphan is legal", () => {
+	test("only the pairing breaks the edits themselves create are rejected; an already odd session stays as odd as it was", () => {
 		const broken = buildBlocks([U("u1", "one"), A("a1", ["c1", "c9"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3"), U("u3", "t"), A("a4")]);
-		expect(validateEdits(broken, { folds: new Map([[1, "[ph]"]]), cut: null }, 3)).not.toBeNull();
+		expect(validateEdits(broken, { folds: new Map([[2, "[ph]"]]), cut: null }, 3)).toBeNull(); // a missing result already existed; folding does not change it
 		const orphan = buildBlocks([U("u1", "one"), R("r0", "zz"), A("a2"), U("u2", "two"), A("a3"), U("u3", "t"), A("a4")]);
-		expect(validateEdits(orphan, { folds: new Map([[1, "[ph]"]]), cut: null }, 3)).not.toBeNull();
 		expect(validateEdits(orphan, { folds: new Map(), cut: 3 }, 3)).toBeNull();
+		const split = buildBlocks([U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3"), U("u3", "t"), A("a4")]);
+		expect(validateEdits(split, { folds: new Map(), cut: 2 }, 3)).toMatch(/cut/); // a cut at the result orphans it
+	});
+	test("aborted and errored assistant turns (saved without results) never count as orphans: later edits stay legal", () => {
+		const dead = (id: string, stop: string, call: string) => {
+			const e = A(id, [call]);
+			(e.messages[0] as Any).stopReason = stop;
+			return e;
+		};
+		const ctx2 = [U("u1", "one"), dead("a1", "aborted", "x1"), U("u2", "two"), A("a2", ["c2"]), R("r2", "c2"), A("a3"), U("u3", "three"), dead("a4", "error", "x2"), U("u4", "four"), A("a5", ["c5"]), R("r5", "c5"), A("a6"), U("u5", "five"), A("a7")];
+		const b = buildBlocks(ctx2);
+		const id = (x: string) => b.findIndex((y) => y.entryId === x);
+		expect(validateEdits(b, { folds: new Map([[id("r2"), "[ph]"]]), cut: null }, 5)).toBeNull();
+		expect(validateEdits(b, { folds: new Map(), cut: id("u3") }, 5)).toBeNull();
+		expect(validateEdits(b, { folds: new Map(), cut: id("u2") }, 5)).toBeNull();
+		// ... while a live assistant turn without results that the cut strands is still the cut's doing only when it is new
+		const live = buildBlocks([U("u1", "one"), A("a1", ["x1"]), U("u2", "two"), A("a2"), U("u3", "three"), A("a3")]);
+		expect(validateEdits(live, { folds: new Map(), cut: 2 }, 3)).toBeNull();
 	});
 
-	test.each(SEEDS)("random deletion, seed %i: the guard rejects exactly the sessions whose pairing broke", (seed) => {
+	test.each(SEEDS)("random deletion, seed %i: an edit set is rejected exactly when the cut creates an orphan the session did not already have", (seed) => {
 		const r = prng(seed * 7919);
 		const entries = randomSession(seed);
 		const full = buildBlocks(entries);
-		expect(validateEdits(full, { folds: new Map(), cut: null }, full.filter((b) => b.kind === "user").length)).toBeNull();
+		const turns = (bl: Block[]) => bl.filter((x) => x.kind === "user").length;
+		expect(validateEdits(full, { folds: new Map(), cut: null }, turns(full))).toBeNull();
 		const victim = Math.floor(r() * entries.length);
 		const rest = entries.filter((_, i) => i !== victim);
-		const calls = new Set<string>();
-		const results = new Set<string>();
-		for (const e of rest) {
-			const m = e.messages[0];
-			if (m.role === "assistant") for (const c of m.content) if (c.type === "toolCall") calls.add(c.id);
-			if (m.role === "toolResult") results.add(m.toolCallId);
-		}
-		const broken = [...calls].some((c) => !results.has(c)) || [...results].some((c) => !calls.has(c));
 		const b = buildBlocks(rest);
-		expect(validateEdits(b, { folds: new Map(), cut: null }, b.filter((x) => x.kind === "user").length) !== null).toBe(broken);
+		expect(validateEdits(b, { folds: new Map(), cut: null }, turns(b))).toBeNull(); // no edit, nothing created
+		// every legal cut position: rejected iff some kept toolResult lost its call (calls before the cut are gone)
+		const limit = b.findIndex((x) => x.userTurn >= turns(b) - 1);
+		for (let c = 1; c < b.length && (limit < 0 || c <= limit); c++) {
+			if (!b[c].entryId || (b[c].kind !== "user" && b[c].kind !== "assistant")) continue;
+			const seen = new Set<string>();
+			const callsAll = new Set<string>();
+			for (const x of b.slice(0, c)) if (x.kind === "assistant") for (const k of x.msg.content) if (k.type === "toolCall") callsAll.add(k.id);
+			for (const x of b.slice(c)) if (x.kind === "assistant") for (const k of x.msg.content) if (k.type === "toolCall") seen.add(k.id);
+			const baseOrphan = (id: string) => ![...b.slice(0, b.findIndex((y) => y.msg.toolCallId === id))].some((y) => y.kind === "assistant" && y.msg.content.some((k: Any) => k.id === id));
+			const newOrphan = b.slice(c).some((x) => x.kind === "toolResult" && !seen.has(x.msg.toolCallId) && !baseOrphan(x.msg.toolCallId));
+			const verdict = validateEdits(b, { folds: new Map(), cut: c }, turns(b));
+			if (newOrphan) expect(verdict).not.toBeNull();
+		}
 	});
 
 	test.each(SEEDS)("payload guard on a random Anthropic-shaped request, seed %i", (seed) => {

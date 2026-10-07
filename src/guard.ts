@@ -1,5 +1,5 @@
 // Guard (F13, I5): validate an edit set before committing it, and repair orphan tool results in the outgoing payload.
-import type { Block } from "./plan.ts";
+import { RELAX_PREV_TURN, type Block } from "./plan.ts";
 import type { Any } from "./util.ts";
 
 const PROTECT_USER_TURNS = 2;
@@ -7,16 +7,53 @@ const PROTECT_USER_TURNS = 2;
 export interface EditSet {
 	folds: Map<number, string>; // block idx -> placeholder text
 	cut: number | null; // summarise blocks[0..cut-1]; blocks[cut] becomes firstKeptEntryId
+	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
+	relax?: boolean; // default RELAX_PREV_TURN
 }
 
-/** null = legal. Otherwise the reason: bad targets, edits inside the last 2 user turns, or a broken tool_use/tool_result pairing. */
+/**
+ * Tool-call pairing problems of a block list, the way the provider layer sees it (pi-ai transform-messages): errored or
+ * aborted assistant messages are dropped, so their calls never count; a toolResult must follow a call of the nearest
+ * assistant message; calls without results are synthesised by the provider but still reported (the caller decides).
+ */
+function pairingIssues(blocks: Block[], from: number): Set<string> {
+	const issues = new Set<string>();
+	let pending: Set<string> | null = null;
+	const closePending = (at: number) => {
+		if (pending) for (const id of pending) issues.add(`noResult:${id}@${at}`);
+		pending = null;
+	};
+	for (let i = from; i < blocks.length; i++) {
+		const b = blocks[i];
+		if (b.kind === "summary" && from > 0) continue; // replaced by our summary
+		const m = b.msg;
+		if (m.role === "toolResult") {
+			if (!pending || !pending.has(m.toolCallId)) issues.add(`orphanResult:${m.toolCallId}@${b.entryId ?? i}`);
+			else pending.delete(m.toolCallId);
+			continue;
+		}
+		if (m.role === "system") continue; // transparent: the provider layer holds it back
+		closePending(i);
+		if (m.role === "assistant") {
+			if (m.stopReason === "error" || m.stopReason === "aborted") continue; // dropped by the provider layer
+			const ids = (m.content ?? []).filter((c: Any) => c?.type === "toolCall").map((c: Any) => c.id);
+			if (ids.length) pending = new Set(ids);
+		}
+	}
+	closePending(blocks.length);
+	return issues;
+}
+
+/** null = legal. Otherwise the reason: bad targets, edits inside the protected user turns, or a tool_use/tool_result pairing the edits themselves would break. */
 export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number): string | null {
+	const relax = plan.relax ?? RELAX_PREV_TURN;
 	const limit = blocks.findIndex((b) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1);
 	for (const [i, text] of plan.folds) {
 		const b = blocks[i];
 		if (!b || b.kind !== "toolResult") return `fold target ${i} is not a toolResult`;
 		if (b.edited) return `fold target ${i} already edited`;
-		if (b.userTurn >= userTurns) return `fold target ${i} is inside the latest user turn`; // the previous turn may be folded (relax); the current one never
+		if (b.userTurn >= userTurns) return `fold target ${i} is inside the latest user turn`;
+		if (b.userTurn === userTurns - 1 && (!relax || plan.recover?.get(i) !== "rereadable")) return `fold target ${i} is in the previous user turn and not re-readable`;
 		if (!b.entryId) return `fold target ${i} has no entry id`;
 		if (typeof text !== "string" || !text.trim()) return `empty placeholder for ${i}`;
 	}
@@ -25,29 +62,13 @@ export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number)
 		if (limit >= 0 && plan.cut > limit) return `cut ${plan.cut} inside the last ${PROTECT_USER_TURNS} user turns`;
 		const kb = blocks[plan.cut];
 		if (!kb.entryId || (kb.kind !== "user" && kb.kind !== "assistant")) return `cut ${plan.cut} is not at a user/assistant message`;
+		// only what the cut itself would create is our problem; a session that was already odd stays as odd as it was
+		const before = pairingIssues(blocks, 0);
+		for (const issue of pairingIssues(blocks, plan.cut)) if (!before.has(issue) && issue.startsWith("orphanResult")) return `the cut would orphan a tool result: ${issue}`;
+		for (const issue of pairingIssues(blocks, plan.cut)) if (!before.has(issue)) return `the cut would break tool-call pairing: ${issue}`;
 	}
-	let pending: Set<string> | null = null;
-	let n = 0;
-	for (let i = plan.cut ?? 0; i < blocks.length; i++) {
-		const b = blocks[i];
-		if (b.kind === "summary" && plan.cut !== null) continue; // replaced by our summary
-		n++;
-		const role = b.msg.role;
-		if (role === "toolResult") {
-			const id = b.msg.toolCallId;
-			if (!pending || !pending.has(id)) return `orphan toolResult ${id} at block ${i}`;
-			pending.delete(id);
-			continue;
-		}
-		if (pending && pending.size) return `assistant tool calls without results before block ${i}: ${[...pending].join(",")}`;
-		pending = null;
-		if (role === "assistant") {
-			const ids = (b.msg.content ?? []).filter((c: Any) => c?.type === "toolCall").map((c: Any) => c.id);
-			if (ids.length) pending = new Set(ids);
-		}
-	}
-	if (pending && pending.size) return `trailing tool calls without results: ${[...pending].join(",")}`;
-	return n === 0 ? "empty context after edits" : null;
+	const kept = plan.cut ?? 0;
+	return blocks.slice(kept).some((b) => b.kind !== "summary") ? null : "empty context after edits";
 }
 
 const toText = (c: Any) => (typeof c === "string" ? c : (c ?? []).map((x: Any) => x.text ?? "").join("\n"));
