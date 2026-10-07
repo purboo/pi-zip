@@ -215,6 +215,32 @@ describe("payload repair covers every request shape Pi's providers produce", () 
 	});
 });
 
+describe("/zip output", () => {
+	test("without a UI to notify, command text goes to stderr and never into stdout (JSON mode)", async () => {
+		const { registerZipCommand } = await import("../src/notice.ts");
+		let cmd: any;
+		registerZipCommand({ registerCommand: (_n: string, c: any) => (cmd = c) } as any, { status: () => "pi-zip: on", statsLine: () => "", setOff: () => "", toggleQuiet: () => "" });
+		const out: string[] = [];
+		const err: string[] = [];
+		const so = process.stdout.write;
+		const se = process.stderr.write;
+		(process.stdout as any).write = (c: any) => (out.push(String(c)), true);
+		(process.stderr as any).write = (c: any) => (err.push(String(c)), true);
+		try {
+			await cmd.handler("status", { mode: "json", ui: { notify: () => { throw new Error("no-op ui must not be used"); } } });
+			await cmd.handler("status", {});
+		} finally {
+			process.stdout.write = so;
+			process.stderr.write = se;
+		}
+		expect(out).toEqual([]);
+		expect(err).toEqual(["pi-zip: on\n", "pi-zip: on\n"]);
+		const seen: string[] = [];
+		await cmd.handler("status", { mode: "tui", ui: { notify: (t: string) => seen.push(t) } });
+		expect(seen).toEqual(["pi-zip: on"]);
+	});
+});
+
 describe("classify", () => {
 	test("read-only bash whitelist", () => {
 		for (const c of ["ls -la /tmp", "cat a b | wc -l", "git log --oneline -5", "cat missing 2>/dev/null", "LC_ALL=C cat f.txt"]) expect(isReadOnlyBash(c)).toBe(true);
