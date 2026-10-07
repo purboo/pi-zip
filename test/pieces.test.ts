@@ -174,6 +174,15 @@ describe("classify", () => {
 		for (const c of ["ls -la /tmp", "cat a b | wc -l", "git log --oneline -5", "cat missing 2>/dev/null", "LC_ALL=C cat f.txt"]) expect(isReadOnlyBash(c)).toBe(true);
 		for (const c of ["npm test", "git push origin main", "cat a > b", "cat a && rm -rf /tmp/x", "python3 build.py", ""]) expect(isReadOnlyBash(c)).toBe(false);
 	});
+	test("commands that only look read-only are not: find -delete/-exec, substitutions, redirects, background jobs, git --output, rg --pre", () => {
+		for (const c of [
+			"find . -name '*.tmp' -delete", "find . -type f -exec rm {} +", "find . -execdir sh -c x ;", "find . -ok rm {} ;", "find . -fprint out.txt", "find . -fprintf out %p",
+			"echo $(rm -rf x)", "cat `which ls`", "ls $(pwd)", "echo hi > out.txt", "echo hi >> out.txt", "cat f 1>out", "ls &> out", "sleep 1 & ls", "cat <(ls)",
+			"git diff --output=patch.txt", "git log --output patch.txt", "git show --output=x", "git diff --ext-diff", "git -c core.pager=sh diff",
+			"rg --pre ./script pattern", "rg --pre=./script pattern", "file -C -m magic",
+		]) expect([c, isReadOnlyBash(c)]).toEqual([c, false]);
+		for (const c of ["find . -name '*.ts' -type f", "find src -maxdepth 2", "git diff --stat HEAD~1", "git log -p -3", "rg -n foo src", "file a.bin", "ls -la && cat a | head -5", "cat a 2>&1 | wc -l"]) expect([c, isReadOnlyBash(c)]).toEqual([c, true]);
+	});
 	test("read: rereadable iff the file is unchanged on disk; a changed or missing file is not", () => {
 		const dir = mkdtempSync(join(tmpdir(), "zip-"));
 		writeFileSync(join(dir, "f.txt"), "hello\nworld\n");
