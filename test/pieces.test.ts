@@ -8,10 +8,12 @@ import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { fmtK, noticeText, Stats, statsText, type NoticeAction } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
-import { A, R, U } from "./helpers.ts";
+import { A, type Any, R, U } from "./helpers.ts";
 import { parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, sliceRecall } from "../src/recall.ts";
 import { handleTable, skeleton } from "../src/summary.ts";
 import { tokensOf } from "../src/util.ts";
+
+const zipRecallName = "zip_recall";
 
 describe("handles and placeholders", () => {
 	const h = handleFor("abc123");
@@ -87,6 +89,46 @@ describe("handles and placeholders", () => {
 		expect(t).toContain("- h2 · bash bun test · turn 9 · exit 1, 8 passed, 2 failed · x");
 		const blocks = buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]);
 		expect(skeleton(blocks, null).text).toMatch(/`ls` -> exit 0 \(turn 1, [0-9a-z]{10}\)/);
+	});
+	test("summary lists the handle of every result, small ones included, and each resolves with recall", () => {
+		const tcall = (id: string, calls: Any[]) => {
+			const m = { role: "assistant", content: calls.map(([cid, name, args]) => ({ type: "toolCall", id: cid, name, arguments: args })) };
+			return { sourceEntry: { id, type: "message", message: m }, messages: [m] };
+		};
+		const tres = (id: string, call: string, name: string, text: string) => {
+			const m = { role: "toolResult", toolCallId: call, toolName: name, isError: false, content: [{ type: "text", text }] };
+			return { sourceEntry: { id, type: "message", message: m }, messages: [m] };
+		};
+		const entries = [
+			U("u1", "go"),
+			tcall("a1", [["c1", "bash", { command: "echo small" }], ["c2", "web_fetch", { url: "https://example.com/x" }], ["c3", "read", { path: "src/a.ts" }], ["c4", zipRecallName, { handle: "zzz" }]]),
+			tres("r1", "c1", "bash", "small bash output"),
+			tres("r2", "c2", "web_fetch", "small fetched page"),
+			tres("r3", "c3", "read", "small file"),
+			tres("r4", "c4", zipRecallName, "recalled"),
+			A("a2"),
+		];
+		const text = skeleton(buildBlocks(entries), null).text;
+		expect(text).toContain(`\`echo small\` -> exit 0 (turn 1, ${handleFor("r1")})`);
+		expect(text).toContain(`web_fetch {"url":"https://example.com/x"} (turn 1, ${handleFor("r2")})`);
+		expect(text).toContain(`- src/a.ts (read: ${handleFor("r3")})`);
+		expect(text).not.toContain(handleFor("r4")); // a recall result is never listed
+		const branch = entries.map((e) => e.sourceEntry);
+		const { items } = resolveHandlesInBranch(branch, [handleFor("r1"), handleFor("r2"), handleFor("r3")]);
+		expect(items.map((i) => i.text)).toEqual(["small bash output", "small fetched page", "small file"]);
+	});
+	test("capped lists and the handle table say how many older entries they left out", () => {
+		const many = Array.from({ length: 70 }, (_, i) => i);
+		const entries = [U("u1", "go"), ...many.flatMap((i) => [A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 0, "tiny")]), A("z")];
+		const t = skeleton(buildBlocks(entries), null).text;
+		expect(t).toContain("[\u2026 10 older omitted \u2026]");
+		expect(t).toContain(handleFor("r69"));
+		const rows = many.map((i) => ({ handle: `h${i}`, tool: "bash", args: "", hint: "" }));
+		const table = handleTable(rows)!;
+		expect(table).toContain("30 older folded outputs omitted");
+		expect(table).toContain("- h69 ");
+		expect(table).not.toContain("- h29 ");
+		expect(table).toContain("- h30 ");
 	});
 	const ktxt = ["record 0001: alpha-beta-gamma", "SECRET-CODE-1: zebra111", "nothing interesting here", "note=lorem ipsum dolor", "checksum=00491 note=x", "ERROR: connection reset by peer", "hash a1b2c3d4e5f60718 written", "took 250 ms to complete", "92345678", "final line ok"].join("\n");
 	test("key lines: first+last, errors, ids, key=value, hex, labelled numbers; sorted, capped, deterministic", () => {

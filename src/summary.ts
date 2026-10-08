@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { handleFor, outcomeHint, pickKeyLines, shortArgs } from "./placeholder.ts";
+import { handleFor, outcomeHint, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type Any, clamp, clip, textOf, tok4 } from "./util.ts";
 
@@ -23,17 +23,23 @@ export interface HandleRow {
 /** Compact table appended to every summary so handles survive it. */
 export function handleTable(rows: HandleRow[]): string | null {
 	if (!rows.length) return null;
+	const omitted = Math.max(0, rows.length - 40);
 	const lines = rows.slice(-40).map((r) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`);
+	if (omitted) lines.unshift(`[… ${omitted} older folded outputs omitted from this table …]`);
 	return "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)\n" + lines.join("\n");
 }
+
+/** Keep the newest `n` lines and say how many older ones were left out (never a silent drop). */
+const newest = (xs: string[], n: number): string[] => (xs.length > n ? [`[… ${xs.length - n} older omitted …]`, ...xs.slice(-n)] : xs);
 
 export function skeleton(prefix: Block[], previous: string | null): { text: string; users: number } {
 	const calls = toolCallIndex(prefix);
 	const results = new Map<string, Block>();
 	for (const b of prefix) if (b.kind === "toolResult") results.set(b.msg.toolCallId, b);
 	const users: string[] = [];
-	const files = new Map<string, Set<string>>();
+	const files = new Map<string, Map<string, string | null>>(); // path -> tool -> handle of its latest result
 	const cmds: string[] = [];
+	const others: string[] = []; // tools with neither a command nor a path (web fetch, pathless grep, custom tools)
 	const errors: string[] = [];
 	for (const b of prefix) {
 		if (b.kind === "user") {
@@ -49,12 +55,16 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 			if (c.name === "bash") {
 				const m = /Command exited with code (\d+)/.exec(resText);
 				const status = m ? `exit ${m[1]}` : res?.msg.isError ? "error" : res ? "exit 0" : "no result";
-				const tag = res ? ` (turn ${res.userTurn}${res.entryId && (res.ours || res.tokens > settings().foldMin) ? ", " + handleFor(res.entryId) : ""})` : "";
+				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : ""; // every result is recallable, so every one gets its handle
 				cmds.push(`\`${clip(String(a.command ?? ""), 160)}\` -> ${status}${tag}`);
 			} else if (typeof a.path === "string" || typeof a.file_path === "string") {
 				const p = String(a.path ?? a.file_path);
-				if (!files.has(p)) files.set(p, new Set());
-				files.get(p)!.add(c.name);
+				if (!files.has(p)) files.set(p, new Map());
+				const ops = files.get(p)!;
+				ops.set(c.name, res?.entryId ? handleFor(res.entryId) : (ops.get(c.name) ?? null));
+			} else if (c.name !== RECALL_TOOL) {
+				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
+				others.push(`${c.name} ${clip(shortArgs(a), 160)}${tag}`);
 			}
 			if (res?.msg.isError) errors.push(`${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
 		}
@@ -71,7 +81,7 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 		}
 		userLines = [...head, `[… ${userLines.length - head.length - tail.length} requests omitted …]`, ...tail];
 	}
-	const fileLines = [...files.entries()].slice(-60).map(([p, ops]) => `- ${p} (${[...ops].join(", ")})`);
+	const fileLines = newest([...files.entries()].map(([p, ops]) => `- ${p} (${[...ops].map(([t, h]) => (h ? `${t}: ${h}` : t)).join(", ")})`), 60);
 	const out: string[] = [SUMMARY_MARK];
 	out.push(`Covers ${prefix.length} earlier messages. Tool outputs in the kept part of the conversation may have been folded; call zip_recall with a handle to get one back exactly.`);
 	if (previous) {
@@ -80,7 +90,8 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 	}
 	out.push("## User requests (verbatim, oldest first)", userLines.length ? userLines.join("\n") : "(none)");
 	out.push("## Files touched", fileLines.length ? fileLines.join("\n") : "(none)");
-	out.push("## Commands run (with exit status)", cmds.length ? cmds.slice(-60).join("\n") : "(none)");
+	out.push("## Commands run (with exit status)", cmds.length ? newest(cmds, 60).join("\n") : "(none)");
+	if (others.length) out.push("## Other tool calls (turn, handle)", newest(others, 60).join("\n"));
 	out.push("## Errors", errors.length ? errors.slice(-15).map((e) => "- " + e).join("\n") : "(none)");
 	return { text: out.join("\n"), users: users.length };
 }
