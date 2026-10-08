@@ -130,19 +130,17 @@ describe("handles and placeholders", () => {
 		expect(table).not.toContain("- h29 ");
 		expect(table).toContain("- h30 ");
 	});
-	test("handle index: handles of an earlier summary survive the clip of its carried-forward text", () => {
+	test("handle index: handles of an earlier summary survive when its own block is full of unrelated carried-forward text", () => {
 		const session = (n: number, from = 0) => {
 			const ids = Array.from({ length: n }, (_, i) => from + i);
 			return [U(`u${from}`, "go"), ...ids.flatMap((i) => [A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 0, "tiny")]), A(`z${from}`)];
 		};
 		const older = skeleton(buildBlocks(session(30)), null).text;
-		// an earlier summary whose own carried-forward block fills the 12,000-char clip, so everything after it is cut from the carried text
 		const prev = older.replace("\n## User requests", "\n## Earlier summary (carried forward)\n" + "filler ".repeat(2500) + "\n## User requests");
 		const t = skeleton(buildBlocks(session(3, 100)), prev).text;
-		expect(t).not.toContain("## Commands run (with exit status)\n`ls` -> exit 0 (turn 1, " + handleFor("r0")); // the clip did cut the old list
+		expect((t.match(/filler/g) ?? []).length).toBeLessThan(3000 / 7 + 5); // only a bounded excerpt of the free text (17,500 chars of it)
 		for (let i = 0; i < 30; i++) expect(t).toContain(handleFor(`r${i}`));
-		expect(t).toContain("## Handle index");
-		expect(t.split("\n").filter((l) => l.startsWith("- " + handleFor("r0") + " "))).toEqual([`- ${handleFor("r0")} \u00b7 bash ls \u00b7 turn 1`]);
+		expect(t.split("\n").filter((l) => l.includes(handleFor("r0")))).toHaveLength(1); // each handle once
 	});
 	test("handle index: newest first, only handles not listed elsewhere, within the token budget, and says what did not fit", () => {
 		const session = (n: number) => [U("u1", "go"), ...Array.from({ length: n }, (_, i) => i).flatMap((i) => [A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 0, "tiny")]), A("z")];

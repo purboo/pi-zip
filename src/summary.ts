@@ -20,13 +20,20 @@ export interface HandleRow {
 	outcome?: string; // exit status / test counts (outcomeHint)
 }
 
-/** Compact table appended to every summary so handles survive it. */
-export function handleTable(rows: HandleRow[]): string | null {
-	if (!rows.length) return null;
-	const omitted = Math.max(0, rows.length - 40);
-	const lines = rows.slice(-40).map((r) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`);
-	if (omitted) lines.unshift(`[… ${omitted} older folded outputs omitted from this table …]`);
-	return "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)\n" + lines.join("\n");
+const TABLE_HEAD = "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)";
+const TABLE_ROWS = 40;
+const tableLine = (r: HandleRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`;
+
+/**
+ * Compact table appended to every summary so handles survive it: this prefix's rows merged with the rows of the previous summary's
+ * table(s) (hints and outcomes kept), newest TABLE_ROWS rows, each handle once, and a count of the older rows left out.
+ */
+export function handleTable(rows: HandleRow[], previous: string | null = null): string | null {
+	const prev = parseSummary(previous);
+	const merged = mergeItems(prev.table.items, rows.map(tableLine), prev.table.omitted, TABLE_ROWS, Infinity, (l) => TABLE_ROW.exec(l)?.[1]);
+	if (!merged.kept.length) return null;
+	const lines = merged.omitted ? [`[… ${merged.omitted} older folded outputs omitted from this table …]`, ...merged.kept] : merged.kept;
+	return TABLE_HEAD + "\n" + lines.join("\n");
 }
 
 /** Keep the newest `n` lines and say how many older ones were left out (never a silent drop). */
@@ -108,7 +115,182 @@ function handleIndex(now: IndexRow[], previous: string | null, listed: string, b
 	return head + "\n" + lines.join("\n");
 }
 
-export function skeleton(prefix: Block[], previous: string | null): { text: string; users: number } {
+// ---------------------------------------------------------------------------------------------------------------
+// Sectioned carry-forward. A summary is parsed into its sections; each section of the previous summary is merged with the same
+// section of the new prefix, deduplicated, and the OLDEST items are dropped first under a per-section budget, with a running
+// count of what was left out. (The earlier design clipped the whole carried text to its first 12,000 characters, which kept the
+// oldest nested content and cut the newest requests and handles.)
+// ---------------------------------------------------------------------------------------------------------------
+interface Items {
+	items: string[]; // oldest first
+	omitted: number; // older items already left out by earlier merges
+}
+interface FileRow {
+	path: string;
+	ops: Map<string, string | null>; // tool -> handle of its latest result
+}
+export interface ParsedSummary {
+	structured: boolean; // at least one section of our own format was found (false: a native Pi compaction summary, free text)
+	users: Items;
+	files: { rows: FileRow[]; omitted: number };
+	cmds: Items;
+	others: Items;
+	errors: Items;
+	table: Items;
+	narrative: string[]; // model-written text and free text, oldest first
+}
+
+const SECTIONS: Array<[RegExp, string]> = [
+	[/^## User requests/, "users"],
+	[/^## Files touched/, "files"],
+	[/^## Commands run/, "cmds"],
+	[/^## Other tool calls/, "others"],
+	[/^## Errors/, "errors"],
+	[/^## Handle index/, "index"],
+	[/^## Folded outputs/, "table"],
+	[/^## Narrative/, "narr"],
+	[/^## Earlier narrative/, "narr"],
+	[/^## Earlier summary/, "free"], // the carried-forward block of the older format
+];
+const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
+const COVERS_ROW = /^Covers \d+ earlier messages\./;
+const NONE_ROW = "(none)";
+
+/** Parse any summary text: pi-zip's current and older formats (carried-forward blocks nested inside carried-forward blocks included), or free text. */
+export function parseSummary(text: string | null): ParsedSummary {
+	const out: ParsedSummary = { structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
+	if (!text) return out;
+	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
+	const occ: Array<{ key: string; lines: string[] }> = [{ key: "free", lines: [] }];
+	for (const line of text.split("\n")) {
+		if (line.trim() === SUMMARY_MARK || COVERS_ROW.test(line)) continue;
+		const hit = line.startsWith("## ") ? SECTIONS.find(([re]) => re.test(line)) : undefined;
+		if (hit) {
+			occ.push({ key: hit[1], lines: [] });
+			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
+			continue;
+		}
+		occ[occ.length - 1].lines.push(line);
+	}
+	const files = new Map<string, FileRow>();
+	for (const { key, lines } of occ) {
+		const body = lines.filter((l) => l.trim() !== "" && l.trim() !== NONE_ROW);
+		if (key === "users") {
+			const r = parseUsers(lines);
+			out.users.items.push(...r.items);
+			out.users.omitted += r.omitted;
+			continue;
+		}
+		const take = (dst: Items, keep: (l: string) => boolean) => {
+			for (const l of body) {
+				const m = OMIT_ROW.exec(l);
+				if (m) dst.omitted += Number(m[1]);
+				else if (keep(l)) dst.items.push(l);
+			}
+		};
+		if (key === "files") {
+			for (const l of body) {
+				const m = OMIT_ROW.exec(l);
+				if (m) { out.files.omitted += Number(m[1]); continue; }
+				const f = FILE_ROW.exec(l);
+				if (!f) continue;
+				const ops = new Map<string, string | null>(files.get(f[1])?.ops ?? []);
+				for (const op of f[2].split(", ")) {
+					const h = FILE_OP.exec(op);
+					if (h) ops.set(h[1], h[2]);
+					else if (op.trim() && !ops.has(op.trim())) ops.set(op.trim(), null);
+				}
+				files.delete(f[1]);
+				files.set(f[1], { path: f[1], ops });
+			}
+		} else if (key === "cmds") take(out.cmds, (l) => l.startsWith("`"));
+		else if (key === "others") take(out.others, () => true);
+		else if (key === "errors") take(out.errors, (l) => l.startsWith("- "));
+		else if (key === "table") take(out.table, (l) => TABLE_ROW.test(l));
+		else if (key === "narr" || key === "free") {
+			const t = lines.join("\n").trim();
+			if (t && !t.startsWith("(unavailable")) out.narrative.push(t);
+		}
+	}
+	out.files.rows = [...files.values()];
+	return out;
+}
+
+/** Numbered, possibly multi-line requests. Numbers run 1, 2, 3...; after an omission marker (or a gap in the older format) any larger number resumes. */
+function parseUsers(lines: string[]): Items {
+	const out: Items = { items: [], omitted: 0 };
+	let cur: string[] | null = null;
+	let last = 0;
+	let anyNumber = true;
+	const close = () => {
+		if (cur) out.items.push(cur.join("\n").replace(/\s+$/, ""));
+		cur = null;
+	};
+	for (const line of lines) {
+		const om = OMIT_ROW.exec(line);
+		if (om && /requests omitted/.test(line)) {
+			close();
+			out.omitted += Number(om[1]);
+			anyNumber = true;
+			continue;
+		}
+		const m = /^(\d+)\. (.*)$/.exec(line);
+		if (m && (anyNumber ? Number(m[1]) > last || last === 0 : Number(m[1]) === last + 1)) {
+			close();
+			cur = [m[2]];
+			last = Number(m[1]);
+			anyNumber = false;
+		} else if (cur) cur.push(line);
+	}
+	close();
+	out.items = out.items.filter((t) => t !== NONE_ROW && t !== "");
+	return out;
+}
+
+/**
+ * older + newer, oldest first. Deduplicated by `key` (default: the item itself; the newest copy wins and keeps the newest position),
+ * then the newest items that fit `maxItems` and `maxChars` are kept (always at least the newest one). `omitted` counts every older
+ * item left out so far, this merge's drops included.
+ */
+function mergeItems(older: string[], newer: string[], omitted: number, maxItems: number, maxChars: number, key: (s: string) => string | undefined = (s) => s): { kept: string[]; omitted: number } {
+	let all = [...older, ...newer];
+	const seen = new Set<string>();
+	all = all.reverse().filter((x) => { const k = key(x) ?? x; return seen.has(k) ? false : (seen.add(k), true); }).reverse();
+	let from = all.length;
+	let used = 0;
+	while (from > 0 && all.length - from < maxItems && used + all[from - 1].length + 1 <= maxChars) used += all[--from].length + 1;
+	if (from === all.length && all.length) from--; // the newest item always stays
+	return { kept: all.slice(from), omitted: omitted + from };
+}
+
+/** Per-section budgets (characters unless noted); the total stays near the old design's 12,000-char carry plus the new prefix's own lists. */
+const BUDGET = { users: 16000, files: 6000, cmds: 10000, others: 5000, errors: 4000, lines: 60, errorLines: 15 };
+/** The previous narrative is kept as a tail excerpt: the newest decisions, open todos and key facts sit at its end. */
+export const PREV_NARRATIVE_CHARS = 3000;
+/** A previous summary that is only free text (Pi's own compaction) has no lists to merge: its excerpt keeps a head (the goal) and a longer tail. */
+export const FOREIGN_SUMMARY_CHARS = 6000;
+
+function tailExcerpt(text: string, max: number, head = 0): string {
+	if (text.length <= max) return text;
+	const cutAtLine = (t: string) => {
+		const nl = t.indexOf("\n"); // start on a line boundary, else on a word boundary: never mid-word
+		if (nl >= 0 && nl < 200) return t.slice(nl + 1);
+		const sp = t.indexOf(" ");
+		return sp >= 0 && sp < 40 ? t.slice(sp + 1) : t;
+	};
+	const h = head ? text.slice(0, head).replace(/\s+\S*$/, "") : "";
+	const t = cutAtLine(text.slice(-(max - h.length)));
+	return (h ? h + "\n" : "") + "[… middle of the earlier narrative omitted …]\n" + t;
+}
+
+const list = (title: string, m: { kept: string[]; omitted: number }, marker: string): string[] => [title, m.kept.length ? [...(m.omitted ? [`[… ${m.omitted} ${marker} …]`] : []), ...m.kept].join("\n") : NONE_ROW];
+
+/**
+ * The deterministic part of a summary: user words verbatim, files, commands, other calls, errors and a handle index, each section
+ * merged from the previous summary `previous` (any format) and this prefix. `tableText` = the folded-outputs table the caller will
+ * append, so the index does not repeat its handles.
+ */
+export function skeleton(prefix: Block[], previous: string | null, tableText = ""): { text: string; users: number } {
 	const calls = toolCallIndex(prefix);
 	const results = new Map<string, Block>();
 	for (const b of prefix) if (b.kind === "toolResult") results.set(b.msg.toolCallId, b);
@@ -144,35 +326,39 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 				others.push(`${c.name} ${clip(shortArgs(a), 160)}${tag}`);
 			}
 			if (res?.entryId && c.name !== RECALL_TOOL) now.push({ handle: handleFor(res.entryId), tool: c.name, args: clip(shortArgs(a), 60), turn: res.userTurn });
-			if (res?.msg.isError) errors.push(`${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
+			if (res?.msg.isError) errors.push(`- ${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
 		}
 	}
-	let userLines = users.map((u, i) => `${i + 1}. ${u}`);
-	const budget = 16000;
-	if (userLines.join("\n").length > budget) {
-		const head = userLines.slice(0, 3);
-		const tail: string[] = [];
-		let used = head.join("\n").length;
-		for (let i = userLines.length - 1; i >= 3 && used < budget; i--) {
-			tail.unshift(userLines[i]);
-			used += userLines[i].length;
-		}
-		userLines = [...head, `[… ${userLines.length - head.length - tail.length} requests omitted …]`, ...tail];
+	const prev = parseSummary(previous);
+	// user requests: previous (older) then new; the oldest go first, numbering continues over what was left out
+	const mu = mergeItems(prev.users.items, users, prev.users.omitted, Infinity, BUDGET.users, undefined);
+	const userLines = mu.kept.map((u, i) => `${mu.omitted + i + 1}. ${u}`);
+	// files: a path touched again moves to the newest end with its newest handles
+	const merged = new Map<string, FileRow>(prev.files.rows.map((r) => [r.path, r]));
+	for (const [path, ops] of files) {
+		const ex = merged.get(path);
+		merged.delete(path);
+		merged.set(path, { path, ops: new Map([...(ex?.ops ?? []), ...[...ops].filter(([t, h]) => h !== null || !ex?.ops.has(t))]) });
 	}
-	const fileLines = newest([...files.entries()].map(([p, ops]) => `- ${p} (${[...ops].map(([t, h]) => (h ? `${t}: ${h}` : t)).join(", ")})`), 60);
+	const fileText = [...merged.values()].map((r) => `- ${r.path} (${[...r.ops].map(([t, h]) => (h ? `${t}: ${h}` : t)).join(", ")})`);
+	const mf = mergeItems(fileText, [], prev.files.omitted, BUDGET.lines, BUDGET.files, (l) => FILE_ROW.exec(l)?.[1]);
+	const mc = mergeItems(prev.cmds.items, cmds, prev.cmds.omitted, BUDGET.lines, BUDGET.cmds);
+	const mo = mergeItems(prev.others.items, others, prev.others.omitted, BUDGET.lines, BUDGET.others);
+	const me = mergeItems(prev.errors.items, errors, prev.errors.omitted, BUDGET.errorLines, BUDGET.errors);
 	const out: string[] = [SUMMARY_MARK];
 	out.push(`Covers ${prefix.length} earlier messages. Tool outputs in the kept part of the conversation may have been folded; call zip_recall with a handle to get one back exactly.`);
-	if (previous) {
-		out.push("## Earlier summary (carried forward)");
-		out.push(previous.split("\n").filter((l) => l.trim() !== SUMMARY_MARK && !l.startsWith("Covers ")).join("\n").trim().slice(0, 12000));
-	}
-	out.push("## User requests (verbatim, oldest first)", userLines.length ? userLines.join("\n") : "(none)");
-	out.push("## Files touched", fileLines.length ? fileLines.join("\n") : "(none)");
-	out.push("## Commands run (with exit status)", cmds.length ? newest(cmds, 60).join("\n") : "(none)");
-	if (others.length) out.push("## Other tool calls (turn, handle)", newest(others, 60).join("\n"));
-	out.push("## Errors", errors.length ? errors.slice(-15).map((e) => "- " + e).join("\n") : "(none)");
-	const index = handleIndex(now, previous, out.join("\n"), INDEX_TOKENS);
+	out.push("## User requests (verbatim, oldest first)");
+	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
+	out.push(...(userLines.length ? userLines : [NONE_ROW]));
+	out.push(...list("## Files touched", mf, "older omitted"));
+	out.push(...list("## Commands run (with exit status)", mc, "older omitted"));
+	if (mo.kept.length) out.push(...list("## Other tool calls (turn, handle)", mo, "older omitted"));
+	out.push(...list("## Errors", me, "older omitted"));
+	const index = handleIndex(now, previous, out.join("\n") + "\n" + tableText, INDEX_TOKENS);
 	if (index) out.push(index);
+	const foreign = !prev.structured;
+	const narr = prev.narrative.join("\n\n");
+	if (narr) out.push(`## Earlier narrative (excerpt of the previous summary, newest part)`, foreign ? tailExcerpt(narr, FOREIGN_SUMMARY_CHARS, 1500) : tailExcerpt(narr, PREV_NARRATIVE_CHARS));
 	return { text: out.join("\n"), users: users.length };
 }
 
@@ -260,12 +446,12 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 			const tool = call?.name ?? b.msg.toolName ?? "tool";
 			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args) : "", turn: b.userTurn, outcome: outcomeHint(textOf((b.raw ?? b.msg).content), tool, !!b.msg.isError), hint: (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "" };
 		});
-	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev);
+	const table = handleTable(rows, prev);
+	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "");
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
 	const nar = await narrative(prefix, ctx, nb, signal);
 	let text = sk.text;
 	text += nar.ok && nar.text ? `\n## Narrative (model-written)\n${nar.text.slice(0, nb * 6)}` : `\n## Narrative\n(unavailable: ${nar.error ?? "n/a"}; rely on the sections above and re-read files as needed)`;
-	const table = handleTable(rows);
 	if (table) text += "\n" + table;
 	return {
 		firstKeptEntryId: p.blocks[p.cutIdx!].entryId!,
