@@ -32,6 +32,82 @@ export function handleTable(rows: HandleRow[]): string | null {
 /** Keep the newest `n` lines and say how many older ones were left out (never a silent drop). */
 const newest = (xs: string[], n: number): string[] => (xs.length > n ? [`[… ${xs.length - n} older omitted …]`, ...xs.slice(-n)] : xs);
 
+const H = "[0-9a-z]{10}"; // a handle, see handleFor
+const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\(turn (\\d+), (${H})\\)$`);
+const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\(turn (\\d+), (${H})\\)$`);
+const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
+const FILE_OP = new RegExp(`^(\\S+): (${H})$`);
+const TABLE_ROW = new RegExp(`^- (${H}) · (\\S+)((?: [^·]*?)?)(?: · turn (\\d+))?(?: · .*)?$`);
+const INDEX_HEAD = "## Handle index";
+/** Budget of the "Handle index" section, in tokens. */
+export const INDEX_TOKENS = 1500;
+
+interface IndexRow {
+	handle: string;
+	tool: string;
+	args: string;
+	turn?: number;
+}
+
+const indexLine = (r: IndexRow) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}`;
+
+/**
+ * Handle rows (oldest first) recorded in an earlier summary, read from every section that carries them: the commands, files and
+ * other-calls lists, the folded-outputs table and an earlier handle index. Works on the whole text, nested carried-forward blocks
+ * included, so the clip applied to the carried-forward text cannot lose them.
+ */
+export function handleRowsOf(text: string | null): IndexRow[] {
+	const rows: IndexRow[] = [];
+	let sec = "";
+	for (const line of (text ?? "").split("\n")) {
+		if (line.startsWith("## ")) {
+			sec = line;
+			continue;
+		}
+		let m: RegExpExecArray | null;
+		if (sec.startsWith("## Commands run")) {
+			if ((m = CMD_ROW.exec(line))) rows.push({ handle: m[3], tool: "bash", args: m[1], turn: Number(m[2]) });
+		} else if (sec.startsWith("## Other tool calls")) {
+			if ((m = OTHER_ROW.exec(line))) rows.push({ handle: m[4], tool: m[1], args: m[2], turn: Number(m[3]) });
+		} else if (sec.startsWith("## Files touched")) {
+			if ((m = FILE_ROW.exec(line)))
+				for (const op of m[2].split(", ")) {
+					const h = FILE_OP.exec(op);
+					if (h) rows.push({ handle: h[2], tool: h[1], args: m[1] });
+				}
+		} else if (sec.startsWith("## Folded outputs") || sec.startsWith(INDEX_HEAD)) {
+			if ((m = TABLE_ROW.exec(line))) rows.push({ handle: m[1], tool: m[2], args: m[3].trim(), turn: m[4] ? Number(m[4]) : undefined });
+		}
+	}
+	return rows;
+}
+
+/**
+ * Handles of the tool results the summary would otherwise lose: this prefix's results and the earlier summary's rows, newest first,
+ * minus handles already written elsewhere in the summary, under a token budget. Says how many rows did not fit.
+ */
+function handleIndex(now: IndexRow[], previous: string | null, listed: string, budgetTokens: number): string | null {
+	const seen = new Set<string>(listed.match(new RegExp(`\\b${H}\\b`, "g")) ?? []);
+	const rows: IndexRow[] = [];
+	for (const r of [...now].reverse().concat(handleRowsOf(previous).reverse())) {
+		if (seen.has(r.handle)) continue;
+		seen.add(r.handle);
+		rows.push({ ...r, args: clip(r.args, 60) });
+	}
+	if (!rows.length) return null;
+	const head = `${INDEX_HEAD} (older outputs, newest first; zip_recall with a handle returns the original)`;
+	let used = tok4(head) + 12; // 12: the "not listed" line
+	const lines: string[] = [];
+	for (const r of rows) {
+		const l = indexLine(r);
+		if (used + tok4(l) + 1 > budgetTokens) break;
+		used += tok4(l) + 1;
+		lines.push(l);
+	}
+	if (lines.length < rows.length) lines.push(`[… ${rows.length - lines.length} older handles not listed …]`);
+	return head + "\n" + lines.join("\n");
+}
+
 export function skeleton(prefix: Block[], previous: string | null): { text: string; users: number } {
 	const calls = toolCallIndex(prefix);
 	const results = new Map<string, Block>();
@@ -41,6 +117,7 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 	const cmds: string[] = [];
 	const others: string[] = []; // tools with neither a command nor a path (web fetch, pathless grep, custom tools)
 	const errors: string[] = [];
+	const now: IndexRow[] = []; // every recallable result of this prefix, oldest first
 	for (const b of prefix) {
 		if (b.kind === "user") {
 			const t = textOf(b.msg.content).trim();
@@ -66,6 +143,7 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 				const tag = res ? ` (turn ${res.userTurn}${res.entryId ? ", " + handleFor(res.entryId) : ""})` : " (no result)";
 				others.push(`${c.name} ${clip(shortArgs(a), 160)}${tag}`);
 			}
+			if (res?.entryId && c.name !== RECALL_TOOL) now.push({ handle: handleFor(res.entryId), tool: c.name, args: clip(shortArgs(a), 60), turn: res.userTurn });
 			if (res?.msg.isError) errors.push(`${c.name} ${shortArgs(a)}: ${clip(resText, 200)}`);
 		}
 	}
@@ -93,6 +171,8 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 	out.push("## Commands run (with exit status)", cmds.length ? newest(cmds, 60).join("\n") : "(none)");
 	if (others.length) out.push("## Other tool calls (turn, handle)", newest(others, 60).join("\n"));
 	out.push("## Errors", errors.length ? errors.slice(-15).map((e) => "- " + e).join("\n") : "(none)");
+	const index = handleIndex(now, previous, out.join("\n"), INDEX_TOKENS);
+	if (index) out.push(index);
 	return { text: out.join("\n"), users: users.length };
 }
 

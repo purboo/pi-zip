@@ -72,7 +72,7 @@ zip_recall({ handle: "k3f9a0x1qz", grep: "ERROR|FAIL" })
 zip_recall({ handle: "k3f9a0x1qz", range: "120-240" })
 ```
 
-Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table). Output comes back in pages of 20,000 characters; the page says how to continue:
+Recall is batched, exact, and also works for outputs from before a compaction or a pi-zip summary (summaries carry a handle table and a budgeted index of older handles). Output comes back in pages of 20,000 characters; the page says how to continue:
 
 ```
 zip_recall({ handle: "k3f9a0x1qz", offset: 20000 })               // next page, by characters

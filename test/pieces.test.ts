@@ -10,7 +10,7 @@ import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, p
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
 import { parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, sliceRecall } from "../src/recall.ts";
-import { handleTable, skeleton } from "../src/summary.ts";
+import { handleRowsOf, handleTable, INDEX_TOKENS, skeleton } from "../src/summary.ts";
 import { tokensOf } from "../src/util.ts";
 
 const zipRecallName = "zip_recall";
@@ -129,6 +129,67 @@ describe("handles and placeholders", () => {
 		expect(table).toContain("- h69 ");
 		expect(table).not.toContain("- h29 ");
 		expect(table).toContain("- h30 ");
+	});
+	test("handle index: handles of an earlier summary survive the clip of its carried-forward text", () => {
+		const session = (n: number, from = 0) => {
+			const ids = Array.from({ length: n }, (_, i) => from + i);
+			return [U(`u${from}`, "go"), ...ids.flatMap((i) => [A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 0, "tiny")]), A(`z${from}`)];
+		};
+		const older = skeleton(buildBlocks(session(30)), null).text;
+		// an earlier summary whose own carried-forward block fills the 12,000-char clip, so everything after it is cut from the carried text
+		const prev = older.replace("\n## User requests", "\n## Earlier summary (carried forward)\n" + "filler ".repeat(2500) + "\n## User requests");
+		const t = skeleton(buildBlocks(session(3, 100)), prev).text;
+		expect(t).not.toContain("## Commands run (with exit status)\n`ls` -> exit 0 (turn 1, " + handleFor("r0")); // the clip did cut the old list
+		for (let i = 0; i < 30; i++) expect(t).toContain(handleFor(`r${i}`));
+		expect(t).toContain("## Handle index");
+		expect(t.split("\n").filter((l) => l.startsWith("- " + handleFor("r0") + " "))).toEqual([`- ${handleFor("r0")} \u00b7 bash ls \u00b7 turn 1`]);
+	});
+	test("handle index: newest first, only handles not listed elsewhere, within the token budget, and says what did not fit", () => {
+		const session = (n: number) => [U("u1", "go"), ...Array.from({ length: n }, (_, i) => i).flatMap((i) => [A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 0, "tiny")]), A("z")];
+		const first = skeleton(buildBlocks(session(1200)), null).text; // lists the newest 60 commands, indexes the rest under the budget
+		const idx = first.slice(first.indexOf("## Handle index"));
+		expect(Math.ceil(idx.length / 4)).toBeLessThanOrEqual(INDEX_TOKENS);
+		expect(idx).toMatch(/\[\u2026 \d+ older handles not listed \u2026\]/);
+		const rows = handleRowsOf(first).map((r) => r.handle);
+		expect(rows).toContain(handleFor("r1199"));
+		expect(rows).toContain(handleFor("r1139"));
+		expect(rows).toContain(handleFor("r1138")); // newest of the indexed ones
+		expect(rows.indexOf(handleFor("r1138"))).toBeLessThan(rows.indexOf(handleFor("r1100")));
+		expect(first).not.toContain(handleFor("r0")); // oldest: over budget
+		expect(new Set(rows).size).toBe(rows.length); // each handle once
+		const second = skeleton(buildBlocks([U("u1", "more"), A("b1", ["d1"]), R("s1", "d1", 0, "tiny"), A("y")]), first).text;
+		expect(second).toContain(handleFor("r1138"));
+		expect(second).toContain(handleFor("s1"));
+		expect(Math.ceil(second.slice(second.indexOf("## Handle index")).length / 4)).toBeLessThanOrEqual(INDEX_TOKENS);
+	});
+	test("handleRowsOf reads the commands, files, other-calls, table and index formats of earlier summaries", () => {
+		const a = handleFor("e1"), b = handleFor("e2"), c = handleFor("e3"), d = handleFor("e4"), e = handleFor("e5");
+		const text = [
+			"[summary of earlier conversation by pi-zip]",
+			"## Files touched",
+			`- src/a (b).ts (read: ${a}, edit: ${b})`,
+			"- src/old.ts (read)",
+			"## Commands run (with exit status)",
+			`\`bun test\` -> exit 1 (turn 4, ${c})`,
+			"## Other tool calls (turn, handle)",
+			`web_fetch {"url":"https://x"} (turn 2, ${d})`,
+			"## Narrative (model-written)",
+			`- ${a} \u00b7 bash not a row, narrative text`,
+			"## Folded outputs (originals recallable with zip_recall)",
+			`- ${e} \u00b7 bash cat f \u00b7 turn 7 \u00b7 exit 0 \u00b7 hint`,
+			"## Handle index (older outputs)",
+			`- ${b} \u00b7 read src/z.ts \u00b7 turn 3`,
+			"[\u2026 5 older handles not listed \u2026]",
+		].join("\n");
+		expect(handleRowsOf(text)).toEqual([
+			{ handle: a, tool: "read", args: "src/a (b).ts" },
+			{ handle: b, tool: "edit", args: "src/a (b).ts" },
+			{ handle: c, tool: "bash", args: "bun test", turn: 4 },
+			{ handle: d, tool: "web_fetch", args: '{"url":"https://x"}', turn: 2 },
+			{ handle: e, tool: "bash", args: "cat f", turn: 7 },
+			{ handle: b, tool: "read", args: "src/z.ts", turn: 3 },
+		]);
+		expect(handleRowsOf(null)).toEqual([]);
 	});
 	const ktxt = ["record 0001: alpha-beta-gamma", "SECRET-CODE-1: zebra111", "nothing interesting here", "note=lorem ipsum dolor", "checksum=00491 note=x", "ERROR: connection reset by peer", "hash a1b2c3d4e5f60718 written", "took 250 ms to complete", "92345678", "final line ok"].join("\n");
 	test("key lines: first+last, errors, ids, key=value, hex, labelled numbers; sorted, capped, deterministic", () => {
