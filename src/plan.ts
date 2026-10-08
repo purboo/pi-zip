@@ -6,12 +6,14 @@ import { type Any, PRODUCT, clamp, envInt, textOf, tok4, tokensOf } from "./util
 import { PH_MARK } from "./placeholder.ts";
 
 /** Default: when a cold return is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest first.
- *  false = the previous user turn stays fully protected. The only knob that is meant to be flipped. */
+ *  false = no relax fold of the previous user turn, but the in-turn rule (INTURN_AGE) still folds old rereadable outputs there; set
+ *  PI_ZIP_INTURN_AGE=0 as well for a fully protected previous turn. */
 export const RELAX_PREV_TURN = true;
 
 /** Default age, in assistant requests, from which a REREADABLE output inside the protected user turns may still be folded. A sub-agent
  *  session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for its whole life (offline sim
- *  on 295 recorded sessions: 1.37x the billion-context bill). 0 disables the rule (PI_ZIP_INTURN_AGE). */
+ *  on 295 recorded sessions: 1.37x the billion-context bill). 0 disables the rule (PI_ZIP_INTURN_AGE).
+ *  Plans run at turn_end, before the next request, so `age >= 20` here equals the sim's `b <= v - 21` (one request stricter than `v - 20`). */
 export const INTURN_AGE = 20;
 
 const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; folded only when re-readable (relax: previous turn; in-turn: old enough)
@@ -173,7 +175,8 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 		if (kind === "user" && !(src.id && steerIds?.has(src.id))) userTurn++;
 		const ours = edited && kind === "toolResult" && textOf(msg.content).startsWith(PH_MARK);
 		if (kind === "assistant") {
-			asst++;
+			// aborted / final-error messages stay in the projection but pi-ai drops them before sending: they add no age (their calls still count as issued)
+			if (msg.stopReason !== "error" && msg.stopReason !== "aborted") asst++;
 			for (const c of msg.content ?? []) if (c?.type === "toolCall") issued.set(c.id, asst);
 		}
 		asstOf[blocks.length] = kind === "toolResult" ? (issued.get(msg.toolCallId) ?? asst) : asst;

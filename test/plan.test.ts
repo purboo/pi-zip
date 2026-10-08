@@ -368,3 +368,18 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 		expect(age("r1")).toBe(30);
 	});
 });
+
+describe("age counts only assistant messages the model is sent", () => {
+	test("aborted and final-error assistant messages add no age; the calls they issued still count as issued", () => {
+		const mk = (stop: string) => {
+			const bad = A("bad", ["c2"]);
+			Object.assign(bad.sourceEntry.message, { stopReason: stop });
+			Object.assign(bad.messages[0], { stopReason: stop });
+			return [U("u1", "go"), A("a1", ["c1"]), R("r1", "c1"), bad, R("r2", "c2"), A("a3"), A("a4")];
+		};
+		const ageOf = (stop: string) => { const bl = buildBlocks(mk(stop)); return [bl.find((b: Any) => b.entryId === "r1")!.age, bl.find((b: Any) => b.entryId === "r2")!.age]; };
+		expect(ageOf("stop")).toEqual([3, 2]);
+		expect(ageOf("aborted")).toEqual([2, 2]);
+		expect(ageOf("error")).toEqual([2, 2]);
+	});
+});

@@ -249,7 +249,7 @@ describe("old formats and foreign summaries", () => {
 	test("empty, '(none)'-only, null and a bare mark all merge into an empty-but-valid summary", () => {
 		for (const prev of [null, "", "[summary of earlier conversation by pi-zip]", "## User requests (verbatim, oldest first)\n(none)\n## Files touched\n(none)"]) {
 			const t = skeleton(buildBlocks([U("u1", "ONLY"), A("e")]), prev).text;
-			expect(t).toContain("## User requests (verbatim, oldest first)\n1. ONLY\n## Files touched\n(none)");
+			expect(t).toContain("## User requests (verbatim, oldest first, continuation lines indented)\n1. ONLY\n## Files touched\n(none)");
 			expect(t).not.toContain("Earlier narrative");
 		}
 	});
@@ -262,5 +262,52 @@ describe("old formats and foreign summaries", () => {
 		expect(t).not.toContain("R0 ");
 		expect(t).toContain("R11 ");
 		expect(/\[… (\d+) older requests omitted …\]/.exec(t)![1]).toBe(String(12 - (t.match(/^\d+\. R\d+ /gm) ?? []).length));
+	});
+});
+
+describe("user requests survive carry-forward intact", () => {
+	const reqs = ["Steps:\n1. fix A\n2. fix B\n3. fix C", "ok go"];
+	const level = (names: string[]) => buildBlocks(names.flatMap((t, i) => [U(`x${i}-${t.length}-${Math.random()}`, t), A(`a${i}-${Math.random()}`)]));
+	const users = (text: string) => parseSummary(text).users;
+
+	test("a numbered list or a '## ' heading inside a request stays one request, across levels", () => {
+		const heading = "Please look at this output:\n## Errors\nboom\n## Files touched\n- x\n1. not a request";
+		let t = skeleton(level([...reqs, heading]), null).text;
+		expect(users(t).items).toEqual([...reqs, heading]);
+		t = skeleton(level(["next"]), t).text;
+		expect(users(t).items).toEqual([...reqs, heading, "next"]);
+		expect(t).toContain("1. Steps:\n   1. fix A");
+		t = skeleton(level(["last"]), t).text;
+		expect(users(t).items).toEqual([...reqs, heading, "next", "last"]);
+		expect(t).toContain("4. next");
+		expect(t).toContain("5. last");
+		// the heading inside the request did not cut the real sections short
+		expect(t).toContain("\n## Files touched\n");
+	});
+
+	test("with the budget forcing a drop, whole requests go, the count is exact and the rest keeps its numbering", () => {
+		const big = (n: number) => `REQ${n}\n1. item\n2. item\n` + "x".repeat(5000);
+		let t = skeleton(level([big(1), big(2), big(3)]), null).text;
+		t = skeleton(level([big(4), big(5)]), t).text;
+		t = skeleton(level([big(6)]), t).text;
+		const u = users(t);
+		expect(u.items.length + u.omitted).toBe(6);
+		expect(u.omitted).toBeGreaterThan(0);
+		for (const [i, item] of u.items.entries()) expect(item.startsWith(`REQ${u.omitted + i + 1}\n1. item\n2. item\n`)).toBe(true);
+		expect(t).toContain(`${u.omitted + 1}. REQ${u.omitted + 1}\n   1. item`);
+	});
+
+	test("repeated identical requests are all kept, in order, across levels", () => {
+		let t = skeleton(level(["first", "yes", "now do Y", "yes"]), null).text;
+		expect(users(t).items).toEqual(["first", "yes", "now do Y", "yes"]);
+		t = skeleton(level(["yes", "yes"]), t).text;
+		expect(users(t).items).toEqual(["first", "yes", "now do Y", "yes", "yes", "yes"]);
+		expect(t).toContain("6. yes");
+	});
+
+	test("an older-format summary still parses heuristically (list numbers do not split when they are not last+1)", () => {
+		const old = "## User requests (verbatim, oldest first)\n1. one\n2. two\n## Files touched\n(none)";
+		expect(users(old).items).toEqual(["one", "two"]);
+		expect(users(skeleton(level(["three"]), old).text).items).toEqual(["one", "two", "three"]);
 	});
 });

@@ -152,6 +152,9 @@ const SECTIONS: Array<[RegExp, string]> = [
 	[/^## Earlier narrative/, "narr"],
 	[/^## Earlier summary/, "free"], // the carried-forward block of the older format
 ];
+/** Heading written for the user section. Its request bodies indent every continuation line by USER_INDENT, so a numbered list or a `## ` heading inside a request cannot be taken for an item or section start. Older summaries have no such marker and are parsed heuristically. */
+const USERS_HEAD = "## User requests (verbatim, oldest first, continuation lines indented)";
+const USER_INDENT = "   ";
 const OMIT_ROW = /^\[… (\d+) [^\]]*?(?:omitted|not listed)[^\]]*…\]$/;
 const COVERS_ROW = /^Covers \d+ earlier messages\./;
 const NONE_ROW = "(none)";
@@ -161,22 +164,22 @@ export function parseSummary(text: string | null): ParsedSummary {
 	const out: ParsedSummary = { structured: false, users: { items: [], omitted: 0 }, files: { rows: [], omitted: 0 }, cmds: { items: [], omitted: 0 }, others: { items: [], omitted: 0 }, errors: { items: [], omitted: 0 }, table: { items: [], omitted: 0 }, narrative: [] };
 	if (!text) return out;
 	// occurrences in text order; in the older nested format the nested (older) copy of a section comes first, so order = oldest first
-	const occ: Array<{ key: string; lines: string[] }> = [{ key: "free", lines: [] }];
+	const occ: Array<{ key: string; lines: string[]; indented?: boolean }> = [{ key: "free", lines: [] }];
 	for (const line of text.split("\n")) {
-		if (line.trim() === SUMMARY_MARK || COVERS_ROW.test(line)) continue;
+		if ((line.trim() === SUMMARY_MARK && !/^\s/.test(line)) || COVERS_ROW.test(line)) continue;
 		const hit = line.startsWith("## ") ? SECTIONS.find(([re]) => re.test(line)) : undefined;
 		if (hit) {
-			occ.push({ key: hit[1], lines: [] });
+			occ.push({ key: hit[1], lines: [], indented: hit[1] === "users" && line.trim() === USERS_HEAD });
 			if (hit[1] !== "free" && hit[1] !== "narr") out.structured = true;
 			continue;
 		}
 		occ[occ.length - 1].lines.push(line);
 	}
 	const files = new Map<string, FileRow>();
-	for (const { key, lines } of occ) {
+	for (const { key, lines, indented } of occ) {
 		const body = lines.filter((l) => l.trim() !== "" && l.trim() !== NONE_ROW);
 		if (key === "users") {
-			const r = parseUsers(lines);
+			const r = indented ? parseIndentedUsers(lines) : parseUsers(lines);
 			out.users.items.push(...r.items);
 			out.users.omitted += r.omitted;
 			continue;
@@ -216,7 +219,33 @@ export function parseSummary(text: string | null): ParsedSummary {
 	return out;
 }
 
-/** Numbered, possibly multi-line requests. Numbers run 1, 2, 3...; after an omission marker (or a gap in the older format) any larger number resumes. */
+/** Current format: an unindented `N. ` line starts a request, indented lines continue it (number values are ignored: they are display only). */
+function parseIndentedUsers(lines: string[]): Items {
+	const out: Items = { items: [], omitted: 0 };
+	let cur: string[] | null = null;
+	const close = () => {
+		if (cur) out.items.push(cur.join("\n").replace(/\s+$/, ""));
+		cur = null;
+	};
+	for (const line of lines) {
+		const om = OMIT_ROW.exec(line);
+		if (om && /requests omitted/.test(line)) {
+			close();
+			out.omitted += Number(om[1]);
+			continue;
+		}
+		const m = /^\d+\. (.*)$/.exec(line);
+		if (m) {
+			close();
+			cur = [m[1]];
+		} else if (cur) cur.push(line.startsWith(USER_INDENT) ? line.slice(USER_INDENT.length) : line.trim() === "" ? "" : line);
+	}
+	close();
+	out.items = out.items.filter((t) => t !== NONE_ROW && t !== "");
+	return out;
+}
+
+/** Older format: numbered, possibly multi-line requests, heuristic. Numbers run 1, 2, 3...; after an omission marker (or a gap in the older format) any larger number resumes. */
 function parseUsers(lines: string[]): Items {
 	const out: Items = { items: [], omitted: 0 };
 	let cur: string[] | null = null;
@@ -248,14 +277,16 @@ function parseUsers(lines: string[]): Items {
 }
 
 /**
- * older + newer, oldest first. Deduplicated by `key` (default: the item itself; the newest copy wins and keeps the newest position),
- * then the newest items that fit `maxItems` and `maxChars` are kept (always at least the newest one). `omitted` counts every older
+ * older + newer, oldest first. Deduplicated by `key` (default: the item itself; the newest copy wins and keeps the newest position;
+ * `null` = no dedup, for repeated user requests), then the newest items that fit `maxItems` and `maxChars` are kept (always at least the newest one). `omitted` counts every older
  * item left out so far, this merge's drops included.
  */
-function mergeItems(older: string[], newer: string[], omitted: number, maxItems: number, maxChars: number, key: (s: string) => string | undefined = (s) => s): { kept: string[]; omitted: number } {
+function mergeItems(older: string[], newer: string[], omitted: number, maxItems: number, maxChars: number, key: ((s: string) => string | undefined) | null = (s) => s): { kept: string[]; omitted: number } {
 	let all = [...older, ...newer];
-	const seen = new Set<string>();
-	all = all.reverse().filter((x) => { const k = key(x) ?? x; return seen.has(k) ? false : (seen.add(k), true); }).reverse();
+	if (key) {
+		const seen = new Set<string>();
+		all = all.reverse().filter((x) => { const k = key(x) ?? x; return seen.has(k) ? false : (seen.add(k), true); }).reverse();
+	}
 	let from = all.length;
 	let used = 0;
 	while (from > 0 && all.length - from < maxItems && used + all[from - 1].length + 1 <= maxChars) used += all[--from].length + 1;
@@ -331,8 +362,8 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	}
 	const prev = parseSummary(previous);
 	// user requests: previous (older) then new; the oldest go first, numbering continues over what was left out
-	const mu = mergeItems(prev.users.items, users, prev.users.omitted, Infinity, BUDGET.users, undefined);
-	const userLines = mu.kept.map((u, i) => `${mu.omitted + i + 1}. ${u}`);
+	const mu = mergeItems(prev.users.items, users, prev.users.omitted, Infinity, BUDGET.users, null); // no dedup: a repeated "yes" is a different request each time
+	const userLines = mu.kept.map((u, i) => `${mu.omitted + i + 1}. ${u.replace(/\n/g, "\n" + USER_INDENT)}`);
 	// files: a path touched again moves to the newest end with its newest handles
 	const merged = new Map<string, FileRow>(prev.files.rows.map((r) => [r.path, r]));
 	for (const [path, ops] of files) {
@@ -347,7 +378,7 @@ export function skeleton(prefix: Block[], previous: string | null, tableText = "
 	const me = mergeItems(prev.errors.items, errors, prev.errors.omitted, BUDGET.errorLines, BUDGET.errors);
 	const out: string[] = [SUMMARY_MARK];
 	out.push(`Covers ${prefix.length} earlier messages. Tool outputs in the kept part of the conversation may have been folded; call zip_recall with a handle to get one back exactly.`);
-	out.push("## User requests (verbatim, oldest first)");
+	out.push(USERS_HEAD);
 	if (mu.omitted) out.push(`[… ${mu.omitted} older requests omitted …]`);
 	out.push(...(userLines.length ? userLines : [NONE_ROW]));
 	out.push(...list("## Files touched", mf, "older omitted"));
