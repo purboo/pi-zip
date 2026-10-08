@@ -17,10 +17,16 @@ describe("learned cache survival", () => {
 		expect(e.cls).toBe("explicit");
 		expect(pWarm(e, 360, 300).p).toBeLessThan(0.5);
 		expect(pWarm(e, 200, 300)).toEqual({ p: 1, src: "prior" }); // shorter gaps keep the declared TTL
-		// a provider that declared 1 h but kills at 360 s: one miss overrides the prior
-		const one = record("x/declared-1h", { explicit: true, total: 50_000, gapS: 400, alive: false }, path);
-		expect(pWarm(one, 400, 3600).p).toBeLessThan(0.5);
-		expect(pWarm(one, 2000, 3600).p).toBeLessThan(0.5); // monotone: longer gaps are no more alive than a dead one
+		// inside the declared TTL a lone miss is noise (warm misses happen); repeated misses override it
+		const miss = () => record("x/declared-1h", { explicit: true, total: 50_000, gapS: 400, alive: false }, path);
+		expect(pWarm(miss(), 400, 3600).p).toBeCloseTo(2 / 3);
+		expect(pWarm(miss(), 400, 3600).p).toBeCloseTo(0.5, 1);
+		const three = miss();
+		expect(pWarm(three, 400, 3600).p).toBeLessThan(0.5);
+		expect(pWarm(three, 2000, 3600).p).toBeLessThan(0.5); // monotone: longer gaps are no more alive than a dead one
+		// glm-flash-like noise: 8 hits and 2 misses at 70 s stay warm
+		for (let i = 0; i < 10; i++) record("g/flash", { explicit: false, total: 50_000, gapS: 70, alive: i % 5 !== 0 }, path);
+		expect(pWarm(loadStats(path).models["g/flash"], 70, 300).p).toBeGreaterThan(0.75);
 	});
 
 	test("GLM: one alive read at 365 s makes every shorter gap warm, longer gaps keep the prior", () => {

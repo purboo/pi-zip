@@ -31,7 +31,11 @@ export function lawPrices(model: Any, cls: CacheClass | undefined, longTier: boo
 /** Gap bins (s): [GAP_EDGES[i], GAP_EDGES[i+1]). Edges sit on the known TTL tiers (300 s, 3600 s): a deterministic TTL never splits a bin. */
 export const GAP_EDGES = [30, 60, 120, 180, 240, 300, 330, 360, 420, 480, 600, 900, 1200, 1800, 2700, 3600, 5400];
 export const HALF_LIFE = 16; // observations per bin: old evidence counts half after 16 newer ones in the same bin (a provider may change its TTL)
-const PRIOR_WEIGHT = 0.25; // the cold-start belief (declared TTL) is worth a quarter of one observation: one clean read overrides it
+// The declared TTL as pseudo-observations. Asymmetric because the signal is: a read of the re-sent prefix cannot happen on a dead cache,
+// but warm misses do (GLM 4-9%, glm-flash ~22%, research round 5). Beyond the TTL one clean read overrides it (weight 1/4: one hit -> 0.8);
+// inside it a lone miss does not (weight 2: one miss -> 0.67, two -> 0.5, three -> 0.4). Otherwise one random miss flips a warm bin to
+// dead, the next returns there fold, and a miss right after a fold is censored: nothing would ever correct it (live smoke, glm-5.3-flash).
+const PRIOR_WEIGHT = { alive: 2, dead: 0.25 };
 export const MIN_EXPECT = 8192; // prefix tokens a sample needs: far above the shared system prefix (~2.4K) other sessions keep warm
 
 export interface Entry { cls?: CacheClass; bins: Record<string, [number, number]>; n: number } // bin index -> [alive, dead] (decayed counts)
@@ -96,11 +100,12 @@ export function record(key: string, u: { explicit: boolean; total: number; gapS?
 	return e;
 }
 
-/** Monotone (non-increasing in the gap) survival per observed bin: (alive + prior) / (n + prior weight), pooled adjacent violators. */
+/** Monotone (non-increasing in the gap) survival per observed bin: (alive + m x prior) / (n + m), pooled adjacent violators. */
 export function curve(e: Entry | undefined, priorS: number): { bin: number; p: number; n: number }[] {
 	const pts = Object.entries(e?.bins ?? {}).map(([b, [a, d]]) => {
 		const i = Number(b), mid = Math.sqrt(GAP_EDGES[i] * (GAP_EDGES[i + 1] ?? 2 * GAP_EDGES[i])), pi = mid <= priorS ? 1 : 0;
-		return { bins: [i], p: (a + PRIOR_WEIGHT * pi) / (a + d + PRIOR_WEIGHT), w: a + d + PRIOR_WEIGHT };
+		const m = pi ? PRIOR_WEIGHT.alive : PRIOR_WEIGHT.dead;
+		return { bins: [i], p: (a + m * pi) / (a + d + m), w: a + d + m };
 	}).sort((x, y) => x.bins[0] - y.bins[0]);
 	const st: typeof pts = [];
 	for (const q of pts) {
