@@ -9,7 +9,12 @@ import { PH_MARK } from "./placeholder.ts";
  *  false = the previous user turn stays fully protected. The only knob that is meant to be flipped. */
 export const RELAX_PREV_TURN = true;
 
-const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never folded or summarised
+/** Default age, in assistant requests, from which a REREADABLE output inside the protected user turns may still be folded. A sub-agent
+ *  session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for its whole life (offline sim
+ *  on 295 recorded sessions: 1.37x the billion-context bill). 0 disables the rule (PI_ZIP_INTURN_AGE). */
+export const INTURN_AGE = 20;
+
+const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; folded only when re-readable (relax: previous turn; in-turn: old enough)
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
@@ -113,6 +118,7 @@ export const settings = () => ({
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
 	minGain: envInt("MIN_GAIN", 10_000), // a summary must remove at least max(minGain, 15% of the context)
+	inturnAge: envInt("INTURN_AGE", INTURN_AGE), // rereadable outputs of the protected turns older than this many assistant requests may fold; 0 = never
 });
 
 /** A summary only pays when it removes a real share of the context. */
@@ -133,6 +139,7 @@ export interface Block {
 	userTurn: number; // user messages so far (inclusive)
 	edited: boolean; // some context_edit changed this entry
 	ours: boolean; // ... and it is one of our placeholders
+	age: number; // toolResult: assistant requests that came after the one that issued the call (0 = answered by the newest request); other kinds 0
 }
 export type Calls = Map<string, { name: string; args: Any }>;
 
@@ -142,6 +149,9 @@ export const countUserTurns = (blocks: Block[]): number => blocks.reduce((a, b) 
 export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Block[] {
 	const blocks: Block[] = [];
 	let userTurn = 0;
+	let asst = 0; // assistant messages so far
+	const issued = new Map<string, number>(); // tool call id -> ordinal of the latest assistant message that issued it (ids may be reused)
+	const asstOf: number[] = []; // block idx -> ordinal of the issuing assistant message (toolResult blocks only)
 	for (const pe of contextEntries) {
 		const src = pe.sourceEntry;
 		const msgs: Any[] = pe.messages ?? [];
@@ -162,8 +172,14 @@ export function buildBlocks(contextEntries: Any[], steerIds?: Set<string>): Bloc
 		}
 		if (kind === "user" && !(src.id && steerIds?.has(src.id))) userTurn++;
 		const ours = edited && kind === "toolResult" && textOf(msg.content).startsWith(PH_MARK);
-		blocks.push({ idx: blocks.length, entryId: src.id ?? null, kind, msg, raw, tokens: msgs.reduce((a, m) => a + tokensOf(m), 0), userTurn, edited, ours });
+		if (kind === "assistant") {
+			asst++;
+			for (const c of msg.content ?? []) if (c?.type === "toolCall") issued.set(c.id, asst);
+		}
+		asstOf[blocks.length] = kind === "toolResult" ? (issued.get(msg.toolCallId) ?? asst) : asst;
+		blocks.push({ idx: blocks.length, entryId: src.id ?? null, kind, msg, raw, tokens: msgs.reduce((a, m) => a + tokensOf(m), 0), userTurn, edited, ours, age: 0 });
 	}
+	for (const b of blocks) if (b.kind === "toolResult") b.age = asst - asstOf[b.idx];
 	return blocks;
 }
 
@@ -236,6 +252,7 @@ export interface PlanOpts {
 	promptPending?: boolean; // true at settle: the upcoming prompt is NOT in `entries` yet but counts as a new user turn
 	relax?: boolean; // default RELAX_PREV_TURN
 	minGain?: number;
+	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 20); 0 = outputs of the protected turns never fold on age
 }
 
 export interface PlanResult {
@@ -276,6 +293,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
 	const relax = o.relax ?? RELAX_PREV_TURN;
+	const inturnAge = o.inturnAge ?? s.inturnAge;
 	const blocks = buildBlocks(entries, o.steerIds);
 	if (!blocks.length) return null;
 	const userTurns = countUserTurns(blocks) + (o.promptPending ? 1 : 0); // the upcoming prompt is a new user turn
@@ -327,6 +345,19 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			for (const b of prev.sort((x, y) => y.tokens - x.tokens)) {
 				if (est <= coldCap) break;
 				if (addFold(b, `${trig}(relax)`)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
+			}
+		}
+	}
+	if (inturnAge > 0) {
+		// in-turn: a protected turn (the new prompt's, the previous one, or the one a mid-run cold return / valve is inside) still holds
+		// outputs that are many requests old; rereadable ones fold biggest-first until the cap, exactly like the previous-turn relax.
+		// Age = assistant requests since the call was issued (the newest outputs, age < inturnAge, always stay).
+		let est = ctxEst - savings();
+		if (est > coldCap) {
+			const aged = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.age >= inturnAge && classify(b) === "rereadable");
+			for (const b of aged.sort((x, y) => y.tokens - x.tokens)) {
+				if (est <= coldCap) break;
+				if (addFold(b, `${trig}(inturn)`)) est -= b.tokens - (tokOverride.get(b.idx) ?? 0);
 			}
 		}
 	}

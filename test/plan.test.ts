@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, valveAllows, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
-import { A, AX, flat, R, U, type Any } from "./helpers.ts";
+import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 
 const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, sys: 0, cwd: process.cwd(), promptPending: true, ...over });
 
@@ -282,5 +282,89 @@ describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
 		(entries[1].messages[0] as Any).content[1].name = "write";
 		(entries[2].messages[0] as Any).toolName = "write";
 		expect(warm(entries, 200_000)).toBeNull();
+	});
+});
+
+describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
+	const saved = process.env.PI_ZIP_INTURN_AGE;
+	afterEach(() => { if (saved === undefined) delete process.env.PI_ZIP_INTURN_AGE; else process.env.PI_ZIP_INTURN_AGE = saved; });
+	const ids = (p: Any) => p.folds.map((f: Any) => f.entryId).sort();
+	const rr = (from: number, to: number, skip: number[] = []) => Array.from({ length: to - from + 1 }, (_, i) => `r${from + i}`).filter((x) => !skip.includes(Number(x.slice(1)))).sort();
+
+	test("default 20, 0 disables; the setting reads PI_ZIP_INTURN_AGE", () => {
+		delete process.env.PI_ZIP_INTURN_AGE;
+		expect(settings().inturnAge).toBe(20);
+		process.env.PI_ZIP_INTURN_AGE = "0";
+		expect(settings().inturnAge).toBe(0);
+		process.env.PI_ZIP_INTURN_AGE = "35";
+		expect(settings().inturnAge).toBe(35);
+	});
+
+	test("a single user turn: rereadable outputs at least 20 requests old fold; newer, non-rereadable and zip_recall results stay", () => {
+		delete process.env.PI_ZIP_INTURN_AGE;
+		const s = longTurn(60, { mutating: [3, 10, 50], recalls: [7] });
+		const p = planContext(s, opts({ coldCap: 8000, promptPending: false }))!;
+		// 61 assistant messages: call i is answered i requests in, so its age is 61 - i; age >= 20  <=>  i <= 41
+		expect(ids(p)).toEqual(rr(1, 41, [3, 7, 10]));
+		expect(p.folds.every((f) => f.trig === "cold(inturn)" && f.recover === "rereadable")).toBe(true);
+		expect(p.cutIdx).toBeNull(); // the whole session is the protected turn: nothing to summarise
+		expect(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 0 }))!.folds).toHaveLength(0);
+	});
+
+	test("the boundary is exact: age 20 folds, age 19 stays; a larger setting moves it", () => {
+		const s = longTurn(60);
+		expect(ids(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 20 }))!)).toEqual(rr(1, 41));
+		expect(ids(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 40 }))!)).toEqual(rr(1, 21));
+		process.env.PI_ZIP_INTURN_AGE = "30";
+		expect(ids(planContext(s, opts({ coldCap: 8000, promptPending: false }))!)).toEqual(rr(1, 31));
+	});
+
+	test("folds stop at the cap, biggest first (same order as the sim)", () => {
+		const s = longTurn(60);
+		// make r5 and r9 much bigger than the rest
+		for (const id of ["r5", "r9"]) { const e = s.find((x: Any) => x.sourceEntry.id === id)!; e.messages[0].content[0].text = e.messages[0].content[0].text.repeat(4); }
+		const total = buildBlocks(s).reduce((a, b) => a + b.tokens, 0);
+		const p = planContext(s, opts({ coldCap: total - 3000, promptPending: false }))!; // needs ~3K tokens: the two big ones are enough
+		expect(ids(p)).toEqual(["r5", "r9"]);
+	});
+
+	test("under the cap nothing folds; the settle view and the run-start view agree", () => {
+		const s = longTurn(60);
+		expect(planContext(s, opts({ coldCap: 1_000_000, promptPending: false }))!.folds).toHaveLength(0);
+		const settle = planContext(s, opts({ coldCap: 8000 }))!; // prompt pending: the finished turn is the previous one
+		const run = planContext([...s, U("u2", "next")], opts({ coldCap: 8000, promptPending: false }))!;
+		expect(ids(settle)).toEqual(ids(run));
+		expect(settle.folds.map((f) => f.ph)).toEqual(run.folds.map((f) => f.ph));
+	});
+
+	test("recalled outputs and outputs below foldMin are never folded in-turn either", () => {
+		const { handleFor } = require("../src/placeholder.ts");
+		const s = longTurn(60);
+		const p = planContext(s, opts({ coldCap: 8000, promptPending: false, recalled: new Set([handleFor("r1")]) }))!;
+		expect(ids(p)).not.toContain("r1");
+		const small = longTurn(60, { chars: 400 });
+		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))!.folds).toHaveLength(0);
+	});
+
+	test("warm valve: a long single-turn session above V folds old rereadable outputs when that halves the context", () => {
+		const s = longTurn(60, { chars: 24_000 }); // ~4K tokens per output, ~240K estimated (V = 160K)
+		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm" }))!;
+		expect(p).not.toBeNull();
+		expect(p.folds.length).toBeGreaterThan(0);
+		expect(p.folds.every((f) => f.trig === "valve(inturn)")).toBe(true);
+		expect(p.ctxAfterFolds).toBeLessThanOrEqual(0.5 * p.ctxTokens);
+		// ... and not when the age rule is off (nothing else is foldable in one turn)
+		expect(planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm", inturnAge: 0 }))).toBeNull();
+	});
+
+	test("a tool call id reused by the server counts its age from the latest call that used it", () => {
+		const s = longTurn(30);
+		// results r1 and r30 both answer "call_0"; r1's age must come from the assistant right before it
+		for (const id of ["a1", "a30"]) (s.find((x: Any) => x.sourceEntry.id === id)!.messages[0].content[1] as Any).id = "call_0";
+		for (const id of ["r1", "r30"]) s.find((x: Any) => x.sourceEntry.id === id)!.messages[0].toolCallId = "call_0";
+		const b = buildBlocks(s);
+		const age = (id: string) => b.find((x) => x.entryId === id)!.age;
+		expect(age("r30")).toBe(1);
+		expect(age("r1")).toBe(30);
 	});
 });

@@ -1,12 +1,13 @@
 // One group per invariant of design §6 (I1-I6), driven through the real extension with a fake Pi.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { repairPayload, validateEdits } from "../src/guard.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, valveTokens, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
-import { A, AX, fakeCtx, fakePi, flat, project, R, U, withK, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, withK, type Any } from "./helpers.ts";
 
-const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN"];
+const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN", "PI_ZIP_INTURN_AGE"];
 let saved: Record<string, string | undefined> = {};
 beforeEach(() => { saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]])); ENV.forEach((k) => delete process.env[k]); process.env.PI_ZIP_TTL_SECS = "1"; });
 afterEach(() => ENV.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))));
@@ -679,5 +680,94 @@ describe("coexistence (F14)", () => {
 		expect(r.notes[0]).toContain("billion-context");
 		await r.handlers.get("cmd:zip").handler("status", r.ctx);
 		expect(r.notes.at(-1)).toContain("paused");
+	});
+});
+
+// =============================================================================================================
+describe("in-turn folds through the real extension: one user message, 60 tool calls", () => {
+	const MUT = [3, 10, 50];
+	const session = () => longTurn(60, { mutating: MUT, recalls: [7] });
+	const tail = [A("a62", ["c62"]), R("r62", "c62", 300)];
+	const expected = Array.from({ length: 41 }, (_, i) => `r${i + 1}`).filter((x) => ![3, 7, 10].includes(Number(x.slice(1))));
+	const ledgerPath = () => `/tmp/pi-zip-inturn-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
+
+	async function run() {
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const entries = session();
+		const r = await rig(entries, COLD_TS());
+		await r.fire("before_agent_start", {});
+		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
+		const req2 = await r.fire("context_with_system", { messages: [...flat(entries), ...flat(tail)] });
+		const all = [...entries, ...tail, A("a63")];
+		const te = await r.fire("turn_end", turnEnd(all, "a63", 1));
+		return { r, entries, req1, req2, all, te, projected: flat(project(all, te.entries)) };
+	}
+	const folded = (msgs: Any[]) => msgs.filter((m) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip")).map((m) => m.toolCallId.replace("c", "r")).sort();
+
+	test("cold return: old rereadable reads fold, recent / non-rereadable / zip_recall results stay, the guard accepts and the edits persist", async () => {
+		const ledger = ledgerPath();
+		process.env.PI_ZIP_LEDGER = ledger;
+		const { req1, te } = await run();
+		expect(folded(req1.messages)).toEqual([...expected].sort());
+		const edits = te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId).sort();
+		expect(edits).toEqual([...expected].sort()); // persisted as context_edit entries
+		const rows = (await Bun.file(ledger).text()).trim().split("\n").map((l) => JSON.parse(l));
+		expect(rows.filter((x) => x.type === "guard_drop")).toHaveLength(0);
+		const fold = rows.find((x) => x.type === "fold");
+		expect(fold.count).toBe(expected.length);
+		expect(new Set(fold.trigs)).toEqual(new Set(["cold(inturn)"]));
+		rmSync(ledger, { force: true });
+	});
+
+	test("the second request repeats the first byte for byte, and so does the persisted projection", async () => {
+		const { req1, req2, projected } = await run();
+		const n = req1.messages.length;
+		expect(JSON.stringify(req2.messages.slice(0, n))).toBe(JSON.stringify(req1.messages));
+		expect(JSON.stringify(projected.slice(0, n))).toBe(JSON.stringify(req1.messages));
+	});
+
+	test("recall of every in-turn fold is byte-exact", async () => {
+		const { r, entries } = await run();
+		const tool = r.handlers.get("tool:zip_recall");
+		const originals = new Map(entries.filter((e) => e.messages[0].role === "toolResult").map((e) => [e.sourceEntry.id, e.messages[0].content[0].text as string]));
+		for (const id of ["r1", "r12", "r41"]) {
+			const res = await tool.execute("t", { handle: handleFor(id), limit: 50_000 }, undefined, undefined, r.ctx);
+			expect(res.isError).toBe(false);
+			expect(res.content[0].text.endsWith(`lines]\n${originals.get(id)}`)).toBe(true);
+		}
+	});
+
+	test("PI_ZIP_INTURN_AGE=0 restores the old behaviour: the single turn is left alone", async () => {
+		process.env.PI_ZIP_INTURN_AGE = "0";
+		const entries = session();
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const r = await rig(entries, COLD_TS());
+		await r.fire("before_agent_start", {});
+		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
+	});
+
+	test("the guard: an aged rereadable output is a legal target in the latest turn; recent or non-rereadable ones are not", () => {
+		const b = buildBlocks(session());
+		const at = (id: string) => b.findIndex((x) => x.entryId === id);
+		const v = (id: string, rec: string | undefined, over: Any = {}) => validateEdits(b, { folds: new Map([[at(id), "[ph]"]]), recover: rec ? new Map([[at(id), rec]]) : undefined, cut: null, ...over }, 1);
+		expect(v("r41", "rereadable")).toBeNull(); // age 20
+		expect(v("r42", "rereadable")).toMatch(/latest user turn/); // age 19
+		expect(v("r41", "nonrereadable")).toMatch(/latest user turn/);
+		expect(v("r41", undefined)).toMatch(/latest user turn/); // unknown = not proven
+		expect(v("r41", "rereadable", { inturnAge: 0 })).toMatch(/latest user turn/);
+		expect(v("r41", "rereadable", { inturnAge: 30 })).toMatch(/latest user turn/);
+		expect(v("r30", "rereadable", { inturnAge: 30 })).toBeNull();
+	});
+
+	test("random sessions: every fold the planner makes, in-turn ones included, passes the guard", () => {
+		for (const seed of SEEDS) {
+			const entries = [...randomSession(seed), U("uN", "back")];
+			for (const age of [1, 2, 5]) {
+				const p = planContext(entries, { sys: 0, cwd: process.cwd(), coldCap: 500, inturnAge: age, promptPending: false })!;
+				const byId = new Map(p.blocks.map((x) => [x.entryId, x]));
+				const bad = validateEdits(p.blocks, { folds: new Map(p.folds.map((f) => [byId.get(f.entryId)!.idx, f.ph])), recover: new Map(p.folds.map((f) => [byId.get(f.entryId)!.idx, f.recover])), cut: null, inturnAge: age }, p.userTurns);
+				expect(bad).toBeNull();
+			}
+		}
 	});
 });

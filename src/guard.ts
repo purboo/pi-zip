@@ -1,5 +1,5 @@
 // Guard (F13, I5): validate an edit set before committing it, and repair orphan tool results in the outgoing payload.
-import { RELAX_PREV_TURN, type Block } from "./plan.ts";
+import { RELAX_PREV_TURN, settings, type Block } from "./plan.ts";
 import type { Any } from "./util.ts";
 
 const PROTECT_USER_TURNS = 2;
@@ -9,6 +9,7 @@ export interface EditSet {
 	cut: number | null; // summarise blocks[0..cut-1]; blocks[cut] becomes firstKeptEntryId
 	recover?: Map<number, string | undefined>; // block idx -> "rereadable" | "nonrereadable" (needed for folds in the previous user turn)
 	relax?: boolean; // default RELAX_PREV_TURN
+	inturnAge?: number; // default settings().inturnAge: a rereadable output at least this many assistant requests old may fold in a protected turn (0 = never)
 }
 
 /**
@@ -47,13 +48,16 @@ function pairingIssues(blocks: Block[], from: number): Set<string> {
 /** null = legal. Otherwise the reason: bad targets, edits inside the protected user turns, or a tool_use/tool_result pairing the edits themselves would break. */
 export function validateEdits(blocks: Block[], plan: EditSet, userTurns: number): string | null {
 	const relax = plan.relax ?? RELAX_PREV_TURN;
+	const inturnAge = plan.inturnAge ?? settings().inturnAge;
 	const limit = blocks.findIndex((b) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1);
 	for (const [i, text] of plan.folds) {
 		const b = blocks[i];
 		if (!b || b.kind !== "toolResult") return `fold target ${i} is not a toolResult`;
 		if (b.edited) return `fold target ${i} already edited`;
-		if (b.userTurn >= userTurns) return `fold target ${i} is inside the latest user turn`;
-		if (b.userTurn === userTurns - 1 && (!relax || plan.recover?.get(i) !== "rereadable")) return `fold target ${i} is in the previous user turn and not re-readable`;
+		const rereadable = plan.recover?.get(i) === "rereadable";
+		const aged = inturnAge > 0 && rereadable && b.age >= inturnAge; // old enough and re-readable: allowed anywhere (same rule as the planner)
+		if (b.userTurn >= userTurns && !aged) return `fold target ${i} is inside the latest user turn`;
+		if (b.userTurn === userTurns - 1 && !aged && (!relax || !rereadable)) return `fold target ${i} is in the previous user turn and not re-readable`;
 		if (!b.entryId) return `fold target ${i} has no entry id`;
 		if (typeof text !== "string" || !text.trim()) return `empty placeholder for ${i}`;
 	}

@@ -83,3 +83,22 @@ export function withK(entries: Any[], k: number, over: Any = {}) {
 	Object.assign(blocks[i].raw, { stopReason: "stop", usage: { input: Math.round(est * k), cacheRead: 0, cacheWrite: 0, output: 50 }, ...over });
 	return entries;
 }
+
+/**
+ * A sub-agent session: ONE user message, then `rounds` tool rounds (call c<i> issued by assistant a<i>, result r<i>) and a closing assistant message.
+ * Every output is `chars` long and unique; rounds listed in `mutating` ran `npm test` (not rereadable), those in `recalls` are zip_recall results.
+ */
+export function longTurn(rounds: number, o: { chars?: number; mutating?: number[]; recalls?: number[] } = {}): Any[] {
+	const out: Any[] = [U("u1", "do the long task")];
+	for (let i = 1; i <= rounds; i++) {
+		const a = A(`a${i}`, [`c${i}`]);
+		const call = (a.messages[0] as Any).content[1];
+		if (o.mutating?.includes(i)) call.arguments = { command: "npm test" };
+		if (o.recalls?.includes(i)) Object.assign(call, { name: "zip_recall", arguments: { handle: "x" } });
+		out.push(a);
+		const text = Array.from({ length: Math.ceil((o.chars ?? 4000) / 40) }, (_, k) => `r${i} line ${k}: value=${(i * 7919 + k * 104729) % 1000003}`).join("\n");
+		out.push(R(`r${i}`, `c${i}`, 0, text));
+	}
+	out.push(A("aEnd"));
+	return out;
+}
