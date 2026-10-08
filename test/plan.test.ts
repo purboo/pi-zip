@@ -300,13 +300,14 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 		expect(settings().inturnAge).toBe(35);
 	});
 
-	test("a single user turn: rereadable outputs at least 20 requests old fold; newer, non-rereadable and zip_recall results stay", () => {
+	test("a single user turn: outputs of every class at least 20 requests old fold; newer and zip_recall results stay", () => {
 		delete process.env.PI_ZIP_INTURN_AGE;
 		const s = longTurn(60, { mutating: [3, 10, 50], recalls: [7] });
 		const p = planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 20 }))!;
 		// 61 assistant messages: call i is answered i requests in, so its age is 61 - i; age >= 20  <=>  i <= 41
-		expect(ids(p)).toEqual(rr(1, 41, [3, 7, 10]));
-		expect(p.folds.every((f) => f.trig === "cold(inturn)" && f.recover === "rereadable")).toBe(true);
+		expect(ids(p)).toEqual(rr(1, 41, [7])); // the non-rereadable r3 and r10 fold too (final model: one age for every class)
+		expect(p.folds.every((f) => f.trig === "cold(inturn)")).toBe(true);
+		expect(p.folds.filter((f) => f.recover !== "rereadable").map((f) => f.entryId).sort()).toEqual(["r10", "r3"]);
 		expect(p.cutIdx).toBeNull(); // the whole session is the protected turn: nothing to summarise
 		expect(planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 0 }))!.folds).toHaveLength(0);
 	});
@@ -346,7 +347,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 		expect(planContext(small, opts({ coldCap: 100, promptPending: false }))!.folds).toHaveLength(0);
 	});
 
-	test("warm valve: a long single-turn session above V folds old rereadable outputs when that halves the context", () => {
+	test("warm valve: a long single-turn session above V folds old outputs when that halves the context", () => {
 		const s = longTurn(60, { chars: 24_000 }); // ~4K tokens per output, ~240K estimated (V = 160K)
 		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm", inturnAge: 20 }))!;
 		expect(p).not.toBeNull();

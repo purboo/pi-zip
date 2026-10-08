@@ -7,24 +7,22 @@ import { type Any, clamp } from "./util.ts";
 /** explicit: the provider reports cacheWrite (a write premium, Anthropic style); automatic: it never does (prefix cache, writes cost input). */
 export type CacheClass = "explicit" | "automatic";
 
-/** Prices of one prefix token ($/M): r = cache read, w = rewrite, out = output. */
-export interface Prices { r: number; w: number; input: number; out: number; cls: CacheClass; src: "model.cost" | "class default" }
+/** Prices of one prefix token in units of the input price: r = cache read, w = rewrite, out = output. */
+export interface Prices { r: number; w: number; input: number; out: number; cls: CacheClass; src: "class" }
 
-/** Price ratios to input when the model declares none (Anthropic list prices; GLM-like automatic caches). */
+/** Price ratios to input per cache class. explicit = Anthropic list multipliers (read 0.1, 5-min write 1.25, 1-h write 2: kappa = w/r - 1
+ *  = 11.5 / 19); automatic: r = 0.2 (kappa = 4: GLM's own ratio 0.186 -> 4.38 is the only automatic provider measured; the class spans
+ *  kappa 1..9 and its geometric centre 3 was worse on quality). Output = 4 x the class's 5-min write: 5 (= 50 r) / 4 (= 20 r). */
 export const CLASS_RATIOS: Record<CacheClass, { r: number; w: number }> = { explicit: { r: 0.1, w: 1.25 }, automatic: { r: 0.2, w: 1 } };
 
-/** model.cost when sane (input > 0, cacheRead <= input), else the class ratios. w: explicit = cacheWrite of the live tier (1h tier: 2 x input),
- *  automatic = input. Before the first response the class is guessed from model.cost; nothing known at all = null (the legacy rule). */
-export function lawPrices(model: Any, cls: CacheClass | undefined, longTier: boolean): Prices | null {
-	const c = model?.cost;
-	const sane = c?.input > 0 && !(c.cacheRead > c.input);
-	const k: CacheClass | undefined = cls ?? (sane ? (c.cacheWrite > 0 ? "explicit" : "automatic") : undefined);
-	if (!k) return null;
-	const input = sane ? c.input : 1;
-	const d = CLASS_RATIOS[k];
-	const r = sane && c.cacheRead > 0 ? c.cacheRead : d.r * input;
-	const w = k === "automatic" ? input : longTier ? 2 * input : sane && c.cacheWrite > 0 ? c.cacheWrite : d.w * input;
-	return { r, w, input, out: sane && c.output > 0 ? c.output : 4 * w, cls: k, src: sane ? "model.cost" : "class default" };
+/** The class ratios, never Pi's price table (model.cost): the law is homogeneous in prices, so ratios are all it needs, and true prices
+ *  instead of the class ratios moved the bill by 0.0-1.0%. w: explicit 1.25, or 2 on the 1-h tier; automatic 1. The class comes from the
+ *  usage reports (learned, persisted); unknown before the first response = null (the legacy rule). */
+export function lawPrices(cls: CacheClass | undefined, longTier: boolean): Prices | null {
+	if (!cls) return null;
+	const d = CLASS_RATIOS[cls];
+	const w = cls === "explicit" && longTier ? 2 : d.w;
+	return { r: d.r, w, input: 1, out: 4 * d.w, cls, src: "class" };
 }
 
 // ---- cache survival ------------------------------------------------------------------------------------------------

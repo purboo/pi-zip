@@ -6,11 +6,11 @@ import { join } from "node:path";
 import { lawPrices, loadStats, pWarm, record, sample, type Prices } from "../src/learn.ts";
 import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, type Law } from "../src/plan.ts";
 import { Zip } from "../src/run.ts";
-import { A, AX, fakeCtx, fakePi, longTurn, R, U, type Any } from "./helpers.ts";
+import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, type Any } from "./helpers.ts";
 
-const ANTH: Prices = { r: 0.3, w: 3.75, input: 3, out: 15, cls: "explicit", src: "model.cost" };
+const ANTH: Prices = { r: 0.3, w: 3.75, input: 3, out: 15, cls: "explicit", src: "class" };
 const ANTH_1H: Prices = { ...ANTH, w: 6 };
-const GLM: Prices = { r: 0.186, w: 1, input: 1, out: 4.4 / 1.4, cls: "automatic", src: "model.cost" };
+const GLM: Prices = { r: 0.186, w: 1, input: 1, out: 4.4 / 1.4, cls: "automatic", src: "class" };
 describe("verdict section 8 tests", () => {
 	test("1. warm valve (EOQ): with g = 2.4K and A = 40K the first fire is at 47K (5 min), 60K (1 h), 29K (GLM), +-1K", () => {
 		const at = (pr: Prices) => { let D = 0; while (!editAllowed(40_000 + D, 40_000, 1, null, pr, 2_400)) D += 100; return D; };
@@ -61,16 +61,12 @@ describe("verdict section 8 tests", () => {
 		expect(ok(10_000)).toBe(false);
 	});
 
-	test("6. no model.cost (and no response yet) -> the legacy rule; a known class without prices uses the class ratios", () => {
-		expect(lawPrices({ provider: "p", id: "m" }, undefined, false)).toBeNull();
+	test("6. class unknown (no response yet) -> the legacy rule; a known class always uses the class ratios", () => {
+		expect(lawPrices(undefined, false)).toBeNull();
 		for (const [B, A, room] of [[200_000, 90_000, null], [183_000, 131_000, null], [180_000, 170_000, 175_424]] as const) expect(editAllowed(B, A, 1, room, null, 2_400)).toBe(legacyValve(B, A, room));
-		expect(lawPrices({}, "explicit", false)).toMatchObject({ r: 0.1, w: 1.25, src: "class default" });
-		expect(lawPrices({}, "explicit", true)).toMatchObject({ w: 2 });
-		expect(lawPrices({}, "automatic", false)).toMatchObject({ r: 0.2, w: 1 });
-		expect(lawPrices({ cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } }, undefined, false)).toMatchObject({ r: 0.26, w: 1.4, cls: "automatic", src: "model.cost" });
-		expect(lawPrices({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }, undefined, false)).toMatchObject({ w: 3.75, cls: "explicit" });
-		expect(lawPrices({ cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }, "automatic", false)).toMatchObject({ w: 3 }); // usage says no write premium
-		expect(lawPrices({ cost: { input: 1, cacheRead: 2 } }, "automatic", false)).toMatchObject({ src: "class default" }); // insane: read above input
+		expect(lawPrices("explicit", false)).toEqual({ r: 0.1, w: 1.25, input: 1, out: 5, cls: "explicit", src: "class" });
+		expect(lawPrices("explicit", true)).toEqual({ r: 0.1, w: 2, input: 1, out: 5, cls: "explicit", src: "class" });
+		expect(lawPrices("automatic", false)).toEqual({ r: 0.2, w: 1, input: 1, out: 4, cls: "automatic", src: "class" });
 	});
 
 	test("7. GLM without cacheWrite: a 365 s return with a full read makes the next 365 s return warm, and 65K -> 35K still passes", () => {
@@ -86,7 +82,7 @@ describe("verdict section 8 tests", () => {
 	});
 });
 
-describe("rewrite base T: only the suffix after the earliest edit is rewritten", () => {
+describe("rewrite base T: the law accepts any T <= A; the planner passes T = A", () => {
 	test("the law: T < A lowers K and opens the warm valve earlier; T = A by default", () => {
 		expect(editAllowed(70_000, 40_000, 1, null, ANTH, 2_400)).toBe(false); // D 30K < 47K
 		expect(editAllowed(70_000, 40_000, 1, null, ANTH, 2_400, 0, 10_000)).toBe(true); // EOQ at T = 10K: 23.5K
@@ -95,17 +91,20 @@ describe("rewrite base T: only the suffix after the earliest edit is rewritten",
 		expect(lawTerms(70_000, 40_000, 0, null, ANTH, 2_400, 0, 10_000).K).toBeCloseTo(-3.45 * 30_000); // cold: T is irrelevant
 	});
 
-	test("the planner measures T: the same 30K fold fires when an old untouched prefix stays cached, not when it would be rewritten", () => {
+	test("the planner prices T = A wherever the edit starts; the suffix after the earliest edit is only logged (Tsuf)", () => {
 		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 12_000), A(`z${t}`)]).flat();
 		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
 		const prose = [U("up", "talk"), AX("x0", 160_000)]; // ~40K tokens nothing can fold
 		const o = { mode: "warm" as const, sys: 0, cwd: ".", promptPending: false, coldCap: 45_000, model: { contextWindow: 1_000_000 }, law: { pr: ANTH, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
-		const early = planContext([...prose, ...outs(10), ...tail], o); // folds start after the prose: T ~ 3K
-		expect(early).not.toBeNull();
-		expect(o.trace.at(-1).T).toBeLessThan(5_000);
+		expect(planContext([...prose, ...outs(10), ...tail], o)).toBeNull(); // folds start after the prose: the suffix ~3K would fire, T = A does not
+		const t = o.trace.at(-1);
+		expect(t.T).toBe(t.A);
+		expect(t.Tsuf).toBeLessThan(5_000);
+		expect(editAllowed(t.B, t.A, 1, null, ANTH, 2_400, 0, t.Tsuf)).toBe(true); // what the old suffix rule would have done
 		const late = { ...o, trace: [] as Any[] };
-		expect(planContext([...outs(10), ...prose, ...tail], late)).toBeNull(); // folds start at the top: T = A ~ 43K
-		expect(late.trace.at(-1).T).toBeGreaterThan(40_000);
+		expect(planContext([...outs(10), ...prose, ...tail], late)).toBeNull(); // folds start at the top: suffix = A
+		expect(late.trace.at(-1).T).toBe(late.trace.at(-1).A);
+		expect(late.trace.at(-1).Tsuf).toBeGreaterThan(40_000);
 	});
 });
 
@@ -141,11 +140,12 @@ describe("through the extension: the free signal is learned, persisted and used;
 		expect(prompts[1]).toMatchObject({ cold: false, survSrc: "learned", cls: "automatic" });
 		expect(prompts[1].pWarm).toBeGreaterThanOrEqual(0.5);
 		expect(rows.find((r) => r.type === "cache_sample")).toMatchObject({ gapS: 365, expect: 60_100, alive: true, edited: false });
-		expect(zip2.status()).toContain("cache zhipu/glm: automatic (from usage), read 0.26 / write 1.4 / output 4.4 $/M (model.cost), survival 360-420s 0.80 n1");
+		expect(zip2.status()).toContain("cache zhipu/glm: automatic (from usage), read 0.2 / write 1 / output 4 x input (class ratios), survival 360-420s 0.80 n1"); // model.cost (0.26 / 1.4 / 4.4) is never read
 	});
 
 	test("a cold run plan logs Phi, K, eta, T, g, w/r, P(warm) and the price and survival sources", async () => {
 		process.env.PI_ZIP_COLD_CAP = "3000";
+		record("p/m", { explicit: true, total: 10_000 }); // the class is known from an earlier response
 		const entries = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 40_000), A("a2"), U("u2", "two"), A("a3"), U("u3", "now")];
 		const zip = new Zip(fakePi().pi as Any);
 		const { ctx } = fakeCtx(entries, { branch: [{ type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: Date.now() - 400_000, content: [] } }] });
@@ -153,9 +153,119 @@ describe("through the extension: the free signal is learned, persisted and used;
 		zip.beforeAgentStart(ctx);
 		await zip.context({ messages: entries.flatMap((x: Any) => x.messages) }, ctx);
 		const law = readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l)).find((r) => r.type === "law");
-		expect(law).toMatchObject({ where: "run", g: 2500, pWarm: 0, survSrc: "prior", cls: "explicit", wr: 12.5, prSrc: "model.cost" });
+		expect(law).toMatchObject({ where: "run", g: 2500, pWarm: 0, survSrc: "prior", cls: "explicit", wr: 12.5, prSrc: "class" });
 		expect(law.steps.at(-1)).toMatchObject({ at: "plan", ok: true });
 		expect(law.steps.at(-1).K).toBeLessThan(0);
-		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "phi", "K", "eta"]);
+		expect(Object.keys(law.steps.at(-1))).toEqual(["at", "ok", "B", "A", "T", "Tsuf", "phi", "K", "eta"]);
+		expect(law.steps.at(-1).T).toBe(law.steps.at(-1).A);
+	});
+});
+
+describe("final model (research round 5, final-model.md section 8 tests 1-5)", () => {
+	const keep = ["PI_ZIP_TTL_SECS", "PI_ZIP_LEDGER", "PI_ZIP_CACHE_STATS", "PI_ZIP_COLD_CAP", "PI_ZIP_INTURN_AGE"];
+	let saved: Record<string, string | undefined> = {};
+	beforeEach(() => { saved = Object.fromEntries(keep.map((k) => [k, process.env[k]])); for (const k of ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_INTURN_AGE"]) delete process.env[k]; process.env.PI_ZIP_CACHE_STATS = tmpFile(); process.env.PI_ZIP_LEDGER = tmpFile(); });
+	afterEach(() => { for (const k of ["PI_ZIP_CACHE_STATS", "PI_ZIP_LEDGER"]) rmSync(process.env[k]!, { force: true }); keep.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))); });
+	const base = { sys: 0, cwd: ".", promptPending: false, model: { contextWindow: 1_000_000 } };
+	const ids = (p: Any) => p.folds.map((f: Any) => f.entryId).sort();
+	const ledger = () => readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+
+	test("1. a big rereadable read of the previous user turn: a warm plan keeps it, the same plan cold (P = 0) folds it", () => {
+		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
+		const s = [...older, U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 40_000), A("zP"), U("uN", "now")];
+		const cold = planContext(s, { ...base, coldCap: 1_000, mode: "cold" })!;
+		expect(ids(cold)).toContain("rP");
+		expect(cold.folds.find((f) => f.entryId === "rP")!.trig).toBe("cold(relax)");
+		const warm = planContext(s, { ...base, coldCap: 1_000, mode: "warm", law: { pr: null, g: 2_400, pWarm: 1 } })!;
+		expect(warm).not.toBeNull(); // the older turns still fold (legacy rule: > 50% of the context)
+		expect(ids(warm)).not.toContain("rP");
+		expect(warm.folds).toHaveLength(10);
+	});
+
+	test("2. a protected-turn test output (not rereadable) folds at age 60, not at age 59", () => {
+		const s = longTurn(60, { mutating: [1, 2] }); // call i has age 61 - i: r1 = 60, r2 = 59
+		const p = planContext(s, { ...base, coldCap: 8_000 })!;
+		const r1 = p.folds.find((f) => f.entryId === "r1");
+		expect(r1?.recover).toBe("nonrereadable");
+		expect(r1?.trig).toBe("cold(inturn)");
+		expect(ids(p)).toEqual(["r1"]);
+	});
+
+	test("3. T = A: with A ~ 40K, g = 2.4K and the explicit class ratios the first warm fire is at D ~ sqrt(2 g kappa A) ~ 47K, not ~ 30K", () => {
+		const pr = lawPrices("explicit", false)!;
+		const prose = [U("up", "talk"), AX("x0", 140_000)]; // ~35K tokens nothing can fold, BEFORE the outputs: the suffix after the first fold is small
+		const outs = (n: number) => Array.from({ length: n }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 4_000), A(`z${t}`)]).flat();
+		const tail = [U("uP", "prev"), A("aP"), U("uN", "now")];
+		let first: Any = null, before: Any = null;
+		for (let n = 20; n <= 80 && !first; n++) {
+			const o = { ...base, mode: "warm" as const, coldCap: 45_000, law: { pr, g: 2_400, pWarm: 1 }, trace: [] as Any[] };
+			const p = planContext([...prose, ...outs(n), ...tail], o);
+			const t = o.trace.at(-1);
+			if (p) first = t; else before = t;
+		}
+		expect(first).not.toBeNull();
+		expect(first.T).toBe(first.A);
+		const eoq = Math.sqrt(2 * 2_400 * 11.5 * first.A);
+		expect(first.B - first.A).toBeGreaterThanOrEqual(eoq);
+		expect(before.B - before.A).toBeLessThan(eoq);
+		expect(Math.abs(first.B - first.A - 47_000)).toBeLessThan(3_000);
+		expect(first.Tsuf).toBeLessThan(0.25 * first.A); // the suffix rule would have fired long before:
+		expect(editAllowed(before.B, before.A, 1, null, pr, 2_400, 0, before.Tsuf)).toBe(true);
+	});
+
+	test("4. two consecutive turn_ends with a large D: only the first edits; the one after that may edit again", async () => {
+		record("p/m", { explicit: true, total: 10_000 });
+		const turns = (from: number, n: number) => Array.from({ length: n }, (_, i) => [U(`u${from + i}`, `q${from + i}`), A(`a${from + i}`, [`c${from + i}`]), R(`r${from + i}`, `c${from + i}`, 16_000), A(`z${from + i}`)]).flat();
+		const zip = new Zip(fakePi().pi as Any);
+		const small = [U("u0", "go")];
+		const { ctx } = fakeCtx(small);
+		zip.sessionStart(ctx);
+		zip.beforeAgentStart(ctx);
+		await zip.context({ messages: flat(small) }, ctx); // warm, below the cap: no run plan
+		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
+		const end = (entries: Any[]) => zip.turnEnd({ message: { role: "assistant", stopReason: "stop", usage: { input: 1_000, cacheRead: 0, cacheWrite: 0 } }, context: { contextEntries: entries }, entries: [], turnIndex: 0 }, ctx);
+		reply(5_000);
+		const s1 = [...turns(1, 40), U("uN", "now"), A("aN")]; // ~160K estimated: far above any EOQ threshold
+		const te1 = await end(s1);
+		expect(te1.entries.filter((e: Any) => e.type === "context_edit").length).toBeGreaterThan(30);
+		reply(5_000); // the request that first carries the edit
+		const s2 = [...project(s1, te1.entries), ...turns(100, 40), U("uM", "more"), A("aM")]; // 40 new foldable outputs: the law would fire again
+		expect(await end(s2)).toBeUndefined();
+		expect(ledger().filter((r) => r.type === "b2b_skip")).toEqual([expect.objectContaining({ where: "turn_end" })]);
+		reply(5_000); // a plain request in between
+		const te3 = await end(s2);
+		expect(te3.entries.filter((e: Any) => e.type === "context_edit").length).toBeGreaterThan(30);
+	});
+
+	test("4b. the guard covers a warm run start too: a prompt right after the edited request plans nothing", async () => {
+		record("p/m", { explicit: true, total: 10_000 });
+		const turns = Array.from({ length: 40 }, (_, i) => [U(`u${i}`, `q${i}`), A(`a${i}`, [`c${i}`]), R(`r${i}`, `c${i}`, 16_000), A(`z${i}`)]).flat();
+		const big = [...turns, U("uN", "now")];
+		const zip = new Zip(fakePi().pi as Any);
+		const { ctx } = fakeCtx(big);
+		zip.sessionStart(ctx);
+		const reply = (total: number) => { zip.providerRequest({ payload: {} }); zip.messageEnd({ role: "assistant", stopReason: "stop", usage: { input: total, cacheRead: 0, cacheWrite: 0, output: 10 } }); };
+		zip.beforeAgentStart(ctx);
+		const req = await zip.context({ messages: flat(big) }, ctx); // warm run start, far above the threshold: the valve fires
+		expect(req).toBeDefined();
+		reply(5_000); // this request first carried the edit
+		zip.beforeAgentStart(ctx); // the user answers at once (warm)
+		expect(await zip.context({ messages: flat(big) }, ctx)).toBeUndefined();
+		expect(ledger().filter((r) => r.type === "b2b_skip")).toEqual([expect.objectContaining({ where: "run" })]);
+	});
+
+	test("5. lawPrices ignores a present model.cost: the ledger prices any model by its class ratios", async () => {
+		expect(lawPrices.length).toBe(2); // (class, long tier): the model is not even an argument
+		record("q/odd", { explicit: false, total: 10_000 });
+		process.env.PI_ZIP_COLD_CAP = "3000";
+		const model = { provider: "q", id: "odd", contextWindow: 1_000_000, cost: { input: 10, output: 1, cacheRead: 9, cacheWrite: 50 }, promptCache: { short: 300 } };
+		const entries = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 40_000), A("a2"), U("u2", "two"), A("a3"), U("u3", "now")];
+		const zip = new Zip(fakePi().pi as Any);
+		const { ctx } = fakeCtx(entries, { model, branch: [{ type: "message", message: { role: "assistant", provider: "q", model: "odd", stopReason: "stop", timestamp: Date.now() - 400_000, content: [] } }] });
+		zip.sessionStart(ctx);
+		zip.beforeAgentStart(ctx);
+		await zip.context({ messages: flat(entries) }, ctx);
+		expect(ledger().find((r) => r.type === "law")).toMatchObject({ cls: "automatic", wr: 5, prSrc: "class" }); // w/r = 1 / 0.2: kappa = 4
+		expect(zip.status()).toContain("cache q/odd: automatic (from usage), read 0.2 / write 1 / output 4 x input (class ratios)");
 	});
 });

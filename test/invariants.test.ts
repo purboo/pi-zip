@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { repairPayload, validateEdits } from "../src/guard.ts";
+import { record } from "../src/learn.ts";
 import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
@@ -547,10 +548,14 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 
 	test("no V any more: with prices a big warm cut pays at any window (the law); a small window clamps the cap below Pi's compaction trigger", async () => {
 		const mid = withK(session(50), 1); // ~112K tokens, ~105K of it foldable
-		const priced = { ...model(1_000_000), cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } };
-		const big = await rig(mid, WARM_TS(), { model: priced });
+		const stats = process.env.PI_ZIP_CACHE_STATS;
+		process.env.PI_ZIP_CACHE_STATS = `${stats}.priced-${process.pid}`;
+		record("p/m", { explicit: true, total: 10_000 }); // the class is known: the law prices the edit with the class ratios
+		const big = await rig(mid, WARM_TS(), { model: model(1_000_000) });
 		await big.fire("before_agent_start", {});
 		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // D ~105K >> the EOQ Delta at this A
+		rmSync(process.env.PI_ZIP_CACHE_STATS, { force: true });
+		process.env.PI_ZIP_CACHE_STATS = stats;
 		const small = session(6); // ~14K tokens
 		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // cap = room = 7.4K
 		await tiny.fire("before_agent_start", {});
@@ -680,7 +685,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 	const MUT = [3, 10, 50];
 	const session = () => longTurn(60, { mutating: MUT, recalls: [7] });
 	const tail = [A("a62", ["c62"]), R("r62", "c62", 300)];
-	const expected = Array.from({ length: 41 }, (_, i) => `r${i + 1}`).filter((x) => ![3, 7, 10].includes(Number(x.slice(1))));
+	const expected = Array.from({ length: 41 }, (_, i) => `r${i + 1}`).filter((x) => x !== "r7"); // every class folds at age; never zip_recall
 	const ledgerPath = () => `/tmp/pi-zip-inturn-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`;
 
 	async function run() {
@@ -696,7 +701,7 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 	}
 	const folded = (msgs: Any[]) => msgs.filter((m) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip")).map((m) => m.toolCallId.replace("c", "r")).sort();
 
-	test("cold return: old rereadable reads fold, recent / non-rereadable / zip_recall results stay, the guard accepts and the edits persist", async () => {
+	test("cold return: old outputs of every class fold, recent / zip_recall results stay, the guard accepts and the edits persist", async () => {
 		const ledger = ledgerPath();
 		process.env.PI_ZIP_LEDGER = ledger;
 		const { req1, te } = await run();
@@ -738,14 +743,15 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(await r.fire("context_with_system", { messages: flat(entries) })).toBeUndefined();
 	});
 
-	test("the guard: an aged rereadable output is a legal target in the latest turn; recent or non-rereadable ones are not", () => {
+	test("the guard: an aged output of any class is a legal target in the latest turn; recent ones are not", () => {
 		const b = buildBlocks(session());
 		const at = (id: string) => b.findIndex((x) => x.entryId === id);
 		const v = (id: string, rec: string | undefined, over: Any = {}) => validateEdits(b, { folds: new Map([[at(id), "[ph]"]]), recover: rec ? new Map([[at(id), rec]]) : undefined, cut: null, ...over }, 1);
 		expect(v("r41", "rereadable")).toBeNull(); // age 20
 		expect(v("r42", "rereadable")).toMatch(/latest user turn/); // age 19
-		expect(v("r41", "nonrereadable")).toMatch(/latest user turn/);
-		expect(v("r41", undefined)).toMatch(/latest user turn/); // unknown = not proven
+		expect(v("r41", "nonrereadable")).toBeNull(); // final model: the age rule is class-blind
+		expect(v("r41", undefined)).toBeNull();
+		expect(v("r42", "nonrereadable")).toMatch(/latest user turn/);
 		expect(v("r41", "rereadable", { inturnAge: 0 })).toMatch(/latest user turn/);
 		expect(v("r41", "rereadable", { inturnAge: 30 })).toMatch(/latest user turn/);
 		expect(v("r30", "rereadable", { inturnAge: 30 })).toBeNull();

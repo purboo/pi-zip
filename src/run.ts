@@ -85,6 +85,7 @@ export class Zip implements ZipControl {
 	private branchLastMs = 0; // the branch clock at run start (a fresh process knows the gap from the session)
 	private nextEdit: number | null = null; // the next request is the first to carry a new edit: its untouched prefix (real tokens)
 	private pending: { gapS: number; expect: number; edited: boolean; key: string } | null = null;
+	private justEdited = false; // the newest response answered a request that first carried an edit: the next request gets no warm edit
 
 	constructor(private pi: ExtensionAPI) {}
 
@@ -143,7 +144,7 @@ export class Zip implements ZipControl {
 	private law(ctx: Any, pWarm: number): Law {
 		const m = ctx?.model ?? this.model;
 		const ent = this.entKey === modelKey(m) ? this.ent : undefined;
-		return { pr: lawPrices(m, ent?.cls, resolveTtl(m, this.branch(ctx)).ms >= 3_600_000), g: this.g, pWarm };
+		return { pr: lawPrices(ent?.cls, resolveTtl(m, this.branch(ctx)).ms >= 3_600_000), g: this.g, pWarm };
 	}
 	private entKey = "";
 	private loadEnt(key: string) {
@@ -156,7 +157,7 @@ export class Zip implements ZipControl {
 		const l = o.law!, pr = l.pr, rd = (x: number) => (Number.isFinite(x) ? Math.round(x * 1000) / 1000 : x > 0 ? "inf" : null);
 		this.ledger({
 			type: "law", where, g: Math.round(l.g), pWarm: rd(l.pWarm), survSrc: where === "run" ? this.survSrc : "in-run", cls: pr?.cls ?? null, wr: pr ? rd(pr.w / pr.r) : null, prSrc: pr?.src ?? "legacy",
-			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
+			steps: (o.trace ?? []).map((t) => ({ at: t.where, ok: t.ok, B: Math.round(t.B), A: Math.round(t.A), T: Math.round(t.T), ...(t.Tsuf !== undefined ? { Tsuf: Math.round(t.Tsuf) } : {}), phi: rd(t.phi), K: rd(t.K), eta: rd(t.eta) })),
 		});
 	}
 
@@ -307,6 +308,11 @@ export class Zip implements ZipControl {
 	private async computeRunPlan(ctx: Any) {
 		const t0 = performance.now();
 		const entries = ((ctx.sessionManager.buildSessionProjection() as Any)?.entries ?? []) as Any[];
+		if (!this.cold && this.justEdited) { // no warm edit on the request right after an edited one (no back-to-back warm rewrites)
+			this.ledger({ type: "b2b_skip", where: "run" });
+			this.discardBg();
+			return;
+		}
 		const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm);
 		const p = planContext(entries, o);
 		this.lawLedger("run", o);
@@ -463,7 +469,11 @@ export class Zip implements ZipControl {
 			return this.commit(e, ctx, this.runPlan, o);
 		}
 		if (failed) return undefined;
-		// warm cache (in-run, P = 1): nothing, unless the context is above the cold cap and the law fires (I6, F10): then the same plan as cold, from the next request on
+		if (this.justEdited) { // the request that just ended carried a fresh edit: no warm edit on the very next one (no back-to-back warm rewrites)
+			this.ledger({ type: "b2b_skip", where: "turn_end" });
+			return undefined;
+		}
+		// warm cache (in-run, P = 1): nothing, unless the context is above the cold cap and the law fires (I6, F10): then the warm plan, from the next request on
 		const { o: popts } = this.opts(ctx, false, "warm", e.context.contextEntries); // the message that just ended carries the newest usage
 		const p = planContext(e.context.contextEntries, popts);
 		if (popts.trace?.length) this.lawLedger("turn_end", popts);
@@ -577,6 +587,7 @@ export class Zip implements ZipControl {
 	private learn(m: Any) {
 		const pend = this.pending, u = m.usage;
 		this.pending = null;
+		this.justEdited = !!pend?.edited;
 		if (!pend || !u || m.stopReason === "error" || m.stopReason === "aborted") return;
 		const cr = u.cacheRead ?? 0, cw = u.cacheWrite ?? 0, total = (u.input ?? 0) + cr + cw;
 		if (!(total > 0)) return;
@@ -613,9 +624,9 @@ export class Zip implements ZipControl {
 	status(): string {
 		const state = this.off ? "off" : this.conflict ? `paused ("${this.conflict}" also manages context; only the request guard is on)` : "on";
 		const key = modelKey(this.model), ttl = ttlFor(this.model), ent = loadStats().models[key];
-		const pr = lawPrices(this.model, ent?.cls, ttl >= 3_600_000);
-		const cache = !key ? "" : `\ncache ${key}: ${ent?.cls ? `${ent.cls} (from usage)` : pr ? `${pr.cls} (guessed from model.cost)` : "class unknown until the first response"}` +
-			`, ${pr ? `read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)}${pr.src === "model.cost" ? " $/M (model.cost)" : " x input (class default)"}` : "no prices (legacy rule)"}` +
+		const pr = lawPrices(ent?.cls, ttl >= 3_600_000);
+		const cache = !key ? "" : `\ncache ${key}: ${pr ? `${pr.cls} (from usage)` : "class unknown until the first response"}` +
+			`, ${pr ? `read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` : "no prices (legacy rule)"}` +
 			`, ${describe(ent, ttl / 1000)}, growth ${(this.g / 1000).toFixed(1)}K/request`;
 		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}folded ${this.stats.folds} output${this.stats.folds === 1 ? "" : "s"}, ${this.stats.summaries} summar${this.stats.summaries === 1 ? "y" : "ies"} (/zip stats for details)${cache}`;
 	}
