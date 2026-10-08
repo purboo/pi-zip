@@ -51,7 +51,20 @@ The cold cap and V are kept below Pi's own compaction trigger (window minus `com
 
 ## Recall
 
-Folded blocks tell the model how to get the original back, and it does so by itself when it needs the content:
+A folded block says what produced it (tool, command or path with offset/limit, user turn, exit status and test counts for commands), its size, a handle and its key lines, so look-alike runs stay apart. It also tells the model to prefer `zip_recall` (original bytes, instant, free, no side effects) over re-running or re-reading, because a re-run may give a different result:
+
+```
+[folded by pi-zip · bash bun test test/api.test.ts · turn 12 · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
+key lines kept (original line numbers; up to 8):
+1: (pass) suite 0 > case parse config ...
+106: 2 fail
+109: Command exited with code 1
+Original kept byte for byte, recallable even after summaries or compaction: zip_recall("k3f9a0x1qz") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.
+```
+
+Placeholders are written once, when the fold is saved: sessions folded by an earlier version keep their old placeholder text unchanged. Summaries list each folded output with its handle, turn and outcome in the same way.
+
+The model recalls by itself when it needs the content:
 
 ```
 zip_recall({ handles: ["k3f9a0x1qz", "m2b7c4d8ww"] })

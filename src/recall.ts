@@ -159,7 +159,8 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 		name: RECALL_TOOL,
 		label: "Recall folded output",
 		description:
-			"Get back the EXACT original content of tool outputs that pi-zip folded earlier in this session. " +
+			"Get back the EXACT original content of tool outputs that pi-zip folded earlier in this session. It is instant, free and has no side effects: " +
+			"prefer it over re-running a command or re-reading a file when you need the exact earlier output (a re-run may give different results). " +
 			"Every folded block shows a handle (10 characters) in its marker line, and summaries carry a handle table; handles stay valid " +
 			"after later summaries or compaction. Pass one handle, or several at once with handles for a batch. " +
 			"The text may be large and comes in pages of characters: prefer grep (case-insensitive regular expression; returns matching lines with their line numbers) " +

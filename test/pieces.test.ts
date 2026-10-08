@@ -6,9 +6,11 @@ import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { fmtK, noticeText, Stats, statsText, type NoticeAction } from "../src/notice.ts";
-import { handleFor, makePlaceholder, pickKeyLines } from "../src/placeholder.ts";
+import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
+import { buildBlocks, toolCallIndex } from "../src/plan.ts";
+import { A, R, U } from "./helpers.ts";
 import { parseRange, recalledHandlesFromBranch, recallSections, resolveHandlesInBranch, sliceRecall } from "../src/recall.ts";
-import { handleTable } from "../src/summary.ts";
+import { handleTable, skeleton } from "../src/summary.ts";
 import { tokensOf } from "../src/util.ts";
 
 describe("handles and placeholders", () => {
@@ -22,9 +24,69 @@ describe("handles and placeholders", () => {
 		const ph = makePlaceholder("y".repeat(9000), "bash", "cat data/f3.txt", h)!;
 		expect(ph.startsWith(`[folded by pi-zip · bash cat data/f3.txt · 9000 chars, 1 lines · handle ${h}]`)).toBe(true);
 		expect(ph).toContain(`zip_recall("${h}")`);
-		expect(ph).toContain("stays recallable even after later summaries or compaction");
+		expect(ph).toContain("recallable even after summaries or compaction");
 		expect(ph).toContain("Do not guess its content");
 		expect(makePlaceholder("short", "bash", "", h)).toBeNull();
+	});
+	test("recall nudge: original bytes, instant, free, no side effects, prefer it to re-running or re-reading", () => {
+		const ph = makePlaceholder("y".repeat(9000), "bash", "ls", h)!;
+		expect(ph).toContain("byte for byte");
+		expect(ph).toContain("instant, free, no side effects");
+		expect(ph).toMatch(/prefer it to re-running or re-reading/);
+	});
+	test("placeholder states turn and, for bash, exit status and test counts; stays on the marker line", () => {
+		const out = "ok\n".repeat(400) + " 12 pass\n 3 fail\nRan 15 tests\n\nCommand exited with code 1";
+		const ph = makePlaceholder(out, "bash", "bun test", h, 8, { turn: 12, isError: true })!;
+		expect(ph.split("\n")[0]).toBe(`[folded by pi-zip · bash bun test · turn 12 · exit 1, 12 passed, 3 failed · ${out.length} chars, ${out.split("\n").length} lines · handle ${h}]`);
+		const clean = makePlaceholder("ok\n".repeat(400) + "5 passed, 0 failed in 1.2s", "bash", "pytest", h, 8, { turn: 3, isError: false })!;
+		expect(clean.split("\n")[0]).toContain("· turn 3 · exit 0, 5 passed, 0 failed ·");
+		const read = makePlaceholder("l\n".repeat(900), "read", "src/a.ts offset=10 limit=50", h, 8, { turn: 4, isError: false })!;
+		expect(read.split("\n")[0]).toContain("read src/a.ts offset=10 limit=50 · turn 4 · 1800 chars"); // no exit status for non-bash tools
+	});
+	test("look-alike items render differently: same command, different run; same file, different slice; same command prefix", () => {
+		const run = (n: number, f: number) => "ok\n".repeat(400) + ` ${n} pass\n ${f} fail` + (f ? "\n\nCommand exited with code 1" : "");
+		const a = makePlaceholder(run(10, 0), "bash", "bun test", handleFor("e1"), 8, { turn: 5, isError: false })!;
+		const b = makePlaceholder(run(10, 2), "bash", "bun test", handleFor("e2"), 8, { turn: 9, isError: true })!;
+		const c = makePlaceholder(run(10, 2), "bash", "bun test", handleFor("e3"), 8, { turn: 9, isError: true })!;
+		expect(a).not.toBe(b);
+		expect(a.split("\n")[0]).not.toBe(b.split("\n")[0]);
+		expect(b.split("\n")[0].replace(handleFor("e2"), "")).toBe(c.split("\n")[0].replace(handleFor("e3"), "") ); // only the handle tells identical runs apart
+		expect(shortArgs({ path: "/p/a.ts", offset: 1, limit: 100 })).not.toBe(shortArgs({ path: "/p/a.ts", offset: 101, limit: 100 }));
+		const base = "cd /some/long/working/directory/for/the/project && npm run test -- --runInBand --testPathPattern=";
+		expect(shortArgs({ command: base + "alpha.spec.ts" })).not.toBe(shortArgs({ command: base + "bravo.spec.ts" })); // the tail survives the clip
+	});
+	test("byte-stable: the same item always renders the same placeholder", () => {
+		const out = "line\n".repeat(300) + "7 passed, 1 failed";
+		const mk = () => makePlaceholder(out, "bash", shortArgs({ command: "npm test" }), h, 8, { turn: 2, isError: false });
+		expect(mk()).toBe(mk());
+		const entries = [U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 0, out), A("a2"), U("u2", "y")];
+		const blocks = buildBlocks(entries);
+		const calls = toolCallIndex(blocks);
+		const first = makePlaceholderFor(blocks[2], calls)!;
+		expect(makePlaceholderFor(buildBlocks(entries)[2], toolCallIndex(buildBlocks(entries)))).toBe(first);
+		expect(first).toContain("· turn 1 · exit 0, 7 passed, 1 failed ·");
+		expect(first).toContain("bash ls");
+	});
+	test("outcomeHint and clipMid", () => {
+		expect(outcomeHint("x", "read", false)).toBe("");
+		expect(outcomeHint("x", "bash")).toBe("");
+		expect(outcomeHint("x\nCommand timed out after 30 seconds", "bash", true)).toBe("timed out");
+		expect(outcomeHint("Tests: 1 failed, 5 passed, 6 total", "bash", false)).toBe("exit 0, 5 passed, 1 failed");
+		expect(outcomeHint("3 errors found", "bash")).toBe(""); // counts need passed/failed
+		expect(clipMid("a  b\nc", 20)).toBe("a b c");
+		const c = clipMid("x".repeat(50) + "TAIL", 21);
+		expect(c).toHaveLength(21);
+		expect(c.endsWith("TAIL") && c.includes("…")).toBe(true);
+	});
+	test("summary lists turn, outcome and handle so look-alike runs stay separable", () => {
+		const t = handleTable([
+			{ handle: "h1", tool: "bash", args: "bun test", hint: "x", turn: 5, outcome: "exit 0, 10 passed" },
+			{ handle: "h2", tool: "bash", args: "bun test", hint: "x", turn: 9, outcome: "exit 1, 8 passed, 2 failed" },
+		])!;
+		expect(t).toContain("- h1 · bash bun test · turn 5 · exit 0, 10 passed · x");
+		expect(t).toContain("- h2 · bash bun test · turn 9 · exit 1, 8 passed, 2 failed · x");
+		const blocks = buildBlocks([U("u1", "x"), A("a1", ["c1"]), R("r1", "c1", 9000), A("a2")]);
+		expect(skeleton(blocks, null).text).toMatch(/`ls` -> exit 0 \(turn 1, [0-9a-z]{10}\)/);
 	});
 	const ktxt = ["record 0001: alpha-beta-gamma", "SECRET-CODE-1: zebra111", "nothing interesting here", "note=lorem ipsum dolor", "checksum=00491 note=x", "ERROR: connection reset by peer", "hash a1b2c3d4e5f60718 written", "took 250 ms to complete", "92345678", "final line ok"].join("\n");
 	test("key lines: first+last, errors, ids, key=value, hex, labelled numbers; sorted, capped, deterministic", () => {

@@ -169,6 +169,18 @@ describe("recall results and reused tool call ids", () => {
 		expect(inPlace[1].content[0].text.startsWith("x x")).toBe(true);
 	});
 });
+test("folds already saved in the old placeholder format stay byte-identical: they are never re-rendered", () => {
+	const old = '[folded by pi-zip · bash ls · 9000 chars, 1 lines · handle abcdefghij]\nFull original is saved and stays recallable even after later summaries or compaction: call zip_recall("abcdefghij") to get it back exactly (optionally with grep or range). Do not guess its content.';
+	const e = R("r1", "c1");
+	const saved = { sourceEntry: e.sourceEntry, messages: [{ ...e.messages[0], content: [{ type: "text", text: old }] }] };
+	const entries = [U("u1", "one"), A("a1", ["c1"]), saved, A("a2"), U("u2", "two"), A("a3", ["c2"]), R("r2", "c2"), A("a4"), U("u3", "three"), A("a5"), U("u4", "back")];
+	const p = planContext(entries, opts({ promptPending: false }))!;
+	expect(p.folds.map((t) => t.entryId)).toEqual(["r2"]); // the saved fold is not a candidate again
+	expect(p.folds[0].ph).toContain("· turn 2 ·"); // new folds get the new format
+	expect(applyPlanToMessages(flat(entries), { source: "runstart", folds: p.folds, cut: null, ctxBefore: 0, ctxAfter: 0, ms: 0, persisted: false })!.messages.find((m: Any) => m.toolCallId === "c1").content[0].text).toBe(old);
+	expect(buildBlocks(entries)[2]).toMatchObject({ edited: true, ours: true });
+});
+
 const buildBlocksEntries = () => [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1"), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
 
 test("buildBlocks flags our placeholders as ours and foreign edits as edited", () => {

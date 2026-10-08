@@ -52,29 +52,76 @@ export function pickKeyLines(text: string, keep = 8): KeyLine[] {
 	return [...picked.values()].sort((a, b) => a.no - b.no);
 }
 
+/** Collapse whitespace and cut to `n` chars keeping head AND tail (the distinguishing part of a path or command is often its end). */
+export function clipMid(s: string, n: number): string {
+	s = s.replace(/\s+/g, " ").trim();
+	if (s.length <= n) return s;
+	const head = Math.ceil((n - 1) * 0.6);
+	return s.slice(0, head) + "…" + s.slice(s.length - (n - 1 - head));
+}
+
+const ARG_CHARS = 90;
+
 export function shortArgs(args: Any): string {
 	if (!args || typeof args !== "object") return "";
-	if (typeof args.command === "string") return clip(args.command, 80);
-	if (typeof args.path === "string") return clip(args.path, 80);
-	if (typeof args.file_path === "string") return clip(args.file_path, 80);
-	if (typeof args.pattern === "string") return clip(args.pattern + (args.path ? " " + args.path : ""), 80);
+	if (typeof args.command === "string") return clipMid(args.command, ARG_CHARS);
+	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
+	if (path !== null && typeof args.pattern !== "string") {
+		const win = ["offset", "limit"].filter((k) => typeof args[k] === "number" && Number.isFinite(args[k])).map((k) => ` ${k}=${args[k]}`).join(""); // which slice of the file
+		return clipMid(path, ARG_CHARS) + win;
+	}
+	if (typeof args.pattern === "string") return clipMid(args.pattern + (args.path ? " " + args.path : ""), ARG_CHARS);
 	try {
-		return clip(JSON.stringify(args), 80);
+		return clipMid(JSON.stringify(args), ARG_CHARS);
 	} catch {
 		return "";
 	}
 }
 
-/** Placeholder text, or null when the output is too short to be worth folding. */
-export function makePlaceholder(text: string, tool: string, args: string, handle: string, keep = 8): string | null {
+const COUNT_RE = /\b(\d+)\s+(passed|passing|pass|failed|failing|fail|skipped|errors?)\b/gi;
+const COUNT_ORDER = ["passed", "failed", "skipped", "errors"];
+
+/**
+ * Deterministic one-line outcome of a command, from the output alone: exit status (bash) and test counts when the tail of the
+ * output has "N passed / N failed" style summaries. `isError` (the tool result flag) lets a bash result without an exit-code
+ * line read as "exit 0" or "error"; leave it undefined when unknown. Empty string = nothing distinctive to say.
+ */
+export function outcomeHint(text: string, tool: string, isError?: boolean): string {
+	if (tool !== "bash") return "";
+	const tail = text.slice(-2000);
+	const parts: string[] = [];
+	const ex = [...tail.matchAll(/Command exited with code (\d+)/g)].pop();
+	if (ex) parts.push(`exit ${ex[1]}`);
+	else if (/Command timed out/.test(tail)) parts.push("timed out");
+	else if (/Command aborted/.test(tail)) parts.push("aborted");
+	else if (isError === true) parts.push("error");
+	else if (isError === false) parts.push("exit 0");
+	const last = new Map<string, string>();
+	for (const m of tail.matchAll(COUNT_RE)) {
+		const w = m[2].toLowerCase();
+		last.set(w.startsWith("pass") ? "passed" : w.startsWith("fail") ? "failed" : w === "skipped" ? "skipped" : "errors", m[1]);
+	}
+	if (last.has("passed") || last.has("failed")) parts.push(COUNT_ORDER.filter((k) => last.has(k)).map((k) => `${last.get(k)} ${k}`).join(", "));
+	return parts.join(", ");
+}
+
+export interface PlaceholderMeta {
+	turn?: number; // user turn the output belongs to (1-based, as seen in the projection when it was folded)
+	isError?: boolean;
+}
+
+/** Placeholder text, or null when the output is too short to be worth folding. The text is stored with the fold (context_edit),
+ *  so it is rendered once and old folds keep their bytes whatever this format becomes. */
+export function makePlaceholder(text: string, tool: string, args: string, handle: string, keep = 8, meta: PlaceholderMeta = {}): string | null {
 	if (text.length <= MIN_FOLD_CHARS) return null;
 	const lines = text.split("\n").length;
 	const keys = pickKeyLines(text, keep);
 	const body = keys.map((k) => `${k.no}: ${clip(k.text, 160)}`).join("\n");
+	const outcome = outcomeHint(text, tool, meta.isError);
 	return (
-		`${PH_MARK} · ${tool}${args ? " " + args : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
+		`${PH_MARK} · ${tool}${args ? " " + args : ""}${meta.turn ? ` · turn ${meta.turn}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
-		`Full original is saved and stays recallable even after later summaries or compaction: call ${RECALL_TOOL}("${handle}") to get it back exactly (optionally with grep or range). Do not guess its content.`
+		`Original kept byte for byte, recallable even after summaries or compaction: ${RECALL_TOOL}("${handle}") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.`
 	);
 }
 
@@ -84,5 +131,5 @@ export function makePlaceholderFor(b: Block, calls: Calls, keep = 8): string | n
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
 	const call = calls.get(b.msg.toolCallId);
-	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep);
+	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { turn: b.userTurn, isError: !!b.msg.isError });
 }

@@ -1,7 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
-import { handleFor, pickKeyLines, shortArgs } from "./placeholder.ts";
+import { handleFor, outcomeHint, pickKeyLines, shortArgs } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, settings, toolCallIndex } from "./plan.ts";
 import { type Any, clamp, clip, textOf, tok4 } from "./util.ts";
 
@@ -16,12 +16,14 @@ export interface HandleRow {
 	tool: string;
 	args: string;
 	hint: string;
+	turn?: number; // user turn of the output, so look-alike runs stay apart
+	outcome?: string; // exit status / test counts (outcomeHint)
 }
 
 /** Compact table appended to every summary so handles survive it. */
 export function handleTable(rows: HandleRow[]): string | null {
 	if (!rows.length) return null;
-	const lines = rows.slice(-40).map((r) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""} · ${clip(r.hint, 90)}`);
+	const lines = rows.slice(-40).map((r) => `- ${r.handle} · ${r.tool}${r.args ? " " + r.args : ""}${r.turn ? ` · turn ${r.turn}` : ""}${r.outcome ? ` · ${r.outcome}` : ""} · ${clip(r.hint, 90)}`);
 	return "## Folded outputs (originals recallable with zip_recall; handles stay valid after later summaries or compaction)\n" + lines.join("\n");
 }
 
@@ -47,7 +49,8 @@ export function skeleton(prefix: Block[], previous: string | null): { text: stri
 			if (c.name === "bash") {
 				const m = /Command exited with code (\d+)/.exec(resText);
 				const status = m ? `exit ${m[1]}` : res?.msg.isError ? "error" : res ? "exit 0" : "no result";
-				cmds.push(`\`${clip(String(a.command ?? ""), 160)}\` -> ${status}`);
+				const tag = res ? ` (turn ${res.userTurn}${res.entryId && (res.ours || res.tokens > settings().foldMin) ? ", " + handleFor(res.entryId) : ""})` : "";
+				cmds.push(`\`${clip(String(a.command ?? ""), 160)}\` -> ${status}${tag}`);
 			} else if (typeof a.path === "string" || typeof a.file_path === "string") {
 				const p = String(a.path ?? a.file_path);
 				if (!files.has(p)) files.set(p, new Set());
@@ -119,7 +122,8 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 		const prompt =
 			`<conversation>\n${conv}\n</conversation>\n\n` +
 			`Write the NARRATIVE part of a context summary for this conversation. A separate deterministic section already lists the user's ` +
-			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. Output only these markdown sections:\n` +
+			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a specific tool output, name it by its ` +
+			`tool and exact command or path (and turn) so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
 			`## Decisions and rationale\n## Current state of the work\n## Open todos / next steps\n## Key facts to remember (exact values, paths, identifiers, results the work still depends on)\n` +
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words. Do not call tools.`;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
@@ -162,7 +166,8 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 		.map((b) => {
 			const call = p.calls.get(b.msg.toolCallId);
 			const keys = pickKeyLines(textOf((b.raw ?? b.msg).content), keepLines);
-			return { handle: handleFor(b.entryId!), tool: call?.name ?? b.msg.toolName ?? "tool", args: call ? shortArgs(call.args) : "", hint: (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "" };
+			const tool = call?.name ?? b.msg.toolName ?? "tool";
+			return { handle: handleFor(b.entryId!), tool, args: call ? shortArgs(call.args) : "", turn: b.userTurn, outcome: outcomeHint(textOf((b.raw ?? b.msg).content), tool, !!b.msg.isError), hint: (keys.find((k) => k.why === "error" || k.why === "id") ?? keys[0])?.text ?? "" };
 		});
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, 4000);
