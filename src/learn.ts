@@ -34,7 +34,9 @@ export const HALF_LIFE = 16; // observations per bin: old evidence counts half a
 // inside it a lone miss does not (weight 2: one miss -> 0.67, two -> 0.5, three -> 0.4). Otherwise one random miss flips a warm bin to
 // dead, the next returns there fold, and a miss right after a fold is censored: nothing would ever correct it (live smoke, glm-5.3-flash).
 const PRIOR_WEIGHT = { alive: 2, dead: 0.25 };
-export const MIN_EXPECT = 8192; // prefix tokens a sample needs: far above the shared system prefix (~2.4K) other sessions keep warm
+// Prefix tokens a sample needs: far above the shared prefix other sessions keep warm (system prompt + tools, ~2-4K; live GLM reads on dead
+// caches: 0 / 704 / 1792 / 3200). Also the head every edit leaves untouched on an automatic cache (plan.ts), so returns stay observable.
+export const MIN_EXPECT = 8192;
 
 export interface Entry { cls?: CacheClass; bins: Record<string, [number, number]>; n: number } // bin index -> [alive, dead] (decayed counts)
 interface File { v: 1; models: Record<string, Entry> }
@@ -63,13 +65,16 @@ export function loadStats(path = statsPath()): File {
 }
 
 /** Was the cache alive after the gap? `expect` = prefix tokens this request re-sent unchanged (the previous prompt, or the untouched prefix
- *  before our first edit), `total` = this prompt. null = censored: too small to tell, the prompt shrank under someone else's edit, or a miss
- *  right after our own edit (a breakpoint cache does not look that far back; an automatic one may hold only the shared system prefix). */
-export function sample(expect: number, cacheRead: number, total = Infinity, edited = false): boolean | null {
-	const e = Math.min(expect, total);
+ *  before our first edit), `total` = this prompt, `cls` = the model's cache class. One bar, half of max(expect, MIN_EXPECT):
+ *  alive = the read AND our own unchanged prefix both clear it (a read the shared prefix cannot explain; a smaller untouched prefix still
+ *  counts when the read covers it: live GLM 6.3K expected, 7.8-9.8K read), dead = a read below half of an expect of at least MIN_EXPECT.
+ *  null = censored: too small to tell, the prompt shrank under someone else's edit, or a miss after our own edit on a breakpoint cache
+ *  (explicit: the provider looks back only ~20 blocks from the last breakpoint; an automatic prefix cache reads any untouched head). */
+export function sample(expect: number, cacheRead: number, total = Infinity, edited = false, cls?: CacheClass): boolean | null {
+	const e = Math.min(expect, total), bar = 0.5 * Math.max(e, MIN_EXPECT);
+	if (cacheRead >= bar && e >= bar) return true;
 	if (!(e >= MIN_EXPECT)) return null;
-	if (cacheRead >= 0.5 * e) return true;
-	return total >= expect && !edited ? false : null;
+	return total >= expect && (!edited || cls === "automatic") ? false : null;
 }
 
 /** Fold one response into the stats (re-read, update, atomic write: concurrent sessions share the file). Returns the model's entry. */

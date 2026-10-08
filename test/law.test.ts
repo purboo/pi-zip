@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { lawPrices, loadStats, pWarm, record, sample, type Prices } from "../src/learn.ts";
-import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, type Law } from "../src/plan.ts";
+import { lawPrices, loadStats, MIN_EXPECT, pWarm, record, sample, type Prices } from "../src/learn.ts";
+import { compactionRoom, editAllowed, lawTerms, legacyValve, planContext, settings, untouchedEst, type Law } from "../src/plan.ts";
 import { Zip } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, type Any } from "./helpers.ts";
 
@@ -180,6 +180,23 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		expect(warm).not.toBeNull(); // the older turns still fold (legacy rule: > 50% of the context)
 		expect(ids(warm)).not.toContain("rP");
 		expect(warm.folds).toHaveLength(10);
+	});
+
+	test("observability: on an automatic cache no fold starts inside the first MIN_EXPECT real tokens, so the next sample is uncensored", () => {
+		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
+		const s = [...older, U("uP", "prev"), A("zP"), U("uN", "now")];
+		const o = { ...base, sys: 1_000, k: 1.5, coldCap: 1_000, mode: "cold" as const };
+		const plan = (cls?: "automatic" | "explicit") => planContext(s, { ...o, law: { pr: lawPrices(cls, false), g: 2_400, pWarm: 0 } })!;
+		const auto = plan("automatic");
+		const head = 1.5 * untouchedEst(auto.blocks, auto.folds, false, 1_000);
+		expect(head).toBeGreaterThanOrEqual(MIN_EXPECT);
+		expect(head).toBeLessThan(MIN_EXPECT + 1.5 * 2_300); // the head ends at the first output past MIN_EXPECT, no later
+		expect(ids(auto)).not.toContain("r0");
+		expect(auto.folds).toHaveLength(8);
+		// the next response: the head read = alive, not read = dead (an uncensored sample either way)
+		expect(sample(head, head, 30_000, true, "automatic")).toBe(true);
+		expect(sample(head, 1_792, 30_000, true, "automatic")).toBe(false);
+		for (const p of [plan("explicit"), plan()]) expect(p.folds).toHaveLength(10); // breakpoint caches and the legacy rule: unchanged
 	});
 
 	test("2. a protected-turn test output (not rereadable) folds at age 60, not at age 59", () => {

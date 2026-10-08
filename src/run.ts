@@ -591,9 +591,9 @@ export class Zip implements ZipControl {
 		if (!pend || !u || m.stopReason === "error" || m.stopReason === "aborted") return;
 		const cr = u.cacheRead ?? 0, cw = u.cacheWrite ?? 0, total = (u.input ?? 0) + cr + cw;
 		if (!(total > 0)) return;
-		const alive = pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited) : null;
-		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, alive });
 		const known = this.entKey === pend.key ? this.ent?.cls : undefined;
+		const alive = pend.gapS >= GAP_EDGES[0] ? sample(pend.expect, cr, total, pend.edited, cw > 0 ? "explicit" : known) : null;
+		if (pend.gapS >= GAP_EDGES[0]) this.ledger({ type: "cache_sample", gapS: Math.round(pend.gapS), expect: Math.round(pend.expect), cacheRead: cr, total, edited: pend.edited, alive });
 		if (alive !== null || !known || (cw > 0 && known !== "explicit")) { // the file is touched only when there is something to learn
 			this.ent = record(pend.key, { explicit: cw > 0, total, gapS: pend.gapS, alive });
 			this.entKey = pend.key;

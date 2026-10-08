@@ -39,7 +39,9 @@ describe("learned cache survival", () => {
 
 	test("censoring: small prompts, misses right after our own edit, and prompts someone else shrank prove nothing", () => {
 		expect(sample(5_000, 0, 6_000)).toBeNull(); // the shared system prefix alone could explain it
-		expect(sample(50_000, 0, 60_000, true)).toBeNull(); // after our edit: the provider may not look back that far
+		expect(sample(50_000, 0, 60_000, true)).toBeNull(); // after our edit, class unknown: the provider may not look back that far
+		expect(sample(50_000, 0, 60_000, true, "explicit")).toBeNull(); // a breakpoint cache looks back only ~20 blocks
+		expect(sample(50_000, 0, 60_000, true, "automatic")).toBe(false); // a prefix cache reads any untouched head: a miss is dead
 		expect(sample(50_000, 30_000, 60_000, true)).toBe(true); // ... but a read of the untouched prefix proves the cache alive
 		expect(sample(50_000, 0, 30_000)).toBeNull(); // Pi compacted in between
 		expect(sample(50_000, 20_000, 30_000)).toBe(true);
@@ -48,6 +50,16 @@ describe("learned cache survival", () => {
 		expect(e.n).toBe(0);
 		expect(e.bins).toEqual({});
 		expect(record("p/m", { explicit: false, total: 60_000, gapS: 10, alive: true }, path).n).toBe(0); // below 30 s: not a return
+	});
+
+	test("shared-prefix floor: a read counts only when it AND our untouched prefix clear half of max(expect, MIN_EXPECT) (live GLM samples)", () => {
+		// alive: the read covers a 6.3-7.7K untouched prefix and is far above any shared prefix (dead-cache reads: 0 / 704 / 1792 / 3200)
+		for (const [e, r] of [[6_390, 7_808], [6_310, 8_448], [7_719, 9_792], [6_983, 9_216]]) expect(sample(e, r, 30_000, true, "automatic")).toBe(true);
+		// censored: the read is the shared system prefix (it may exceed a tiny expect), or our own prefix is too small to own a big read
+		for (const [e, r] of [[1_576, 1_792], [908, 1_792], [2_448, 3_968], [1_338, 2_816], [1_000, 6_000]]) expect(sample(e, r, 30_000, true, "automatic")).toBeNull();
+		expect(sample(6_670, 1_792, 22_640, true, "automatic")).toBeNull(); // a miss below MIN_EXPECT: the floor could be half of it
+		expect(sample(9_648, 1_792, 40_608, true, "automatic")).toBe(false); // an untouched head >= MIN_EXPECT not read: dead
+		expect(sample(9_648, 5_000, 40_608, true, "automatic")).toBe(true);
 	});
 
 	test("forgetting: an observation counts half after HALF_LIFE newer ones in its bin; the curve stays monotone", () => {

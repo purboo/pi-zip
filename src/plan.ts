@@ -4,7 +4,7 @@ import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } f
 import { createHash } from "node:crypto";
 import { type Any, PRODUCT, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
-import type { Prices } from "./learn.ts";
+import { MIN_EXPECT, type Prices } from "./learn.ts";
 
 /** Default: when a COLD plan (P(warm) < 0.5) is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest
  *  first. A warm plan never does: the user comes back to a warm cache and refers to the turn just finished (final model: +4.0 / +5.8
@@ -373,7 +373,14 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	};
 	// a zip_recall result IS content the model just asked for: folding it would undo the recall (and loop); never
 	const isRecall = (b: Block) => (calls.get(b.msg.toolCallId)?.name ?? b.msg.toolName) === RECALL_TOOL;
-	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b);
+	// Observability: on an automatic (prefix) cache no fold starts inside the first MIN_EXPECT real tokens, so the next response's cacheRead
+	// is an uncensored survival sample (learn.ts sample). Without it every idle return folded into the first 1-7K tokens and its sample was
+	// censored, so the learned curve never saw a return (live GLM bench). Explicit caches are exempt: the provider looks back only ~20
+	// blocks from the last breakpoint, a far head is not read either way. A cut replaces the prefix from the first message: exempt too.
+	const head = law.pr?.cls === "automatic" ? MIN_EXPECT / k : 0;
+	const start: number[] = [];
+	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), o.sys);
+	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head;
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
