@@ -69,6 +69,7 @@ export class Zip implements ZipControl {
 	private wireLedgered = false;
 	private model: Any;
 	private conflictNoticed = false;
+	private ttlNoticed = false;
 	private runUserSeen = 0;
 	private steerTs = new Set<number>(); // timestamps of steering/follow-up user messages not yet marked in the session
 	private steerIds = new Set<string>(); // marked: user entries that are NOT new user turns
@@ -159,6 +160,7 @@ export class Zip implements ZipControl {
 		for (const en of branch) if (en?.type === "custom" && en.customType === STEER_CUSTOM && Array.isArray(en.data?.ids)) for (const id of en.data.ids) if (typeof id === "string") this.steerIds.add(id);
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		this.model = ctx?.model;
+		this.ttlNoticed = false;
 		this.detectConflict(ctx);
 		this.ledger({ type: "session_start", off: this.off, quiet: this.quiet, conflict: this.conflict });
 	}
@@ -184,7 +186,7 @@ export class Zip implements ZipControl {
 		this.detectConflict(ctx);
 		if (!this.active()) return;
 		const branch = this.branch(ctx);
-		const { cold, reason } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey);
+		const { cold, reason, ttl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey);
 		this.cold = cold;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the valve)
 		this.coldReason = reason;
@@ -197,7 +199,11 @@ export class Zip implements ZipControl {
 			}
 			break;
 		}
-		this.ledger({ type: "prompt", cold, reason, settleTargets: this.settleIds.length });
+		this.ledger({ type: "prompt", cold, reason, ttlMs: ttl.ms, ttlSource: ttl.source, settleTargets: this.settleIds.length });
+		if (ttl.note && !this.ttlNoticed) {
+			this.ttlNoticed = true; // once per session
+			if (!this.quiet) this.notify(ctx, ttl.note);
+		}
 	}
 
 	private cancelTimer() {
@@ -345,7 +351,7 @@ export class Zip implements ZipControl {
 
 	/** Start the away-timer for a summary; returns the delay in ms. unref'd: it never keeps the process alive. */
 	private scheduleSummary(p: PlanResult, ctx: Any): number {
-		const ttl = ttlFor(ctx.model);
+		const ttl = ttlFor(ctx.model, this.branch(ctx));
 		const delay = Math.max(0, (this.lastReqMs || Date.now()) + AWAY_FRACTION * ttl - Date.now());
 		const gen = ++this.timerGen;
 		this.timer = setTimeout(() => void this.runAway(p, ctx, gen), delay);

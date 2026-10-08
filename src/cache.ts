@@ -1,5 +1,5 @@
 // Cache temperature (F7): "cold" is a fact about real time, never a guess.
-import { type Any, envInt } from "./util.ts";
+import { type Any, PRODUCT, envInt } from "./util.ts";
 
 export const DEFAULT_TTL_MS = 300_000;
 
@@ -23,7 +23,41 @@ export function cacheTtlMs(
 	return typeof secs === "number" && secs > 0 ? secs * 1000 : fallbackMs;
 }
 
-export const ttlFor = (model: Any): number => (process.env.PI_ZIP_TTL_SECS ? envInt("TTL_SECS", 300) * 1000 : cacheTtlMs(model?.promptCache));
+/**
+ * TTL tier the provider really wrote, from the newest <=3 usable assistant messages of this model (real run, cacheWrite >= MIN_WRITE):
+ * `usage.cacheWrite1h` (Anthropic, Bedrock) is the 1h share of `cacheWrite`. >= 50% -> "1h", ~0 -> "5m". The field absent (the API
+ * does not report it) or a split in between = no evidence (undefined): the declared TTL stands. Relays may rewrite cache_control.
+ */
+const MIN_WRITE = 1024;
+export function observedTier(branch: Any[], key: string): "1h" | "5m" | undefined {
+	let w = 0, w1h = 0, seen = 0;
+	for (let i = branch.length - 1; i >= 0 && seen < 3; i--) {
+		const m = branch[i]?.type === "message" ? branch[i].message : null;
+		if (m?.role !== "assistant" || m.stopReason === "error" || m.stopReason === "aborted" || `${m.provider}/${m.model ?? ""}` !== key) continue;
+		const u = m.usage;
+		if (!(u?.cacheWrite >= MIN_WRITE)) continue;
+		seen++;
+		if (typeof u.cacheWrite1h === "number") (w += u.cacheWrite), (w1h += u.cacheWrite1h);
+	}
+	return !w ? undefined : w1h >= w / 2 ? "1h" : w1h < w * 0.05 ? "5m" : undefined;
+}
+
+export interface TtlInfo { ms: number; source: "declared" | "observed"; note?: string }
+
+/** Declared TTL, corrected by what the provider was seen to write. PI_ZIP_TTL_SECS wins. `note` = the one-time mismatch notice text. */
+export function resolveTtl(model: Any, branch: Any[] = []): TtlInfo {
+	if (process.env.PI_ZIP_TTL_SECS) return { ms: envInt("TTL_SECS", 300) * 1000, source: "declared" };
+	const pc = model?.promptCache;
+	const declared = cacheTtlMs(pc);
+	const long = process.env.PI_CACHE_RETENTION === "long";
+	const seen = declared > 0 ? observedTier(branch, modelKey(model)) : undefined;
+	const mismatch = (req: string, got: string, ms: number): TtlInfo => ({ ms, source: "observed", note: `${PRODUCT} · requested ${req} prompt cache, provider wrote ${got} · using ${got}` });
+	if (long && seen === "5m") return mismatch("1h", "5m", cacheTtlMs(pc, DEFAULT_TTL_MS, { cacheRetention: "short" }));
+	if (!long && seen === "1h" && pc?.long > 0) return mismatch("5m", "1h", pc.long * 1000);
+	return { ms: declared, source: "declared" };
+}
+
+export const ttlFor = (model: Any, branch: Any[] = []): number => resolveTtl(model, branch).ms;
 
 /** Cold = a prior request exists and nothing touched the cache for longer than the TTL. No prior request counts as warm. */
 export const isColdByTtl = (lastActivityMs: number, nowMs: number, ttlMs: number): boolean => lastActivityMs > 0 && nowMs - lastActivityMs > ttlMs;
@@ -59,12 +93,12 @@ export function lastModelInBranch(branch: Any[]): string {
 }
 
 /** Cold by time, or because the model changed: a cache entry belongs to one provider and model. */
-export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = ""): { cold: boolean; reason: string } {
-	const ttl = ttlFor(model);
+export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = ""): { cold: boolean; reason: string; ttl: TtlInfo } {
+	const ttl = resolveTtl(model, branch);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
-	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}` };
-	const cold = isColdByTtl(last, nowMs, ttl);
-	const reason = last ? `ttl gap ${Math.round((nowMs - last) / 1000)}s ${cold ? ">" : "<="} ${Math.round(ttl / 1000)}s` : "no prior request";
-	return { cold, reason };
+	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl };
+	const cold = isColdByTtl(last, nowMs, ttl.ms);
+	const reason = last ? `ttl gap ${Math.round((nowMs - last) / 1000)}s ${cold ? ">" : "<="} ${Math.round(ttl.ms / 1000)}s` : "no prior request";
+	return { cold, reason, ttl };
 }

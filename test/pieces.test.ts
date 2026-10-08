@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
-import { cacheTtlMs, detectCold, isColdByTtl } from "../src/cache.ts";
+import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
 import { fmtK, noticeText, Stats, statsText, type NoticeAction } from "../src/notice.ts";
 import { handleFor, makePlaceholder, pickKeyLines } from "../src/placeholder.ts";
@@ -290,6 +290,7 @@ describe("cache", () => {
 			expect(detectCold({ promptCache: pc }, 0, [{ type: "message", message: { timestamp: 10_000_000 - 1_000_000 } }], 10_000_000).cold).toBe(false); // 1000 s < 3600 s
 		} finally {
 			delete process.env.PI_CACHE_RETENTION;
+			delete process.env.PI_ZIP_TTL_SECS;
 		}
 		expect(detectCold({ promptCache: pc }, 0, [{ type: "message", message: { timestamp: 10_000_000 - 1_000_000 } }], 10_000_000).cold).toBe(true); // 1000 s > 300 s
 	});
@@ -323,6 +324,44 @@ describe("cache", () => {
 		expect(detectCold({ promptCache: { short: 300 } }, now - 5000, branch, now).cold).toBe(false);
 		expect(detectCold({ promptCache: { short: 300 } }, 0, branch, now).cold).toBe(true);
 		expect(detectCold({}, 0, [], now)).toMatchObject({ cold: false, reason: "no prior request" });
+	});
+});
+
+describe("observed TTL tier", () => {
+	const a = (cacheWrite: number, cacheWrite1h?: number, extra: Record<string, unknown> = {}) => ({
+		type: "message",
+		message: { role: "assistant", provider: "p", model: "m", timestamp: 9_000_000, usage: { cacheWrite, ...(cacheWrite1h === undefined ? {} : { cacheWrite1h }) }, ...extra },
+	});
+	test("observedTier: 1h share, absent field, mixed models, errors, small writes", () => {
+		expect(observedTier([a(5000, 5000)], "p/m")).toBe("1h");
+		expect(observedTier([a(5000, 0)], "p/m")).toBe("5m");
+		expect(observedTier([a(5000, 2000)], "p/m")).toBeUndefined(); // split in between: no evidence
+		expect(observedTier([a(5000)], "p/m")).toBeUndefined(); // API does not report it
+		expect(observedTier([a(5000, 0), a(5000, 0, { model: "other" })], "p/m")).toBe("5m");
+		expect(observedTier([a(5000, 0), a(5000, 5000, { model: "other" })], "p/other")).toBe("1h");
+		expect(observedTier([a(5000, 0), a(5000, 5000, { stopReason: "error" }), a(5000, 5000, { stopReason: "aborted" })], "p/m")).toBe("5m");
+		expect(observedTier([a(5000, 0), a(500, 500)], "p/m")).toBe("5m"); // small write ignored
+		expect(observedTier([a(500, 500)], "p/m")).toBeUndefined();
+		expect(observedTier([a(5000, 5000), a(5000, 0), a(5000, 0), a(5000, 0)], "p/m")).toBe("5m"); // only the newest 3
+	});
+	test("detectCold: long requested but 5m written -> 5m TTL, once-noticeable; short requested but 1h written -> 1h if declared", () => {
+		const now = 10_000_000;
+		const model = { provider: "p", id: "m", promptCache: { short: 300, long: 3600 } };
+		const gap = { type: "message", message: { timestamp: now - 1_000_000 } };
+		process.env.PI_CACHE_RETENTION = "long";
+		try {
+			expect(detectCold(model, 0, [gap], now).ttl).toMatchObject({ ms: 3_600_000, source: "declared" });
+			const r = detectCold(model, 0, [a(5000, 0), gap], now);
+			expect(r.cold).toBe(true); // 1000 s > 300 s
+			expect(r.ttl).toMatchObject({ ms: 300_000, source: "observed", note: expect.stringContaining("requested 1h prompt cache, provider wrote 5m") });
+			process.env.PI_ZIP_TTL_SECS = "20";
+			expect(detectCold(model, 0, [a(5000, 0), gap], now).ttl).toMatchObject({ ms: 20_000, source: "declared" });
+		} finally {
+			delete process.env.PI_CACHE_RETENTION;
+			delete process.env.PI_ZIP_TTL_SECS;
+		}
+		expect(detectCold(model, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 3_600_000, source: "observed" });
+		expect(detectCold({ ...model, promptCache: { short: 300 } }, 0, [a(5000, 5000), gap], now).ttl).toMatchObject({ ms: 300_000, source: "declared" });
 	});
 });
 

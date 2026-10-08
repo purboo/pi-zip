@@ -86,6 +86,10 @@ The guard has two parts. Before saving a fold or a summary it checks that the ed
 
 **Which providers?** Anything Pi supports. The cache TTL comes from the model's `promptCache` declaration (seconds) for the tier Pi uses (`short`, or `long` when `PI_CACHE_RETENTION=long`), falling back to 5 minutes. Pi's own idle cache refreshes count as a cache touch, and a different provider or model than the last request counts as cold. Providers that do not report cache usage still work; the stats are then estimates only.
 
+Some relays rewrite `cache_control`, so the TTL actually written can differ from the one requested. pi-zip checks `usage.cacheWrite1h` (reported by the Anthropic messages API and Bedrock) on the newest few assistant messages of the current model: if you requested 1h but the provider wrote 5m, it uses the 5m TTL (and the reverse, when the model declares a 1h tier), and says so once per session unless `/zip quiet` is on. Without that field it keeps the declared TTL. `PI_ZIP_TTL_SECS` still wins.
+
+Some relays reject `PI_CACHE_RETENTION=long` with 400 `a ttl='1h' cache_control block must not come after a ttl='5m' cache_control block`, because they inject their own 5m `cache_control`. That is a provider issue: unset the variable.
+
 ## Testing
 
 ```bash
@@ -95,7 +99,7 @@ bun run build-check                                                        # bun
 
 `test/pi-integration.test.ts` runs the extension through Pi's real session manager, extension loader and `emitContext`, with a mid-conversation system update and an aborted tool-call turn in the session, and checks that the request is byte-identical before and after turn_end persists the edits.
 
-Environment overrides exist for tests only and are not part of the product surface: `PI_ZIP_TTL_SECS` (cache TTL), `PI_ZIP_COLD_CAP` (fold target in tokens, default 40000), `PI_ZIP_FOLD_MIN` (smallest output worth folding, default 500 tokens), `PI_ZIP_KEEP_LINES`, `PI_ZIP_MIN_GAIN` (summary gain floor, default 10000), `PI_ZIP_OFF=1` (register nothing), `PI_ZIP_LEDGER=<path>` (append a JSON line per decision, including the summary call's token usage; `cold_plan` records the calibration as `k`, `calReal`, `calEst`, `calSource`, next to the scaled `ctxBefore` and `ctxAfter`).
+Environment overrides exist for tests only and are not part of the product surface: `PI_ZIP_TTL_SECS` (cache TTL), `PI_ZIP_COLD_CAP` (fold target in tokens, default 40000), `PI_ZIP_FOLD_MIN` (smallest output worth folding, default 500 tokens), `PI_ZIP_KEEP_LINES`, `PI_ZIP_MIN_GAIN` (summary gain floor, default 10000), `PI_ZIP_OFF=1` (register nothing), `PI_ZIP_LEDGER=<path>` (append a JSON line per decision; `prompt` records `ttlMs` and `ttlSource`, `declared` or `observed`; including the summary call's token usage; `cold_plan` records the calibration as `k`, `calReal`, `calEst`, `calSource`, next to the scaled `ctxBefore` and `ctxAfter`).
 
 Internally, `RELAX_PREV_TURN` in `src/plan.ts` selects whether re-readable outputs of the previous user turn may be folded on a cold return (default `true`).
 
