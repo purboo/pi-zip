@@ -467,6 +467,10 @@ describe("cache", () => {
 		expect(detectCold(model, 0, [old, { type: "usage", kind: "other", timestamp: new Date(now - 100_000).toISOString() }], now).cold).toBe(true);
 		const fresh = { type: "message", message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", timestamp: now - 1000 } };
 		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ cold: false });
+		expect(detectCold(model, 0, [fresh], now)).toMatchObject({ pastTtl: false });
+		expect(detectCold(model, 0, [old], now)).toMatchObject({ cold: true, pastTtl: true });
+		const warmLearned = () => ({ p: 0.8, src: "learned" }); // a provider that outlives its declared TTL: warm, yet past the TTL
+		expect(detectCold(model, 0, [old], now, "", warmLearned)).toMatchObject({ cold: false, pWarm: 0.8, pastTtl: true });
 		expect(detectCold({ provider: "p", id: "other", promptCache: { short: 300 } }, 0, [fresh], now)).toMatchObject({ cold: true, reason: expect.stringContaining("model switch") });
 		expect(detectCold({ provider: "q", id: "m", promptCache: { short: 300 } }, 0, [fresh], now).cold).toBe(true);
 		expect(detectCold({ provider: "p", id: "other" }, now - 1000, [], now, "p/m").cold).toBe(true); // in-process memory of the last request's model

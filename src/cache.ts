@@ -97,7 +97,8 @@ export function lastPrompt(branch: Any[]): { key: string; total: number } {
 export const lastModelInBranch = (branch: Any[]): string => lastPrompt(branch).key;
 
 export type Survival = (gapS: number, priorS: number) => { p: number; src: string };
-export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: number; src: string; gapS: number | null }
+/** pastTtl: the idle gap exceeds the declared TTL (the shipped rule's "cold"), whatever the learned P(warm) says. */
+export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: number; src: string; gapS: number | null; pastTtl: boolean }
 
 /** Cold by time, or because the model changed: a cache entry belongs to one provider and model. `learned` = P(warm) after a gap from the
  *  survival the provider was seen to have (learn.ts); without it, or under PI_ZIP_TTL_SECS (tests), the TTL decides. cold = P(warm) < 0.5. */
@@ -105,11 +106,11 @@ export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs =
 	const ttl = resolveTtl(model, branch);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
-	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null };
-	if (!last) return { cold: false, reason: "no prior request", ttl, pWarm: 1, src: "no prior request", gapS: null };
+	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null, pastTtl: false };
+	if (!last) return { cold: false, reason: "no prior request", ttl, pWarm: 1, src: "no prior request", gapS: null, pastTtl: false };
 	const gapS = (nowMs - last) / 1000;
 	const byTtl = isColdByTtl(last, nowMs, ttl.ms);
 	const s = learned && !process.env.PI_ZIP_TTL_SECS ? learned(gapS, ttl.ms / 1000) : { p: byTtl ? 0 : 1, src: "prior" };
 	const reason = `ttl gap ${Math.round(gapS)}s ${byTtl ? ">" : "<="} ${Math.round(ttl.ms / 1000)}s${s.src === "prior" ? "" : `, learned P(warm) ${s.p.toFixed(2)}`}`;
-	return { cold: s.p < 0.5, reason, ttl, pWarm: s.p, src: s.src, gapS };
+	return { cold: s.p < 0.5, reason, ttl, pWarm: s.p, src: s.src, gapS, pastTtl: byTtl };
 }

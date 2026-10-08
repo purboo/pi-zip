@@ -76,6 +76,7 @@ export class Zip implements ZipControl {
 	private steerIds = new Set<string>(); // marked: user entries that are NOT new user turns
 	// the law's inputs (round 5): P(warm) of this run's return, growth g, and the free cache signal of every response
 	private pWarm = 1;
+	private pastTtl = false; // this run is a user return after the declared TTL (the previous user turn is eligible: plan.ts PlanOpts.pastTtl)
 	private survSrc = "no prior request";
 	private ent: Entry | undefined; // learned class + survival of the current model (learn.ts)
 	private g = G0; // EWMA(0.1) of real-token growth between consecutive responses, capped at the p90 of the last 20 deltas
@@ -208,6 +209,7 @@ export class Zip implements ZipControl {
 		this.cancelTimer(); // the user is back: nothing is started behind their back any more
 		this.model = ctx?.model;
 		this.cold = false;
+		this.pastTtl = false;
 		this.runChecked = true;
 		this.runEdits = false;
 		this.runPlan = null;
@@ -223,8 +225,9 @@ export class Zip implements ZipControl {
 		this.loadEnt(key);
 		this.branchLastMs = lastMessageMs(branch);
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
-		const { cold, reason, ttl, pWarm: p, src, gapS } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior));
+		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior));
 		this.cold = cold;
+		this.pastTtl = pastTtl;
 		this.pWarm = p;
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
@@ -314,6 +317,7 @@ export class Zip implements ZipControl {
 			return;
 		}
 		const { o, cal } = this.opts(ctx, false, this.cold ? "cold" : "warm", entries, this.pWarm);
+		o.pastTtl = this.pastTtl;
 		const p = planContext(entries, o);
 		this.lawLedger("run", o);
 		if (!p) {

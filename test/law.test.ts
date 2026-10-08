@@ -143,6 +143,33 @@ describe("through the extension: the free signal is learned, persisted and used;
 		expect(zip2.status()).toContain("cache zhipu/glm: automatic (from usage), read 0.2 / write 1 / output 4 x input (class ratios), survival 360-420s 0.80 n1"); // model.cost (0.26 / 1.4 / 4.4) is never read
 	});
 
+	test("GLM learned warm at 365 s (> the declared 300 s): the return still folds the previous turn's read; at 120 s it keeps it", async () => {
+		process.env.PI_ZIP_COLD_CAP = "3000";
+		const model = { provider: "zhipu", id: "glm", contextWindow: 1_000_000 };
+		for (let i = 0; i < 4; i++) record("zhipu/glm", { explicit: false, total: 60_000, gapS: 365, alive: true }); // the provider outlives its TTL
+		record("zhipu/glm", { explicit: false, total: 60_000, gapS: 125, alive: true });
+		// 10K tokens of prose first (the automatic-cache observability head), then the previous user turn with one big re-readable read
+		const entries = [U("u0", "talk"), AX("x0", 40_000), U("u1", "read it"), A("a1", ["c1"]), R("r1", "c1", 80_000), A("a2"), U("u2", "now")];
+		const back = (ms: number) => [{ type: "message", message: { role: "assistant", provider: "zhipu", model: "glm", stopReason: "stop", timestamp: ms, content: [] } }];
+		const run = async (gapS: number) => {
+			rmSync(process.env.PI_ZIP_LEDGER!, { force: true });
+			const zip = new Zip(fakePi().pi as Any);
+			const { ctx } = fakeCtx(entries, { model, branch: back(Date.now() - gapS * 1000) });
+			zip.sessionStart(ctx);
+			zip.beforeAgentStart(ctx);
+			await zip.context({ messages: flat(entries) }, ctx);
+			return readFileSync(process.env.PI_ZIP_LEDGER!, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		};
+		const late = await run(365);
+		expect(late.find((r) => r.type === "prompt")).toMatchObject({ cold: false, survSrc: "learned" });
+		expect(late.find((r) => r.type === "prompt").pWarm).toBeGreaterThanOrEqual(0.5);
+		expect(late.find((r) => r.type === "cold_plan")).toMatchObject({ trigger: "valve", source: "valve", folds: 1 });
+		expect(late.find((r) => r.type === "law").steps.at(-1)).toMatchObject({ at: "plan", ok: true });
+		const early = await run(125); // inside the TTL: a warm return keeps the turn just finished
+		expect(early.find((r) => r.type === "prompt")).toMatchObject({ cold: false });
+		expect(early.find((r) => r.type === "cold_plan")).toBeUndefined();
+	});
+
 	test("a cold run plan logs Phi, K, eta, T, g, w/r, P(warm) and the price and survival sources", async () => {
 		process.env.PI_ZIP_COLD_CAP = "3000";
 		record("p/m", { explicit: true, total: 10_000 }); // the class is known from an earlier response
@@ -180,6 +207,22 @@ describe("final model (research round 5, final-model.md section 8 tests 1-5)", (
 		expect(warm).not.toBeNull(); // the older turns still fold (legacy rule: > 50% of the context)
 		expect(ids(warm)).not.toContain("rP");
 		expect(warm.folds).toHaveLength(10);
+	});
+
+	test("1b. the same warm plan at a return after the declared TTL (pastTtl) folds it: the TTL rule's eligibility, the law's timing", () => {
+		const older = Array.from({ length: 10 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9_000), A(`z${t}`)]).flat();
+		const s = [...older, U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 40_000), A("zP"), U("uN", "now")];
+		const warm = planContext(s, { ...base, coldCap: 1_000, mode: "warm", pastTtl: true, law: { pr: null, g: 2_400, pWarm: 1 } })!;
+		expect(warm.folds.find((f) => f.entryId === "rP")!.trig).toBe("valve(relax)");
+		expect(warm.folds).toHaveLength(11);
+		// the law still decides: a warm explicit-class plan whose saving cannot pay the rewrite stays null with or without pastTtl
+		const small = [U("uP", "prev"), A("aP", ["cP"]), R("rP", "cP", 4_000), A("zP"), U("uN", "now"), AX("xN", 400_000)]; // ~100K the plan cannot touch
+		const law = { pr: lawPrices("explicit", false), g: 2_400, pWarm: 1 };
+		for (const pastTtl of [false, true]) expect(planContext(small, { ...base, coldCap: 1_000, mode: "warm", pastTtl, law })).toBeNull();
+		expect(ids(planContext(small, { ...base, coldCap: 1_000, mode: "cold", law: { ...law, pWarm: 0 } })!)).toEqual(["rP"]); // cold: always
+		// never the latest user turn's own outputs, never a non-rereadable output of the previous turn
+		const own = [...older, U("uP", "prev"), A("aP"), U("uN", "now"), A("aN", ["cN"]), R("rN", "cN", 40_000), A("zN")];
+		expect(ids(planContext(own, { ...base, coldCap: 1_000, mode: "warm", pastTtl: true, law: { pr: null, g: 2_400, pWarm: 1 } })!)).not.toContain("rN");
 	});
 
 	test("observability: on an automatic cache no fold starts inside the first MIN_EXPECT real tokens, so the next sample is uncensored", () => {

@@ -7,8 +7,11 @@ import { PH_MARK } from "./placeholder.ts";
 import { MIN_EXPECT, type Prices } from "./learn.ts";
 
 /** Default: when a COLD plan (P(warm) < 0.5) is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest
- *  first. A warm plan never does: the user comes back to a warm cache and refers to the turn just finished (final model: +4.0 / +5.8
- *  lost items with it); at a cold return the cache is rewritten anyway. false = no relax fold of the previous user turn, but the
+ *  first. A warm plan does so only at a user return after the declared TTL (PlanOpts.pastTtl): the very returns where the TTL rule
+ *  always folded that turn, so the quality stays the TTL rule's while the law, with the learned P(warm), still decides whether the
+ *  rewrite pays (a provider whose cache outlives its declared TTL otherwise keeps the whole previous turn at every return: live GLM
+ *  1.15x the TTL rule's bill). Any other warm plan never does: the user comes back to a warm cache and refers to the turn just
+ *  finished (final model: +4.0 / +5.8 lost items with it). false = no relax fold of the previous user turn, but the
  *  in-turn rule (INTURN_AGE) still folds old outputs there; set PI_ZIP_INTURN_AGE=0 as well for a fully protected previous turn. */
 export const RELAX_PREV_TURN = true;
 
@@ -262,7 +265,7 @@ export interface RunPlan {
 }
 
 export interface PlanOpts {
-	mode?: "cold" | "warm"; // cold: cache believed gone (default). warm: only when the context is above the cold cap and the law fires; then the cold plan without the previous-turn relax.
+	mode?: "cold" | "warm"; // cold: cache believed gone (default). warm: only when the context is above the cold cap and the law fires; then the cold plan without the previous-turn relax (kept only when pastTtl).
 	law?: Law; // prices, g and P(warm); default: no prices (legacy rule), P = 0 cold / 1 warm
 	trace?: (LawTerms & { where: "summary" | "plan" })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
@@ -279,6 +282,7 @@ export interface PlanOpts {
 	relax?: boolean; // default RELAX_PREV_TURN
 	minGain?: number;
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
+	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
 }
 
 export interface PlanResult {
@@ -315,7 +319,7 @@ export const contentKeyOf = (content: Any): string => {
 /** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
  *  summarise only if folds cannot reach the cap and the law prices the summary call in. Warm: null unless the context is above the
  *  cold cap and the law fires for the plan (the summary call is sunk there); then the cold plan minus the previous-turn relax (a warm plan
- *  never folds the previous user turn by relax). A cold plan with P(warm) > 0
+ *  folds the previous user turn by relax only at a return after the declared TTL, o.pastTtl). A cold plan with P(warm) > 0
  *  passes the same law (expected cost). The cap never exceeds Pi's compaction room. Returns null when there is nothing to plan on
  *  or the law says no. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
@@ -385,10 +389,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
 	for (const b of cands) addFold(b, trig);
-	if (relax && mode === "cold") {
+	if (relax && (mode === "cold" || o.pastTtl === true)) {
 		// the protected window = the new prompt + the previous user turn; that turn's big reads are what makes a cold return
 		// expensive. Rereadable ones can be recalled exactly: fold them biggest-first until the cap; never the latest turn's own.
-		// Cold plans only: a warm plan keeps the previous user turn visible.
+		// Cold plans, and warm plans at a return after the declared TTL; any other warm plan keeps the previous user turn visible.
 		let est = ctxEst - savings();
 		if (est > coldCap) {
 			const prev = blocks.filter((b) => foldable(b) && protectedTurn(b) && b.userTurn < userTurns && classify(b) === "rereadable");
