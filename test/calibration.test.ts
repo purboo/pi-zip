@@ -1,7 +1,7 @@
 // Token-scale calibration: k = real / estimate, read from the branch itself (no in-memory state), used by every limit.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, unlinkSync } from "node:fs";
-import { DEFAULT_K, K_MAX, buildBlocks, calibrate, planContext, valveTokens } from "../src/plan.ts";
+import { DEFAULT_K, K_MAX, buildBlocks, calibrate, planContext } from "../src/plan.ts";
 import { A, AX, fakeCtx, fakePi, flat, project, R, U, withK, type Any } from "./helpers.ts";
 
 const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_MIN_GAIN"];
@@ -109,18 +109,18 @@ describe("every limit is compared on the calibrated scale", () => {
 		expect(at(1.5)).not.toBeNull(); // ~45K real: over it
 	});
 
-	test("the warm valve V is measured in calibrated tokens: the same chars/4 estimate is under V at k = 1 and over it at k = 1.7", () => {
-		const warm = (entries: Any[], k: number) => planContext(entries, { mode: "warm", sys: 0, cwd: ".", promptPending: false, k, model: { provider: "p", id: "m" } });
+	test("the warm cap is measured in calibrated tokens: the same chars/4 estimate is under it at k = 1 and over it at k = 1.7", () => {
+		const warm = (entries: Any[], k: number) => planContext(entries, { mode: "warm", sys: 0, cwd: ".", promptPending: false, k, coldCap: 160_000, model: { provider: "p", id: "m" } });
 		const big: Any[] = [];
 		for (let t = 0; t < 50; t++) big.push(U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9000), A(`z${t}`));
 		big.push(U("uN", "now"));
-		expect(valveTokens({})).toBe(160_000);
 		expect(warm(big, 1)).toBeNull(); // 112K < 160K
 		expect(warm(big, 1.7)).not.toBeNull(); // 190K > 160K
 	});
 
-	test("through the extension: a warm return whose usage says 1.7x is over the valve, one that says 1.0x is not", async () => {
+	test("through the extension: a warm return whose usage says 1.7x is over the cap, one that says 1.0x is not", async () => {
 		const { default: piZip } = await import("../src/index.ts");
+		process.env.PI_ZIP_COLD_CAP = "160000"; // ~112K estimated: under it at k = 1, ~190K real over it at k = 1.7
 		const mk = async (k: number) => {
 			const entries = withK(Array.from({ length: 50 }, (_, t) => [U(`u${t}`, `q${t}`), A(`a${t}`, [`c${t}`]), R(`r${t}`, `c${t}`, 9000), A(`z${t}`)]).flat().concat(U("uN", "now")), k);
 			const f = fakePi();

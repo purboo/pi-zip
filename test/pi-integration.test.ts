@@ -129,7 +129,7 @@ describe("real Pi: the request view is identical before and after turn_end persi
 	});
 
 	test("a summary cut: request N equals request N+1 (replayed system message, summary, kept messages)", async () => {
-		const r = await rig((sm) => populate(sm, 3000)); // long assistant prose: folds alone cannot reach the cap, so a summary is planned
+		const r = await rig((sm) => populate(sm, 6000)); // long assistant prose: folds alone cannot reach the cap, so a summary is planned (and its uncached call pays: X ~ 70K)
 		sendPrompt(r.sm, "next request");
 		const req1 = await r.request();
 		expect(req1.some((m) => m.role === "compactionSummary")).toBe(true);

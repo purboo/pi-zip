@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, valveAllows, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, planContext, RELAX_PREV_TURN, settings, summaryGainOk, legacyValve, VALVE_MIN_REDUCTION, type Cut, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 
 const opts = (over: Partial<PlanOpts> = {}): PlanOpts => ({ coldCap: 60_000, sys: 0, cwd: process.cwd(), promptPending: true, ...over });
@@ -218,22 +218,22 @@ describe("cold cap default", () => {
 describe("warm valve gate (VALVE_MIN_REDUCTION)", () => {
 	test("the rule is one pure function: fire only when after <= 0.5 x before", () => {
 		expect(VALVE_MIN_REDUCTION).toBe(0.5);
-		expect(valveAllows(183_000, 131_000, null)).toBe(false); // a 28% cut does not pay back the rewrite of a warm cache
-		expect(valveAllows(200_000, 90_000, null)).toBe(true); // 55%
-		expect(valveAllows(200_000, 100_000, null)).toBe(true); // exactly r = 0.5
-		expect(valveAllows(200_000, 100_001, null)).toBe(false);
-		expect(valveAllows(200_000, 200_000, null)).toBe(false); // nothing removed
-		expect(valveAllows(200_000, 210_000, null)).toBe(false);
+		expect(legacyValve(183_000, 131_000, null)).toBe(false); // a 28% cut does not pay back the rewrite of a warm cache
+		expect(legacyValve(200_000, 90_000, null)).toBe(true); // 55%
+		expect(legacyValve(200_000, 100_000, null)).toBe(true); // exactly r = 0.5
+		expect(legacyValve(200_000, 100_001, null)).toBe(false);
+		expect(legacyValve(200_000, 200_000, null)).toBe(false); // nothing removed
+		expect(legacyValve(200_000, 210_000, null)).toBe(false);
 	});
 
 	test("hard floor: at or above Pi's compaction room any reduction fires, nothing still does not", () => {
 		const room = compactionRoom({ contextWindow: 200_000 })!; // 200000 - 16384 - 8192
 		expect(room).toBe(175_424);
-		expect(valveAllows(room, room - 1, room)).toBe(true);
-		expect(valveAllows(180_000, 170_000, room)).toBe(true);
-		expect(valveAllows(180_000, 180_000, room)).toBe(false);
-		expect(valveAllows(room - 1, room - 10_000, room)).toBe(false); // just below the danger zone the ordinary rule applies
-		expect(valveAllows(183_000, 131_000, null)).toBe(false); // unknown window: no floor
+		expect(legacyValve(room, room - 1, room)).toBe(true);
+		expect(legacyValve(180_000, 170_000, room)).toBe(true);
+		expect(legacyValve(180_000, 180_000, room)).toBe(false);
+		expect(legacyValve(room - 1, room - 10_000, room)).toBe(false); // just below the danger zone the ordinary rule applies
+		expect(legacyValve(183_000, 131_000, null)).toBe(false); // unknown window: no floor
 	});
 
 	// old turns: `oldOutputs` foldable 9000-char reads; the previous user turn holds one `bigChars` write result that can never be folded
@@ -291,9 +291,9 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 	const ids = (p: Any) => p.folds.map((f: Any) => f.entryId).sort();
 	const rr = (from: number, to: number, skip: number[] = []) => Array.from({ length: to - from + 1 }, (_, i) => `r${from + i}`).filter((x) => !skip.includes(Number(x.slice(1)))).sort();
 
-	test("default 20, 0 disables; the setting reads PI_ZIP_INTURN_AGE", () => {
+	test("default 60, 0 disables; the setting reads PI_ZIP_INTURN_AGE", () => {
 		delete process.env.PI_ZIP_INTURN_AGE;
-		expect(settings().inturnAge).toBe(20);
+		expect(settings().inturnAge).toBe(60);
 		process.env.PI_ZIP_INTURN_AGE = "0";
 		expect(settings().inturnAge).toBe(0);
 		process.env.PI_ZIP_INTURN_AGE = "35";
@@ -303,7 +303,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 	test("a single user turn: rereadable outputs at least 20 requests old fold; newer, non-rereadable and zip_recall results stay", () => {
 		delete process.env.PI_ZIP_INTURN_AGE;
 		const s = longTurn(60, { mutating: [3, 10, 50], recalls: [7] });
-		const p = planContext(s, opts({ coldCap: 8000, promptPending: false }))!;
+		const p = planContext(s, opts({ coldCap: 8000, promptPending: false, inturnAge: 20 }))!;
 		// 61 assistant messages: call i is answered i requests in, so its age is 61 - i; age >= 20  <=>  i <= 41
 		expect(ids(p)).toEqual(rr(1, 41, [3, 7, 10]));
 		expect(p.folds.every((f) => f.trig === "cold(inturn)" && f.recover === "rereadable")).toBe(true);
@@ -324,7 +324,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 		// make r5 and r9 much bigger than the rest
 		for (const id of ["r5", "r9"]) { const e = s.find((x: Any) => x.sourceEntry.id === id)!; e.messages[0].content[0].text = e.messages[0].content[0].text.repeat(4); }
 		const total = buildBlocks(s).reduce((a, b) => a + b.tokens, 0);
-		const p = planContext(s, opts({ coldCap: total - 3000, promptPending: false }))!; // needs ~3K tokens: the two big ones are enough
+		const p = planContext(s, opts({ coldCap: total - 3000, promptPending: false, inturnAge: 20 }))!; // needs ~3K tokens: the two big ones are enough
 		expect(ids(p)).toEqual(["r5", "r9"]);
 	});
 
@@ -348,7 +348,7 @@ describe("in-turn folds (PI_ZIP_INTURN_AGE)", () => {
 
 	test("warm valve: a long single-turn session above V folds old rereadable outputs when that halves the context", () => {
 		const s = longTurn(60, { chars: 24_000 }); // ~4K tokens per output, ~240K estimated (V = 160K)
-		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm" }))!;
+		const p = planContext(s, opts({ coldCap: 40_000, promptPending: false, mode: "warm", inturnAge: 20 }))!;
 		expect(p).not.toBeNull();
 		expect(p.folds.length).toBeGreaterThan(0);
 		expect(p.folds.every((f) => f.trig === "valve(inturn)")).toBe(true);

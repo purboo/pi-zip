@@ -83,22 +83,33 @@ export function lastMessageMs(branch: Any[]): number {
 	return last;
 }
 
-/** Provider/model of the newest assistant message that really ran (errors and aborts may never have reached a cache). */
-export function lastModelInBranch(branch: Any[]): string {
+/** The newest assistant message that really ran (errors and aborts may never have reached a cache): its provider/model and prompt size. */
+export function lastPrompt(branch: Any[]): { key: string; total: number } {
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const m = branch[i]?.type === "message" ? branch[i].message : null;
-		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && m.provider) return `${m.provider}/${m.model ?? ""}`;
+		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && m.provider) {
+			const u = m.usage;
+			return { key: `${m.provider}/${m.model ?? ""}`, total: u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0) : 0 };
+		}
 	}
-	return "";
+	return { key: "", total: 0 };
 }
+export const lastModelInBranch = (branch: Any[]): string => lastPrompt(branch).key;
 
-/** Cold by time, or because the model changed: a cache entry belongs to one provider and model. */
-export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = ""): { cold: boolean; reason: string; ttl: TtlInfo } {
+export type Survival = (gapS: number, priorS: number) => { p: number; src: string };
+export interface ColdInfo { cold: boolean; reason: string; ttl: TtlInfo; pWarm: number; src: string; gapS: number | null }
+
+/** Cold by time, or because the model changed: a cache entry belongs to one provider and model. `learned` = P(warm) after a gap from the
+ *  survival the provider was seen to have (learn.ts); without it, or under PI_ZIP_TTL_SECS (tests), the TTL decides. cold = P(warm) < 0.5. */
+export function detectCold(model: Any, lastReqMs: number, branch: Any[], nowMs = Date.now(), lastModel = "", learned?: Survival): ColdInfo {
 	const ttl = resolveTtl(model, branch);
 	const last = Math.max(lastReqMs, lastMessageMs(branch));
 	const prev = lastModel || lastModelInBranch(branch);
-	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl };
-	const cold = isColdByTtl(last, nowMs, ttl.ms);
-	const reason = last ? `ttl gap ${Math.round((nowMs - last) / 1000)}s ${cold ? ">" : "<="} ${Math.round(ttl.ms / 1000)}s` : "no prior request";
-	return { cold, reason, ttl };
+	if (last && prev && modelKey(model) && prev !== modelKey(model)) return { cold: true, reason: `model switch ${prev} -> ${modelKey(model)}`, ttl, pWarm: 0, src: "model switch", gapS: null };
+	if (!last) return { cold: false, reason: "no prior request", ttl, pWarm: 1, src: "no prior request", gapS: null };
+	const gapS = (nowMs - last) / 1000;
+	const byTtl = isColdByTtl(last, nowMs, ttl.ms);
+	const s = learned && !process.env.PI_ZIP_TTL_SECS ? learned(gapS, ttl.ms / 1000) : { p: byTtl ? 0 : 1, src: "prior" };
+	const reason = `ttl gap ${Math.round(gapS)}s ${byTtl ? ">" : "<="} ${Math.round(ttl.ms / 1000)}s${s.src === "prior" ? "" : `, learned P(warm) ${s.p.toFixed(2)}`}`;
+	return { cold: s.p < 0.5, reason, ttl, pWarm: s.p, src: s.src, gapS };
 }

@@ -4,6 +4,7 @@ import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } f
 import { createHash } from "node:crypto";
 import { type Any, PRODUCT, clamp, envInt, textOf, tok4, tokensOf } from "./util.ts";
 import { PH_MARK } from "./placeholder.ts";
+import type { Prices } from "./learn.ts";
 
 /** Default: when a cold return is still above the cap, also fold REREADABLE outputs of the previous user turn, biggest first.
  *  false = no relax fold of the previous user turn, but the in-turn rule (INTURN_AGE) still folds old rereadable outputs there; set
@@ -13,19 +14,15 @@ export const RELAX_PREV_TURN = true;
 /** Default age, in assistant requests, from which a REREADABLE output inside the protected user turns may still be folded. A sub-agent
  *  session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for its whole life (offline sim
  *  on 295 recorded sessions: 1.37x the billion-context bill). 0 disables the rule (PI_ZIP_INTURN_AGE).
- *  Plans run at turn_end, before the next request, so `age >= 20` here equals the sim's `b <= v - 21` (one request stricter than `v - 20`). */
-export const INTURN_AGE = 20;
+ *  Plans run at turn_end, before the next request, so `age >= 60` here equals the sim's `b <= v - 61`. 60 lies inside the equal-risk CI
+ *  (33-103, round 5) and is the live floor: age 20 lost 1.21x the items live and made 190 warm in-turn folds on the in-turn audit. */
+export const INTURN_AGE = 60;
 
 const PROTECT_USER_TURNS = 2; // the latest user turn and the one before it are never summarised; folded only when re-readable (relax: previous turn; in-turn: old enough)
 const SUMMARY_FLOOR = 1000;
 const SUMMARY_CAP = 8000;
 const SUMMARY_RATIO = 0.1;
 
-// The warm valve (F10): a warm cache is never touched unless the context is already so large that every later request pays
-// to read it. V is also kept below Pi's own compaction trigger (window - reserveTokens), otherwise Pi's lossy compaction
-// would always get there first.
-export const VALVE_MAX = 160_000;
-export const VALVE_RATIO = 0.8;
 export const DEFAULT_RESERVE_TOKENS = 16_384; // Pi's compaction reserve default
 export const COMPACT_MARGIN = 8_192; // estimates are chars/4: stay clear of the trigger
 const MIN_TARGET = 4_096;
@@ -44,29 +41,51 @@ export function compactionRoom(model: Any, reserve = DEFAULT_RESERVE_TOKENS): nu
 	return w > 0 ? Math.max(MIN_TARGET, w - reserve - COMPACT_MARGIN) : null;
 }
 
-// Rewriting a warm cache costs a full cache write of what is left, so an edit only pays back when it removes a large share of the
-// context. Offline sweep of cold cap x valve rule over recorded sessions (cache TTL 300 s and 3600 s): r = 0.5 blocks the folds
-// that lose money (protected recent turns hold most of the context, so the cut is small: e.g. 183K -> 131K, 28%), keeps the large
-// ones that make TTL-3600 sessions cheaper, and caused no extra Pi compactions. Needs no prices and no guess of requests left.
-// Hard floor: inside Pi's compaction danger zone the valve is the last lossless defence, so any reduction is allowed there.
+// Legacy rule, only when nothing at all is known about prices (no model.cost, no response yet): a warm edit must cut at least half
+// of the context, or, inside Pi's compaction danger zone (before >= room), merely reduce it.
 export const VALVE_MIN_REDUCTION = 0.5;
-
-/** Whether a warm edit may fire: ctx before -> after (real tokens) must cut at least VALVE_MIN_REDUCTION of the context, or, when
- *  before >= `room` (compactionRoom: window - reserve - margin, null = unknown window), merely reduce it. */
-export function valveAllows(before: number, after: number, room: number | null): boolean {
+export function legacyValve(before: number, after: number, room: number | null): boolean {
 	if (!(after < before)) return false;
 	if (room !== null && before >= room) return true;
 	return after <= (1 - VALVE_MIN_REDUCTION) * before;
 }
 
-/** V = min(160K, 0.8 x window, window - reserve - margin); an unknown window gives 160K. */
-export function valveTokens(model: Any, reserve = DEFAULT_RESERVE_TOKENS): number {
-	const w = Number(model?.contextWindow);
-	return w > 0 ? Math.min(VALVE_MAX, VALVE_RATIO * w, compactionRoom(model, reserve)!) : VALVE_MAX;
+export const PI_KEEP_RECENT = 20_000; // Pi's compaction keepRecentTokens default
+export const G0 = 2_500; // growth per request before the session's own EWMA has data
+
+/** What the law knows at a decision: prices (null = legacy rule), growth per request g (real tokens), P(the cache is warm). */
+export interface Law { pr: Prices | null; g: number; pWarm: number }
+export interface LawTerms { ok: boolean; B: number; A: number; T: number; P: number; K: number; eta: number; phi: number }
+
+/**
+ * The round-5 law (verdict section 8): rewrite the cache only when what the edit saves pays for the rewrite it causes.
+ *   Phi = [ r D^2/(2g) + eta D ] / K >= 1,   D = B - A,   K = (w - r) (P T - (1 - P) D) + call
+ * B, A = real context before / after the edit. T = the post-edit tokens after the earliest edited position, i.e. what a warm edit really
+ * rewrites (the system prompt, tools and untouched history before it stay cached; measured write 0.89 T, while A over-states it 2.4x);
+ * T = A when unknown. P = P(warm) at this gap: 1 = the verdict's warm valve, 0 = known dead (K < 0: always fire). The expected form is
+ * linear in P because a warm next request costs (w - r) T - r D more with the edit and a cold one w D less, plus the r D read credit.
+ * eta = 0 below Pi's compaction room, else Pi's own price per token of room (window term). Prices per token; no prices = legacy rule.
+ */
+export function lawTerms(B: number, A: number, P: number, room: number | null, pr: Prices | null, g: number, call = 0, T = A, keep = PI_KEEP_RECENT): LawTerms {
+	const t: LawTerms = { ok: false, B, A, T, P, K: NaN, eta: 0, phi: NaN };
+	if (!(A < B)) return t;
+	if (!pr || !(pr.r > 0)) return { ...t, ok: legacyValve(B, A, room) };
+	const { r, w, out } = pr;
+	const D = B - A, K = (w - r) * (P * Math.min(T, A) - (1 - P) * D) + call;
+	let eta = 0;
+	if (room !== null && B >= room) {
+		const S = Math.min(8_000, Math.max(1_000, 0.1 * (B - keep))), Api = keep + S;
+		eta = (w * (B - keep) + out * S + (w - r) * Api) / Math.max(B - Api, 1);
+	}
+	const gain = (r * D * D) / (2 * Math.max(g, 1)) + eta * D;
+	return { ...t, ok: K <= 0 || gain >= K, K, eta, phi: K > 0 ? gain / K : Infinity };
 }
 
+export const editAllowed = (B: number, A: number, P: number, room: number | null, pr: Prices | null, g: number, call = 0, T = A): boolean =>
+	lawTerms(B, A, P, room, pr, g, call, T).ok;
+
 // Token scale. Every size in this file is a chars/4 estimate, and chars/4 undercounts real tokens (JSON-heavy tool calls, code,
-// identifiers, tool definitions that are not in the text at all). `k` = real tokens per estimated token; every limit (cold cap, V,
+// identifiers, tool definitions that are not in the text at all). `k` = real tokens per estimated token; every limit (cold cap,
 // compaction room, min gain) is compared against k x estimate, so they mean REAL tokens. k is read from the branch itself (the
 // usage of the newest assistant message), so it survives a restart and needs no stored state. With no usage to read, DEFAULT_K
 // applies: 1.7 is the ratio measured on recorded coding sessions (real first-request context / chars/4 estimate: 1.72 after cold
@@ -119,11 +138,11 @@ export const settings = () => ({
 	coldCap: envInt("COLD_CAP", 40_000), // cold: fold, then summarise, down to this many tokens
 	foldMin: envInt("FOLD_MIN", 500), // outputs below this many tokens are never folded
 	keepLines: envInt("KEEP_LINES", 8),
-	minGain: envInt("MIN_GAIN", 10_000), // a summary must remove at least max(minGain, 15% of the context)
+	minGain: envInt("MIN_GAIN", 10_000), // legacy rule only (no prices): a summary must remove at least max(minGain, 15% of the context)
 	inturnAge: envInt("INTURN_AGE", INTURN_AGE), // rereadable outputs of the protected turns older than this many assistant requests may fold; 0 = never
 });
 
-/** A summary only pays when it removes a real share of the context. */
+/** Legacy summary gate (no prices): a summary only pays when it removes a real share of the context. */
 export function summaryGainOk(prefixTokens: number, summaryTokens: number, totalTokens: number, minGain = settings().minGain): boolean {
 	return prefixTokens - summaryTokens >= Math.max(minGain, 0.15 * totalTokens);
 }
@@ -238,10 +257,13 @@ export interface RunPlan {
 	sent?: boolean; // a request view carrying this plan has gone out
 	applied?: Set<string>; // entry ids whose fold the latest request view actually carried (what turn_end must persist, no more)
 	cutTs?: number; // timestamp of the request-local summary message: one value per run, so every request of the run is identical
+	untouched?: number; // real tokens before the earliest edited block: what the first request carrying the plan can still read from the cache
 }
 
 export interface PlanOpts {
-	mode?: "cold" | "warm"; // cold: cache already gone (default). warm: only when the context is above the valve V and valveAllows; then the same plan as cold.
+	mode?: "cold" | "warm"; // cold: cache believed gone (default). warm: only when the context is above the cold cap and the law fires; then the same plan as cold.
+	law?: Law; // prices, g and P(warm); default: no prices (legacy rule), P = 0 cold / 1 warm
+	trace?: (LawTerms & { where: "summary" | "plan" })[]; // every law evaluation is pushed here (ledger)
 	reserve?: number; // Pi's compaction reserveTokens (default 16384)
 	steerIds?: Set<string>; // user entries that are mid-run steering or follow-up messages, not new user turns
 	sys: number; // estimated tokens of the system prompt (same chars/4 scale as the blocks; tool definitions are covered by k)
@@ -255,7 +277,7 @@ export interface PlanOpts {
 	promptPending?: boolean; // true at settle: the upcoming prompt is NOT in `entries` yet but counts as a new user turn
 	relax?: boolean; // default RELAX_PREV_TURN
 	minGain?: number;
-	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 20); 0 = outputs of the protected turns never fold on age
+	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 }
 
 export interface PlanResult {
@@ -275,6 +297,14 @@ export interface PlanResult {
 	cutKeptFirstMsg: Any;
 }
 
+/** Estimated tokens before the earliest edited block (system prompt included): what stays cached through the edit. A cut edits from the start. */
+export function untouchedEst(blocks: Block[], folds: FoldTarget[], cut: boolean, sys: number): number {
+	const ids = new Set(folds.map((t) => t.entryId));
+	let est = sys;
+	if (!cut) for (const b of blocks) { if (b.entryId && ids.has(b.entryId)) break; est += b.tokens; }
+	return est;
+}
+
 /** Identity of a tool result's text, independent of its tool call id. */
 export const contentKeyOf = (content: Any): string => {
 	const t = textOf(content);
@@ -282,9 +312,10 @@ export const contentKeyOf = (content: Any): string => {
 };
 
 /** The planner. Cold: fold everything outside the protected window, relax into the previous turn if still above the cap,
- *  summarise only if folds cannot reach the cap and the gain gate passes. Warm: null unless the context is above the valve V and
- *  the plan passes valveAllows; then exactly the cold plan (one valve, one reduction gate). The cap never exceeds Pi's compaction room.
- *  Returns null when there is nothing to plan on. */
+ *  summarise only if folds cannot reach the cap and the law prices the summary call in. Warm: null unless the context is above the
+ *  cold cap and the law fires for the plan (the summary call is sunk there); then exactly the cold plan. A cold plan with P(warm) > 0
+ *  passes the same law (expected cost). The cap never exceeds Pi's compaction room. Returns null when there is nothing to plan on
+ *  or the law says no. */
 export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const s = settings();
 	const mode = o.mode ?? "cold";
@@ -292,6 +323,12 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const k = o.k ?? 1;
 	const room = compactionRoom(o.model, o.reserve);
 	const coldCap = Math.min(o.coldCap ?? s.coldCap, room ?? Infinity) / k;
+	const law: Law = o.law ?? { pr: null, g: G0, pWarm: mode === "cold" ? 0 : 1 };
+	const gate = (where: "summary" | "plan", B: number, A: number, r: number | null, call: number, T: number): boolean => {
+		const t = lawTerms(B, A, law.pWarm, r, law.pr, law.g, call, T);
+		o.trace?.push({ where, ...t });
+		return t.ok;
+	};
 	const minGain = (o.minGain ?? s.minGain) / k;
 	const foldMin = o.foldMin ?? s.foldMin;
 	const keepLines = o.keepLines ?? s.keepLines;
@@ -303,7 +340,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const calls = toolCallIndex(blocks);
 	const recalled = o.recalled ?? new Set<string>();
 	const ctxEst = o.sys + blocks.reduce((a, b) => a + b.tokens, 0);
-	if (mode === "warm" && !(ctxEst > valveTokens(o.model, o.reserve) / k)) return null; // I6: warm cache below the valve -> never edit
+	if (mode === "warm" && !(ctxEst > coldCap)) return null; // I6: warm cache below the cold cap -> never edit
 	const trig = mode === "warm" ? "valve" : "cold";
 	const tokOverride = new Map<number, number>();
 	const folds: FoldTarget[] = [];
@@ -388,7 +425,10 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		if (cuts.length) {
 			let pick = cuts[cuts.length - 1];
 			for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }
-			if (pre[pick] >= 2 * S(pre[pick]) && summaryGainOk(pre[pick], S(pre[pick]), total, minGain)) {
+			// cold: the summary call must pay for itself (verdict: call = w X + out S for an uncached call); warm: it is sunk in the plan's law
+			const X = k * pre[pick], Sr = k * S(pre[pick]);
+			const gain = !law.pr ? summaryGainOk(pre[pick], S(pre[pick]), total, minGain) : mode === "warm" || gate("summary", X, Sr, null, law.pr.w * X + law.pr.out * Sr, Sr);
+			if (pre[pick] >= 2 * S(pre[pick]) && gain) {
 				cutIdx = pick;
 				prefixTokens = pre[pick];
 				summaryTokensPlanned = S(pre[pick]);
@@ -417,10 +457,12 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			bi++;
 		}
 	}
-	if (mode === "warm") {
-		const after = k * (ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0));
-		if (!valveAllows(k * ctxEst, after, room)) return null; // F10: the rewrite of a warm cache would not pay back
-	}
+	// the untouched prefix: everything before the earliest edited block (a cut edits from the first block on)
+	const untouched = untouchedEst(blocks, folds, cutIdx !== null, o.sys);
+	const after = ctxAfterFolds - (cutIdx !== null ? prefixTokens - summaryTokensPlanned : 0);
+	const planned = folds.length > 0 || cutIdx !== null;
+	// F10: a warm rewrite must pay back; a cold plan with some chance of a warm cache is priced by expectation (no prices: cold always fires)
+	if ((mode === "warm" || (planned && law.pr)) && !gate("plan", k * ctxEst, k * after, room, 0, k * (after - untouched))) return null;
 	return { blocks, calls, folds, cutIdx, firstKeptEntryId: cutIdx !== null ? blocks[cutIdx].entryId : null, prefixTokens, summaryTokensPlanned, sumTrigger, k, ctxTokens: k * ctxEst, ctxAfterFolds: k * ctxAfterFolds, userTurns, cutVisibleIdx, cutKeptFirstMsg };
 }
 

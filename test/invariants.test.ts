@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { repairPayload, validateEdits } from "../src/guard.ts";
-import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, valveTokens, type Block, type RunPlan } from "../src/plan.ts";
+import { buildBlocks, planContext, applyPlanToMessages, reserveTokensFor, type Block, type RunPlan } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
 import { skeleton } from "../src/summary.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, U, withK, type Any } from "./helpers.ts";
@@ -195,15 +195,16 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		}
 	});
 
-	test("a summary the warm return never needs (context below the valve) is discarded and still booked as cost", async () => {
+	test("a summary the warm return never needs (the law does not fire) is discarded and still booked as cost", async () => {
 		const st = { calls: 0 };
 		const r = await rig(done, WARM_TS(), { modelRegistry: { complete: mkComplete(st) } });
 		const settled = await settle(r);
 		await sleep(200);
 		expect(st.calls).toBe(1);
 		await r.fire("before_provider_request", { payload: {} }); // a fresh request: the cache is warm again
+		process.env.PI_ZIP_COLD_CAP = "200000"; // ~100K tokens, now below the cap: a warm cache is never edited
 		const req = await comeBack(r, settled, Date.now());
-		expect(req).toBeUndefined(); // 1M window, ~100K tokens: below V, so nothing is edited
+		expect(req).toBeUndefined();
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("$0.0200");
 		expect(st.calls).toBe(1);
@@ -497,15 +498,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 	};
 	const model = (contextWindow?: number) => ({ provider: "p", id: "m", ...(contextWindow ? { contextWindow } : {}), cost: { cacheWrite: 3, cacheRead: 0.3 }, promptCache: { short: 300 } });
 
-	test("V = min(160K, 0.8 x window, window - reserve - margin); unknown window = 160K; the reserve is Pi's setting", () => {
-		expect(valveTokens(undefined)).toBe(160_000);
-		expect(valveTokens({})).toBe(160_000);
-		expect(valveTokens({ contextWindow: 1_000_000 })).toBe(160_000);
-		expect(valveTokens({ contextWindow: 200_000 })).toBe(160_000);
-		expect(valveTokens({ contextWindow: 128_000 })).toBe(102_400);
-		expect(valveTokens({ contextWindow: 64_000 })).toBe(64_000 - 16_384 - 8_192); // 39.4K: below both 160K and 0.8 x 64K = 51.2K
-		expect(valveTokens({ contextWindow: 64_000 }, 30_000)).toBe(64_000 - 30_000 - 8_192);
-		for (const w of [16_000, 32_000, 64_000, 128_000, 200_000, 1_000_000]) expect(valveTokens({ contextWindow: w })).toBeLessThan(Math.max(w - 16_384, 4_096 + 1));
+	test("the reserve is Pi's setting", () => {
 		expect(reserveTokensFor({}, undefined)).toBe(16_384);
 		expect(reserveTokensFor({ compaction: { reserveTokens: 5000 } }, undefined)).toBe(5000);
 		expect(reserveTokensFor({ compaction: { reserveTokens: 5000, modelOverrides: { "p/m": { reserveTokens: 9000 } } } }, { provider: "p", id: "m" })).toBe(9000);
@@ -552,16 +545,14 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(r.notes).toEqual([]);
 	});
 
-	test("the valve follows the window: 128K window -> 102K, 1M -> 160K; a small window stays below Pi's compaction trigger", async () => {
-		const mid = withK(session(50), 1); // ~112K tokens
-		const warmMid = await rig(mid, WARM_TS(), { model: model(128_000) });
-		await warmMid.fire("before_agent_start", {});
-		expect(await warmMid.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // 112K > 102K
-		const big = await rig(mid, WARM_TS(), { model: model(1_000_000) });
+	test("no V any more: with prices a big warm cut pays at any window (the law); a small window clamps the cap below Pi's compaction trigger", async () => {
+		const mid = withK(session(50), 1); // ~112K tokens, ~105K of it foldable
+		const priced = { ...model(1_000_000), cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } };
+		const big = await rig(mid, WARM_TS(), { model: priced });
 		await big.fire("before_agent_start", {});
-		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeUndefined(); // 112K < 160K
+		expect(await big.fire("context_with_system", { messages: flat(mid) })).toBeDefined(); // D ~105K >> the EOQ Delta at this A
 		const small = session(6); // ~14K tokens
-		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // V = 8192
+		const tiny = await rig(small, WARM_TS(), { model: model(32_000) }); // cap = room = 7.4K
 		await tiny.fire("before_agent_start", {});
 		expect(await tiny.fire("context_with_system", { messages: flat(small) })).toBeDefined();
 		// the cold cap never exceeds Pi's compaction room either
@@ -685,6 +676,7 @@ describe("coexistence (F14)", () => {
 
 // =============================================================================================================
 describe("in-turn folds through the real extension: one user message, 60 tool calls", () => {
+	beforeEach(() => { process.env.PI_ZIP_INTURN_AGE = "20"; }); // the mechanics at age 20 (default 60: a 61-request turn would fold only r1)
 	const MUT = [3, 10, 50];
 	const session = () => longTurn(60, { mutating: MUT, recalls: [7] });
 	const tail = [A("a62", ["c62"]), R("r62", "c62", 300)];

@@ -9,7 +9,7 @@ export interface NoticeAction {
 	tokensAfter: number;
 	ms: number;
 	prepared?: boolean; // summary computed while the user was away
-	pressure?: boolean; // done by the warm valve (the context is above V while the cache is still warm), not because the cache was cold
+	pressure?: boolean; // done by the warm valve (the law fired while the cache is still warm), not because the cache was cold
 }
 
 export const fmtK = (tokens: number): string => `${tokens >= 99_500 ? Math.round(tokens / 1000) : Math.round(tokens / 100) / 10}K`;
