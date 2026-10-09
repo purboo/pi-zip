@@ -19,19 +19,34 @@ export default function piZip(pi: ExtensionAPI) {
 			if (typeof m?.visibleWidth === "function" && typeof m?.truncateToWidth === "function")
 				setMeasure({ vw: m.visibleWidth, cut: (s: string, w: number) => (m.visibleWidth(s) <= w ? s : w <= 0 ? "" : m.truncateToWidth(s, w, "…")) });
 		}, () => {});
+		// A click on a notice toggles its detail, like Pi's own compaction row; ctrl+o (Pi's global expand) still wins: a click
+		// only overrides the global state it was made under. Keyed by entry id because Pi rebuilds the component on every toggle.
+		const clicked = new Map<string, { open: boolean; under: boolean }>();
 		pi.registerEntryRenderer?.(NOTICE_CUSTOM, (entry: Any, o: Any, theme: Any) => {
 			const d = entry?.data;
 			if (!d?.text) return undefined;
+			const global = !!o?.expanded;
+			const key = typeof entry?.id === "string" ? entry.id : "";
+			const open = () => {
+				const c = key ? clicked.get(key) : undefined;
+				return c && c.under === global ? c.open : global;
+			};
+			const expandable = d.v === 2 && d.kind !== "state" && d.kind !== "card" && !!(d.why || d.items?.length);
 			return {
 				render: (width: number) => {
 					try {
 						if (d.v !== 2) return [theme.fg("dim", measure.cut(d.text, width))];
 						if (d.kind === "state") return renderState(d.word, d.reason ?? "", width, theme, measure);
 						if (d.kind === "card" && d.card) return renderCard(d.card, width, theme, measure);
-						return renderNotice(d as NoticeData, !!o?.expanded, width, theme, measure.vw);
+						return renderNotice(d as NoticeData, open(), width, theme, measure.vw);
 					} catch {
 						return [];
 					}
+				},
+				handleMouse: (ev: Any) => {
+					if (!expandable || !key || ev?.type !== "click" || ev?.button !== "left") return undefined;
+					clicked.set(key, { open: !open(), under: global });
+					return { handled: true, render: true };
 				},
 				invalidate: () => {},
 			};

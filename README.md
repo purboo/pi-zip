@@ -43,7 +43,7 @@ At most one line per turn in the transcript, only when the context was folded or
 ▸ pi-zip  182K → 41K  ▰▰▱▱▱▱▱▱▱▱  summarized 64 requests · ready while you were away
 ```
 
-The second line appears once per session. Expand tool output (ctrl+o) to see why it happened now and what was folded:
+The second line appears once per session. Click the notice (or expand tool output with ctrl+o) to see why it happened now and what was folded:
 
 ```
 ▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs
@@ -53,7 +53,7 @@ The second line appears once per session. Expand tool output (ctrl+o) to see why
           … 10 more
 ```
 
-These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it.
+These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it. The pi-zip numbers are real tokens, the same scale as Pi's context meter (the "after" side is what the edited request actually carried); the `Compacted from N tokens` figure in Pi's block is Pi's own estimate taken when the entry is saved, so it will not match.
 
 Everything else pi-zip shows uses the same one-line grammar, and only when something changed:
 

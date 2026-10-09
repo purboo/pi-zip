@@ -11,7 +11,7 @@ import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planCo
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
-import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
+import { type Any, PRODUCT, clamp, textOf, tok4, tokensOf } from "./util.ts";
 import { fmtLife, SPARK_GAPS, type CardData, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
@@ -646,15 +646,20 @@ export class Zip implements ZipControl {
 		});
 		if (cut) this.ledger({ type: "summary", trigger: cut.trigger, source: plan.source, count: cut.count, prefixTokens: cut.prefixTokens, summaryTokens: cut.summaryTokens, ms: cut.ms, waitedMs: Math.round(waitMs), llmOk: cut.llmOk, llmError: cut.llmError, costUsd: cut.costUsd, ...this.usageOf(cut) });
 		const valve = plan.source === "valve";
+		// What the user sees should match Pi's own context meter. A run plan was carried by the request that just ended, so its
+		// usage is the REAL size after the edits: rescale the notice to it (display only; decisions stay on the plan's k). A
+		// valve plan only applies from the next request: keep the estimate.
+		const estAfter = ctxTokens - (before - after) - cutSaved - k * tokensOf(e.message);
+		const r = !valve && o.usageTotal > 0 && estAfter > 0 ? clamp(o.usageTotal / estAfter, 0.2, 5) : 1;
 		const notices: NoticeAction[] = [];
-		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: ctxTokens, tokensAfter: ctxTokens - (before - after), ms: plan.ms + (performance.now() - o.t0), pressure: valve });
+		if (live.length) notices.push({ kind: "fold", count: live.length, tokensBefore: r * ctxTokens, tokensAfter: r * (ctxTokens - (before - after)), ms: plan.ms + (performance.now() - o.t0), pressure: valve });
 		if (cut) {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
-			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
+			notices.push({ kind: "summary", count: cut.count, tokensBefore: r * (ctxTokens - (before - after)), tokensAfter: r * (ctxTokens - (before - after) - cutSaved), ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
 		}
 		if (notices.length && !this.quiet) {
 			const ITEMS = 8;
-			const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, turn: byId.get(t.entryId)?.userTurn, tokens: Math.round(k * t.entryTokens), handle: handleFor(t.entryId) }));
+			const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, turn: byId.get(t.entryId)?.userTurn, tokens: Math.round(r * k * t.entryTokens), handle: handleFor(t.entryId) }));
 			const why = valve ? "cache still warm, but the context passed the warm-cache limit" : this.cold ? this.coldWhy : "cache warm: the reads saved pay for the rewrite";
 			const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
 			this.noticed = true;

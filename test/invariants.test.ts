@@ -747,7 +747,37 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		const ex = renderers.get("pi-zip/notice")({ data: kept[0].data }, { expanded: true }, { fg: (_c: string, t: string) => t }).render(200);
 		expect(ex.length).toBeGreaterThan(3);
 		expect(ex.join("\n")).toContain(kept[0].data.items[0].handle);
+		// a left click toggles the detail (Pi rebuilds the component, so the state is keyed by entry id); ctrl+o still wins
+		const th = { fg: (_c: string, t: string) => t };
+		const entry = { id: "n1", data: kept[0].data };
+		const c1 = renderers.get("pi-zip/notice")(entry, { expanded: false }, th);
+		expect(c1.handleMouse({ type: "press", button: "left" })).toBeUndefined();
+		expect(c1.handleMouse({ type: "click", button: "left" })).toMatchObject({ handled: true });
+		expect(c1.render(200).length).toBe(ex.length);
+		expect(renderers.get("pi-zip/notice")(entry, { expanded: false }, th).render(200).length).toBe(ex.length); // survives a rebuild
+		expect(renderers.get("pi-zip/notice")(entry, { expanded: true }, th).render(200).length).toBe(ex.length); // ctrl+o: open
+		const c2 = renderers.get("pi-zip/notice")(entry, { expanded: true }, th);
+		c2.handleMouse({ type: "click", button: "left" });
+		expect(c2.render(200)).toEqual(wide);
+	});
 
+	test("the notice's 'after' is the real size the edited request carried (matches Pi's context meter), not the estimate", async () => {
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const run = async (real: number) => {
+			const entries = session();
+			const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: () => {} });
+			await r.fire("before_agent_start", {});
+			await r.fire("context_with_system", { messages: flat(entries) });
+			const te = turnEnd([...entries, ...tail, A("a63")], "a63", 1);
+			te.message.usage.input = real;
+			await r.fire("turn_end", te);
+			await sleep(5);
+			return r.appended.find((x: Any) => x.customType === "pi-zip/notice").data;
+		};
+		const a = await run(6000), b = await run(9000);
+		expect(a.after).toBe(6000);
+		expect(b.after).toBe(9000);
+		expect(b.before / a.before).toBeCloseTo(1.5, 2); // before scales with the same ratio
 	});
 
 	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {
