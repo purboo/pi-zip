@@ -7,12 +7,27 @@ pi-zip folds old tool output out of the context **only when the prompt cache has
 ## Install
 
 ```bash
-pi install npm:pi-zip
-# or
 pi install git:github.com/purboo/pi-zip
 ```
 
-Try it for one run without installing: `pi -e npm:pi-zip`.
+(Not published on npm yet.)
+
+## Measured results (v0.2.0)
+
+Live A/B runs on the same coding tasks (4 task templates × 4 seeds, the user away 6 minutes between prompts), paired by task, 95% bootstrap intervals. BC = [billion-context](https://github.com/ranxianglei/billion-context) with its defaults.
+
+| Model | Cost vs BC | Speed | Quality (task done / planted facts recalled) |
+|---|---|---|---|
+| Claude Sonnet 5.5 | **0.79×** [0.72, 0.86] | p90 wait per prompt 53 s vs 85 s; same as plain Pi | 16/16 and 1.00, same as BC |
+| GPT-6.1-sol (14 tasks so far) | 1.00× [0.91, 1.09] | median task 197 s vs 293 s | 14/14 and 1.00 vs 13/14 and 0.96 |
+
+Against plain Pi on the same Claude runs: same speed, 0.45× the cost. Hidden-question probes on real long sessions (questions whose answer had been folded): 45–52% answered from the original via `zip_recall` vs 5% for BC's reconstruction, same number of wrong answers.
+
+Known limits:
+
+- **GLM** (automatic prefix cache that outlives its declared 5 minutes): v0.1 cost about 1.2× BC live. v0.2 learns the real cache lifetime and folds the previous turn after the declared TTL (offline 0.95–0.97× v0.1), but this was not verified live.
+- **Long autonomous runs** (one prompt, hundreds of tool calls, e.g. sub-agents): roughly on par with BC, not better. Outputs are only folded inside a running turn once they are 60 requests old.
+- If you always answer within the cache lifetime, there is little to save, by design.
 
 ## What you see
 
@@ -91,7 +106,7 @@ The guard has two parts. Before saving a fold or a summary it checks that the ed
 
 ## FAQ
 
-**Will it save money?** Only on cold returns, which is where a long session pays for a full cache rewrite. If you always answer within the cache TTL, pi-zip does nothing by design. `/zip stats` shows an estimate based on the model's declared prices: avoided cache writes and reads, minus summary calls, minus the cost of content you recalled. It is an estimate (token counts are chars/4, scaled by the calibration above), and it can be negative.
+**Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm it edits only when the inequality above says the rewrite pays back (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip stats` shows an estimate based on the model's declared prices: avoided cache writes and reads, minus summary calls, minus the cost of content you recalled. It is an estimate (token counts are chars/4, scaled by the calibration above), and it can be negative.
 
 **Does it cost extra?** Planning is free. A summary is one extra model call (the current model, no tools, no prompt cache), shown in `/zip stats`. A background summary you never use (you came back while the cache was warm) is counted too. Recalled content re-enters the context at normal prices.
 
