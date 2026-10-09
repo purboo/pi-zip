@@ -8,7 +8,7 @@ import { describe, lawPrices, loadStats, pWarm, record, sample, GAP_EDGES, type 
 import { validateEdits, repairPayload } from "./guard.ts";
 import { Stats, noticeText, statsText, type NoticeAction, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, untouchedEst, type Block, type Calibration, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
-import { handleFor } from "./placeholder.ts";
+import { handleFor, PH_MARK } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
 import { type Any, PRODUCT, tok4 } from "./util.ts";
@@ -636,16 +636,25 @@ export class Zip implements ZipControl {
 			this.pi.appendEntry(STATE_CUSTOM, { off: this.off, quiet: this.quiet });
 		} catch {}
 	}
-	status(): string {
+	/** What this session carries (persisted in its file, survives restarts), unlike the per-process counters. */
+	private sessionTotals(ctx: Any): string {
+		let folds = 0, summaries = 0;
+		for (const e of ctx ? this.branch(ctx) : []) {
+			if (e?.type === "context_edit" && String(e.replacement?.content?.[0]?.text ?? "").startsWith(PH_MARK)) folds++;
+			else if (e?.type === "compaction" && e.details?.by === PRODUCT) summaries++;
+		}
+		return ctx ? `this session so far: ${folds} folded output${folds === 1 ? "" : "s"}, ${summaries} summar${summaries === 1 ? "y" : "ies"}` : "";
+	}
+	status(ctx?: Any): string {
 		const state = this.off ? "off" : this.conflict ? `paused ("${this.conflict}" also manages context; only the request guard is on)` : "on";
 		const key = modelKey(this.model), ttl = ttlFor(this.model), ent = loadStats().models[key];
 		const pr = lawPrices(ent?.cls, ttl >= 3_600_000);
 		const cache = !key ? "" : `\ncache ${key}: ${pr ? `${pr.cls} (from usage)` : "class unknown until the first response"}` +
 			`, ${pr ? `read ${+pr.r.toFixed(4)} / write ${+pr.w.toFixed(4)} / output ${+pr.out.toFixed(4)} x input (class ratios)` : "no prices (legacy rule)"}` +
 			`, ${describe(ent, ttl / 1000)}, growth ${(this.g / 1000).toFixed(1)}K/request`;
-		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}folded ${this.stats.folds} output${this.stats.folds === 1 ? "" : "s"}, ${this.stats.summaries} summar${this.stats.summaries === 1 ? "y" : "ies"} (/zip stats for details)${cache}`;
+		return `${PRODUCT}: ${state}, cache TTL ${Math.round(ttl / 1000)} s, ${this.quiet ? "notices off, " : ""}since pi started: folded ${this.stats.folds} output${this.stats.folds === 1 ? "" : "s"}, ${this.stats.summaries} summar${this.stats.summaries === 1 ? "y" : "ies"}${ctx ? "; " + this.sessionTotals(ctx) : ""} (/zip stats for details)${cache}`;
 	}
-	statsLine = () => statsText(this.stats, this.model);
+	statsLine = (ctx?: Any) => statsText(this.stats, this.model) + (ctx ? ` (${this.sessionTotals(ctx)})` : "");
 	setOff(off: boolean): string {
 		this.off = off;
 		if (off) { this.runPlan = null; this.runEdits = false; this.cancelTimer(); this.discardBg(); }

@@ -578,3 +578,19 @@ test("token estimate follows Pi's chars/4 rules", () => {
 	expect(tokensOf({ role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(40) }, { type: "toolCall", name: "bash", arguments: { command: "ls" } }] })).toBe(Math.ceil((40 + 4 + JSON.stringify({ command: "ls" }).length) / 4));
 	expect(tokensOf({ role: "compactionSummary", summary: "x".repeat(80) })).toBe(20);
 });
+
+describe("/zip status after a restart", async () => {
+	const { Zip } = await import("../src/run.ts");
+	const { fakeCtx, fakePi } = await import("./helpers.ts");
+	test("reports what the session carries (folds and summaries persisted in its file), not only this process's counters", () => {
+		const ph = (id: string) => ({ type: "context_edit", targetId: id, replacement: { content: [{ type: "text", text: `[folded by pi-zip · bash ls · handle ${id}]` }] } });
+		const branch = [ph("a"), ph("b"), ph("c"), { type: "context_edit", targetId: "x", replacement: { content: [{ type: "text", text: "someone else" }] } }, { type: "compaction", summary: "s", details: { by: "pi-zip" } }, { type: "compaction", summary: "pi", details: {} }];
+		const zip = new Zip(fakePi().pi);
+		const { ctx } = fakeCtx([], { branch });
+		const s = zip.status(ctx);
+		expect(s).toContain("since pi started: folded 0 outputs, 0 summaries");
+		expect(s).toContain("this session so far: 3 folded outputs, 1 summary");
+		expect(zip.statsLine(ctx)).toContain("this session so far: 3 folded outputs, 1 summary");
+		expect(zip.status()).not.toContain("this session");
+	});
+});

@@ -78,8 +78,8 @@ export function statsText(s: Stats, model: Any): string {
 }
 
 export interface ZipControl {
-	status(): string;
-	statsLine(): string;
+	status(ctx?: Any): string;
+	statsLine(ctx?: Any): string;
 	setOff(off: boolean): string;
 	toggleQuiet(): string;
 }
@@ -90,8 +90,8 @@ export function registerZipCommand(pi: ExtensionAPI, zip: ZipControl) {
 		handler: async (args: string, cctx: Any) => {
 			const sub = (args ?? "").trim().toLowerCase() || "status";
 			const text =
-				sub === "status" ? zip.status()
-				: sub === "stats" ? zip.statsLine()
+				sub === "status" ? zip.status(cctx)
+				: sub === "stats" ? zip.statsLine(cctx)
 				: sub === "off" ? zip.setOff(true)
 				: sub === "on" ? zip.setOff(false)
 				: sub === "quiet" ? zip.toggleQuiet()
