@@ -1,7 +1,7 @@
 // pi-zip: keeps long Pi sessions cheap without losing anything. Wiring only; the logic lives in the sibling modules.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Any } from "./util.ts";
-import { registerZipCommand } from "./notice.ts";
+import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
 import { registerRecallTool } from "./recall.ts";
 import { NOTICE_CUSTOM, Zip } from "./run.ts";
@@ -13,11 +13,23 @@ export default function piZip(pi: ExtensionAPI) {
 	registerZipCommand(pi, zip);
 	try {
 		// fold/summary notices stay in the transcript as one dim line (a custom entry: never part of the model's context)
-		pi.registerEntryRenderer?.(NOTICE_CUSTOM, (entry: Any, _o: Any, theme: Any) => {
-			const text = String(entry?.data?.text ?? "");
-			if (!text) return undefined;
+		let vw: (s: string) => number = (s) => s.length;
+		import("@earendil-works/pi-tui").then((m: Any) => {
+			if (typeof m?.visibleWidth === "function") vw = m.visibleWidth;
+		}, () => {});
+		pi.registerEntryRenderer?.(NOTICE_CUSTOM, (entry: Any, o: Any, theme: Any) => {
+			const d = entry?.data;
+			if (!d?.text) return undefined;
+			const data: NoticeData = d.v === 2 ? d : { v: 2, text: d.text, before: 0, after: 0, desc: "" };
 			return {
-				render: (width: number) => [theme.fg("dim", text.length > width ? text.slice(0, Math.max(0, width - 1)) + "…" : text)],
+				render: (width: number) => {
+					if (d.v !== 2) return [theme.fg("dim", vw(d.text) > width ? d.text.slice(0, Math.max(0, width - 1)) + "…" : d.text)];
+					try {
+						return renderNotice(data, !!o?.expanded, width, theme, vw);
+					} catch {
+						return [];
+					}
+				},
 				invalidate: () => {},
 			};
 		});

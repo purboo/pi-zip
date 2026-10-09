@@ -34,14 +34,25 @@ Known limits:
 
 ## What you see
 
-At most one line per turn, only when something was folded:
+At most one line per turn in the transcript, only when the context was folded or summarized. The numbers come first, and the bar shows how much is left:
 
 ```
-pi-zip · folded 12 old outputs · 84.2K → 31.5K tokens · 0.9 ms · originals recallable
-pi-zip · summarized 64 requests · 182K → 41K tokens · 8.4 s (done while you were away)
+▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs
+          originals are kept; the model can recall any of them with zip_recall
+▸ pi-zip  182K → 41K  ▰▰▱▱▱▱▱▱▱▱  summarized 64 requests · ready while you were away
 ```
 
-The line goes to the UI only; it never enters the model's context. Nothing else is added to the screen.
+The second line appears once per session. Expand tool output (ctrl+o) to see why it happened now and what was folded:
+
+```
+▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs
+          cache cold (away 47 min): this request rewrites it anyway, so editing is free
+          bash npm test        turn 1     14K  k3x9q2m7ab
+          read src/payment.ts  turn 1      9K  p8d2x1qa0m
+          … 10 more
+```
+
+These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it. Recalls show up as ordinary `zip_recall` tool calls.
 
 ## The three rules
 

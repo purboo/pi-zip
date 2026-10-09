@@ -12,19 +12,90 @@ export interface NoticeAction {
 	pressure?: boolean; // done by the warm valve (the law fired while the cache is still warm), not because the cache was cold
 }
 
+/** One folded output, for the expanded (ctrl+o) view of a notice. */
+export interface NoticeItem {
+	label: string; // tool + short args
+	turn?: number;
+	tokens: number;
+	handle: string;
+}
+
+/** What a transcript notice stores (custom entry data; never sent to the model). `text` is the plain one-line form (status-line fallback, ledger). */
+export interface NoticeData {
+	v: 2;
+	text: string;
+	before: number;
+	after: number;
+	desc: string; // "folded 12 old outputs · summarized 64 requests · ready while you were away"
+	why?: string; // expanded view: why now
+	items?: NoticeItem[];
+	more?: number; // folded outputs not listed
+	first?: boolean; // the session's first notice: say once that originals are kept
+}
+
 export const fmtK = (tokens: number): string => `${tokens >= 99_500 ? Math.round(tokens / 1000) : Math.round(tokens / 100) / 10}K`;
 
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const secs = (ms: number) => `${(Math.round(ms / 100) / 10).toFixed(1)} s`;
+
+/** The words after the numbers: what happened, plus how long the user waited for a summary (if at all). */
+export function noticeDesc(actions: NoticeAction[]): string {
+	return actions
+		.map((a) => {
+			if (a.kind === "fold") return `folded ${plural(a.count, "old output")}`;
+			return `summarized ${plural(a.count, "request")} · ${a.prepared ? "ready while you were away" : `waited ${secs(a.ms)}`}`;
+		})
+		.join(" · ");
+}
+
 export function noticeText(actions: NoticeAction[]): string {
-	const segs = actions.map((a) => {
-		const sizes = `${fmtK(a.tokensBefore)} → ${fmtK(a.tokensAfter)} tokens`;
-		if (a.kind === "fold") {
-			const ms = a.ms < 10 ? (Math.round(a.ms * 10) / 10).toFixed(1) : String(Math.round(a.ms));
-			return `folded ${a.count} old output${a.count === 1 ? "" : "s"} · ${sizes} · ${ms} ms · originals recallable${a.pressure ? " · context over the warm-cache limit" : ""}`;
-		}
-		const s = (Math.round(a.ms / 100) / 10).toFixed(1);
-		return `summarized ${a.count} request${a.count === 1 ? "" : "s"} · ${sizes} · ${a.prepared ? `${s} s (done while you were away)` : `waited ${s} s`}`;
-	});
-	return `${PRODUCT} · ${segs.join(" · ")}`;
+	const first = actions[0], last = actions[actions.length - 1];
+	return `${PRODUCT}  ${fmtK(first.tokensBefore)} → ${fmtK(last.tokensAfter)}  ${noticeDesc(actions)}`;
+}
+
+/** Ten cells, filled in proportion to what is left: length is read before any digit is. */
+export function ratioBar(before: number, after: number, cells = 10): string {
+	const f = before > 0 ? Math.min(cells, Math.max(1, Math.round((cells * after) / before))) : cells;
+	return "▰".repeat(f) + "▱".repeat(cells - f);
+}
+
+export interface NoticeTheme {
+	fg(color: string, text: string): string;
+}
+
+const MARK = "▸ ";
+const INDENT = " ".repeat(MARK.length + PRODUCT.length + 2);
+
+/** Lines for the transcript. Narrow terminals drop whole segments in order (description, then bar); the numbers always stay.
+ *  `w` measures display width (Pi's visibleWidth in the renderer; string length in tests). Every line fits `width`. */
+export function renderNotice(d: NoticeData, expanded: boolean, width: number, th: NoticeTheme, w: (s: string) => number = (s) => s.length): string[] {
+	const nums = `${fmtK(d.before)} → ${fmtK(d.after)}`;
+	const bar = ratioBar(d.before, d.after);
+	const tries: [string, string][] = [
+		[`${MARK}${PRODUCT}  ${nums}  ${bar}  ${d.desc}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}  ${th.fg("dim", bar)}  ${th.fg("dim", d.desc)}`],
+		[`${MARK}${PRODUCT}  ${nums}  ${bar}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}  ${th.fg("dim", bar)}`],
+		[`${MARK}${PRODUCT}  ${nums}`, `${th.fg("accent", MARK + PRODUCT)}  ${th.fg("text", nums)}`],
+		[nums, th.fg("text", nums)],
+	];
+	const head = tries.find(([plain]) => w(plain) <= width);
+	if (!head) return [];
+	const out = [head[1]];
+	const sub = (plain: string) => {
+		const line = INDENT + plain;
+		if (w(line) <= width) out.push(th.fg("dim", line));
+		else if (w(plain) <= width) out.push(th.fg("dim", plain));
+	};
+	if (d.first) sub("originals are kept; the model can recall any of them with zip_recall");
+	if (!expanded) return out;
+	if (d.why) sub(d.why);
+	const items = d.items ?? [];
+	const lw = Math.min(28, Math.max(0, ...items.map((i) => i.label.length)));
+	for (const i of items) {
+		const label = i.label.length > lw ? i.label.slice(0, lw - 1) + "…" : i.label.padEnd(lw);
+		sub(`${label}  ${(i.turn ? `turn ${i.turn}` : "").padEnd(8)}${fmtK(i.tokens).padStart(6)}  ${i.handle}`);
+	}
+	if (d.more) sub(`… ${d.more} more`);
+	return out;
 }
 
 export class Stats {

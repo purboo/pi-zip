@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
-import { fmtK, noticeText, type NoticeAction } from "../src/notice.ts";
+import { fmtK, noticeText, ratioBar, renderNotice, type NoticeAction, type NoticeData } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
@@ -535,16 +535,44 @@ describe("observed TTL tier", () => {
 describe("notices and stats", () => {
 	test("fmtK", () => expect([fmtK(84200), fmtK(31500), fmtK(182000), fmtK(41000)]).toEqual(["84.2K", "31.5K", "182K", "41K"]));
 	const fold: NoticeAction = { kind: "fold", count: 12, tokensBefore: 84200, tokensAfter: 31500, ms: 0.94 };
-	test("exact formats; fold and summary merge into ONE line", () => {
-		expect(noticeText([fold])).toBe("pi-zip · folded 12 old outputs · 84.2K → 31.5K tokens · 0.9 ms · originals recallable");
-		const sync: NoticeAction = { kind: "summary", count: 64, tokensBefore: 182000, tokensAfter: 41000, ms: 8400 };
-		expect(noticeText([sync])).toBe("pi-zip · summarized 64 requests · 182K → 41K tokens · waited 8.4 s");
-		expect(noticeText([{ ...sync, prepared: true }])).toBe("pi-zip · summarized 64 requests · 182K → 41K tokens · 8.4 s (done while you were away)");
-		const merged = noticeText([fold, sync]);
-		expect(merged).not.toContain("\n");
-		expect(merged.startsWith("pi-zip · folded 12")).toBe(true);
-		expect(merged).toContain("waited 8.4 s");
-		expect(noticeText([{ ...fold, count: 1, ms: 4.44 }])).toContain("folded 1 old output · ");
+	const sync: NoticeAction = { kind: "summary", count: 64, tokensBefore: 182000, tokensAfter: 41000, ms: 8400 };
+	test("exact formats; fold and summary merge into ONE line, numbers first", () => {
+		expect(noticeText([fold])).toBe("pi-zip  84.2K → 31.5K  folded 12 old outputs");
+		expect(noticeText([sync])).toBe("pi-zip  182K → 41K  summarized 64 requests · waited 8.4 s");
+		expect(noticeText([{ ...sync, prepared: true }])).toBe("pi-zip  182K → 41K  summarized 64 requests · ready while you were away");
+		const merged = noticeText([fold, { ...sync, tokensBefore: 31500, tokensAfter: 20000 }]);
+		expect(merged).toBe("pi-zip  84.2K → 20K  folded 12 old outputs · summarized 64 requests · waited 8.4 s");
+		expect(noticeText([{ ...fold, count: 1 }])).toBe("pi-zip  84.2K → 31.5K  folded 1 old output");
+	});
+	test("ratio bar: ten cells, filled by what is left, never empty", () => {
+		expect(ratioBar(74000, 43000)).toBe("▰▰▰▰▰▰▱▱▱▱");
+		expect(ratioBar(182000, 41000)).toBe("▰▰▱▱▱▱▱▱▱▱");
+		expect(ratioBar(1_290_000, 40_000)).toBe("▰▱▱▱▱▱▱▱▱▱");
+	});
+	const th = { fg: (_c: string, t: string) => t };
+	const data: NoticeData = {
+		v: 2, text: "", before: 74000, after: 43000, desc: "folded 12 old outputs", why: "cache cold (away 47 min), so folding was free",
+		items: [{ label: "bash npm test", turn: 1, tokens: 14000, handle: "k3x9q2m7ab" }, { label: "read src/payment.ts", turn: 1, tokens: 9000, handle: "p8d2x1qa0m" }], more: 10,
+	};
+	test("collapsed: one line; narrow terminals drop the words, then the bar, never the numbers; nothing exceeds the width", () => {
+		expect(renderNotice(data, false, 120, th)).toEqual(["▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱  folded 12 old outputs"]);
+		expect(renderNotice(data, false, 40, th)).toEqual(["▸ pi-zip  74K → 43K  ▰▰▰▰▰▰▱▱▱▱"]);
+		expect(renderNotice(data, false, 25, th)).toEqual(["▸ pi-zip  74K → 43K"]);
+		expect(renderNotice(data, false, 12, th)).toEqual(["74K → 43K"]);
+		expect(renderNotice(data, false, 5, th)).toEqual([]);
+		for (const w of [5, 12, 25, 40, 60, 80, 120]) for (const ex of [false, true]) for (const l of renderNotice({ ...data, first: true }, ex, w, th)) expect(l.length).toBeLessThanOrEqual(w);
+	});
+	test("the session's first notice says once that originals are kept; ctrl+o lists why and what", () => {
+		expect(renderNotice({ ...data, first: true }, false, 120, th)[1]).toBe("          originals are kept; the model can recall any of them with zip_recall");
+		const ex = renderNotice(data, true, 120, th);
+		expect(ex[1]).toBe("          cache cold (away 47 min), so folding was free");
+		expect(ex[2]).toBe("          bash npm test        turn 1     14K  k3x9q2m7ab");
+		expect(ex[3]).toContain("read src/payment.ts  turn 1");
+		expect(ex[4]).toBe("          … 10 more");
+	});
+	test("colours: product accent, numbers text, bar and words dim", () => {
+		const tag = { fg: (c: string, t: string) => `<${c}>${t}</${c}>` };
+		expect(renderNotice(data, false, 120, tag, (s) => s.replace(/<\/?\w+>/g, "").length)[0]).toBe("<accent>▸ pi-zip</accent>  <text>74K → 43K</text>  <dim>▰▰▰▰▰▰▱▱▱▱</dim>  <dim>folded 12 old outputs</dim>");
 	});
 });
 

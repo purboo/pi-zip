@@ -87,7 +87,7 @@ describe("I1 byte stability: every request of a run sends the same prefix, and i
 		expect(JSON.stringify(projected.slice(0, req1.messages.length))).toBe(JSON.stringify(req1.messages));
 		expect(te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId)).toEqual(["r1"]);
 		expect(r.notes).toHaveLength(1);
-		expect(r.notes[0]).toMatch(/^pi-zip · folded 1 old output · [\d.]+K → [\d.]+K tokens · [\d.]+ ms · originals recallable$/);
+		expect(r.notes[0]).toMatch(/^pi-zip  [\d.]+K → [\d.]+K  folded 1 old output$/);
 	});
 
 	test("after the persist the next request needs no local edit (the session projection already carries it)", async () => {
@@ -156,7 +156,7 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
 		const base = r.ctx.sessionManager.getBranch();
 		r.ctx.sessionManager.getBranch = () => [...base, ...te.entries]; // what Pi persists
-		expect(r.notes.at(-1)).toMatch(/summarized 2 requests · [\d.]+K → [\d.]+K tokens · [\d.]+ s \(done while you were away\)/);
+		expect(r.notes.at(-1)).toMatch(/^pi-zip  [\d.]+K → [\d.]+K  summarized 2 requests · ready while you were away$/);
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("1 summary");
 		expect(r.notes.at(-1)).toContain("$0.0200");
@@ -535,7 +535,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		const ids = te.entries.filter((e: Any) => e.type === "context_edit").map((e: Any) => e.targetId).sort();
 		expect(ids.length).toBe(79);
 		expect(JSON.stringify(flat(project(all, te.entries)).slice(0, req1.messages.length))).toBe(JSON.stringify(req1.messages));
-		expect(r.notes[0]).toContain("context over the warm-cache limit");
+		expect(r.notes[0]).toMatch(/^pi-zip  [\d.]+K → [\d.]+K  folded \d+ old outputs$/); // the valve reason is in the expanded transcript view
 	});
 
 	test("above V but the plan would cut under 50% (the bulk is a protected, non-re-readable result): nothing is edited, at the first request or at turn_end", async () => {
@@ -584,7 +584,7 @@ describe("I6 / F10 warm cache: nothing changes unless the context passes the val
 		expect(await first.fire("context_with_system", { messages: flat(session(3)) })).toBeUndefined();
 		const te = await first.fire("turn_end", turnEnd([...entries, A("zN")], "zN"));
 		expect(te.entries.filter((e: Any) => e.type === "context_edit").length).toBe(79);
-		expect(first.notes[0]).toContain("context over the warm-cache limit");
+		expect(first.notes[0]).toMatch(/^pi-zip  [\d.]+K → [\d.]+K  folded \d+ old outputs$/);
 	});
 });
 
@@ -733,11 +733,21 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		await sleep(5);
 		const kept = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
 		expect(kept).toHaveLength(1);
-		expect(kept[0].data.text).toMatch(/^pi-zip · folded \d+ old outputs/);
+		expect(kept[0].data.text).toMatch(/^pi-zip  [\d.]+K → [\d.]+K  folded \d+ old outputs$/);
+		expect(kept[0].data).toMatchObject({ v: 2, first: true });
+		expect(kept[0].data.items.length).toBeGreaterThan(0);
+		expect(kept[0].data.items[0].handle).toMatch(/^[0-9a-z]{10}$/);
 		expect(r.notes).toHaveLength(0); // not also a status line
-		const line = renderers.get("pi-zip/notice")({ data: kept[0].data }, { expanded: false }, { fg: (_c: string, t: string) => t }).render(30);
-		expect(line).toHaveLength(1);
-		expect(line[0].length).toBeLessThanOrEqual(30);
+		const comp = renderers.get("pi-zip/notice")({ data: kept[0].data }, { expanded: false }, { fg: (_c: string, t: string) => t });
+		const line = comp.render(30);
+		expect(line).toEqual([expect.stringMatching(/^▸ pi-zip  [\d.]+K → [\d.]+K$/)]); // 30 columns: words, bar and the "originals are kept" line drop
+		const wide = comp.render(200);
+		expect(wide[0]).toMatch(/^▸ pi-zip  [\d.]+K → [\d.]+K  [▰▱]{10}  folded \d+ old outputs$/);
+		expect(wide[1]).toContain("originals are kept");
+		const ex = renderers.get("pi-zip/notice")({ data: kept[0].data }, { expanded: true }, { fg: (_c: string, t: string) => t }).render(200);
+		expect(ex.length).toBeGreaterThan(3);
+		expect(ex.join("\n")).toContain(kept[0].data.items[0].handle);
+
 	});
 
 	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {

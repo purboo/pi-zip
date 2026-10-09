@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } from "./cache.ts";
 import { describe, lawPrices, loadStats, pWarm, record, sample, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
-import { fmtK, Stats, noticeText, type NoticeAction, type ZipControl } from "./notice.ts";
+import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, untouchedEst, type Block, type Calibration, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
@@ -16,6 +16,7 @@ import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
 export const STEER_CUSTOM = "pi-zip/steer";
+const fmtAway = (s: number) => (s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(Math.round(s / 360) / 10).toFixed(1)} h`);
 export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export const UNUSED_SUMMARY_CUSTOM = "pi-zip/unused-summary"; // a background summary nobody adopted: its cost, so the session totals stay honest
 export const AWAY_FRACTION = 0.8; // the away-timer fires this far into the cache lifetime
@@ -98,6 +99,8 @@ export class Zip implements ZipControl {
 	recallOk = true;
 	/** index.ts registered the transcript renderer for NOTICE_CUSTOM (Pi versions without registerEntryRenderer fall back to a status line). */
 	entryRenderer = false;
+	private coldWhy = ""; // the expanded notice's "why now" for this run
+	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
 	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
 	summarizedWarm = false;
 	setRecallOk(ok: boolean) {
@@ -116,13 +119,13 @@ export class Zip implements ZipControl {
 
 	/** keep = a fold/summary notice: written to the session as a custom entry, so it stays in the transcript (also after a restart)
 	 *  next to Pi's own "[compaction]" block instead of a status line the next status overwrites. Custom entries never reach the model. */
-	private notify(ctx: Any, text: string, keep = false) {
+	private notify(ctx: Any, text: string, keep?: NoticeData) {
 		this.stats.notices++;
 		this.ledger({ type: "notice", text });
 		if (keep && ctx?.mode === "tui" && this.entryRenderer) {
 			setTimeout(() => { // after Pi has appended this turn's edits
 				try {
-					this.pi.appendEntry(NOTICE_CUSTOM, { text });
+					this.pi.appendEntry(NOTICE_CUSTOM, keep);
 				} catch {}
 			}, 0);
 			return;
@@ -256,6 +259,7 @@ export class Zip implements ZipControl {
 		this.survSrc = src;
 		this.runChecked = false; // the first request decides (cold: the cold plan; warm: only above the cap, if the law fires)
 		this.coldReason = reason;
+		this.coldWhy = src === "model switch" ? "model switched: its cache starts empty, so this request rewrites it anyway" : cold && gapS !== null ? `cache cold (away ${fmtAway(gapS)}): this request rewrites it anyway, so editing is free` : "";
 		for (const h of recalledHandlesFromBranch(branch)) this.recalled.add(h);
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const en = branch[i];
@@ -578,7 +582,14 @@ export class Zip implements ZipControl {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
 			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
 		}
-		if (notices.length && !this.quiet) this.notify(ctx, noticeText(notices), true);
+		if (notices.length && !this.quiet) {
+			const ITEMS = 8;
+			const items = live.slice(0, ITEMS).map((t) => ({ label: `${t.tool}${t.args ? " " + t.args : ""}`, turn: byId.get(t.entryId)?.userTurn, tokens: Math.round(k * t.entryTokens), handle: handleFor(t.entryId) }));
+			const why = valve ? "cache still warm, but the context passed the warm-cache limit" : this.cold ? this.coldWhy : "cache warm: the reads saved pay for the rewrite";
+			const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM) };
+			this.noticed = true;
+			this.notify(ctx, data.text, data);
+		}
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}
 
