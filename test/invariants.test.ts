@@ -152,7 +152,9 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		const req = await comeBack(r, settled, COLD_TS());
 		expect(req.messages[0].role).toBe("compactionSummary");
 		expect(st.calls).toBe(1); // adopted, not rebuilt
-		await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		const te = await r.fire("turn_end", turnEnd([...back, A("a6")], "a6"));
+		const base = r.ctx.sessionManager.getBranch();
+		r.ctx.sessionManager.getBranch = () => [...base, ...te.entries]; // what Pi persists
 		expect(r.notes.at(-1)).toMatch(/summarized 2 requests · [\d.]+K → [\d.]+K tokens · [\d.]+ s \(done while you were away\)/);
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("1 summary");
@@ -206,6 +208,9 @@ describe("F12 summary prepared while the user is away (timer at 0.8 x TTL)", () 
 		process.env.PI_ZIP_COLD_CAP = "200000"; // ~100K tokens, now below the cap: a warm cache is never edited
 		const req = await comeBack(r, settled, Date.now());
 		expect(req).toBeUndefined();
+		await sleep(0);
+		const base = r.ctx.sessionManager.getBranch();
+		r.ctx.sessionManager.getBranch = () => [...base, ...r.appended]; // the unused summary's cost is booked in the session
 		await r.handlers.get("cmd:zip").handler("stats", r.ctx);
 		expect(r.notes.at(-1)).toContain("$0.0200");
 		expect(st.calls).toBe(1);

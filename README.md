@@ -61,8 +61,8 @@ The cold cap is kept below Pi's own compaction trigger (window minus `compaction
 
 | Command | Effect |
 |---|---|
-| `/zip status` | on / off / paused, cache TTL, totals |
-| `/zip stats` | tokens folded, estimated $ saved versus doing nothing, summaries, recalls |
+| `/zip status` | on / off / paused, cache TTL, what this session has folded, summarised and recalled, learned cache survival |
+| `/zip stats` | this session's folds (with tokens removed), summaries and recalls; persisted in the session, so a restart does not reset them |
 | `/zip off` | strict no-op: no folds, no summaries, requests left untouched (earlier folds stay recallable) |
 | `/zip on` | resume |
 | `/zip quiet` | toggle the per-turn notice (folding continues) |
@@ -109,9 +109,9 @@ The guard has two parts. Before saving a fold or a summary it checks that the ed
 
 ## FAQ
 
-**Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm it edits only when the inequality above says the rewrite pays back (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip stats` shows an estimate based on the model's declared prices: avoided cache writes and reads, minus summary calls, minus the cost of content you recalled. It is an estimate (token counts are chars/4, scaled by the calibration above), and it can be negative.
+**Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm it edits only when the inequality above says the rewrite pays back (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip stats` shows what this session has folded (and roughly how many tokens that removed), its summaries with what their model calls cost, and its recalls. The numbers live in the session file, so a restart does not reset them.
 
-**Does it cost extra?** Planning is free. A summary is one extra model call (the current model, no tools, no prompt cache), shown in `/zip stats`. A background summary you never use (you came back while the cache was warm) is counted too. Recalled content re-enters the context at normal prices.
+**Does it cost extra?** Planning is free. A summary is one extra model call (the current model, no tools, no prompt cache), shown in `/zip stats`. A background summary you never use (you came back while the cache was warm) is counted there too. Recalled content re-enters the context at normal prices.
 
 **Can the model lose information?** Folded outputs are replaced by a placeholder with key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your requests verbatim and never paraphrase the model's reasoning. If the model ignores the handle and guesses, that is a model failure pi-zip cannot catch; this is why only re-readable outputs of the previous turn are folded at a cold return; other outputs of the protected turns wait until they are 60 requests old.
 

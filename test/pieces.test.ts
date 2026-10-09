@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { repairPayload } from "../src/guard.ts";
 import { cacheTtlMs, detectCold, isColdByTtl, observedTier } from "../src/cache.ts";
 import { classifyRecoverability, isReadOnlyBash } from "../src/classify.ts";
-import { fmtK, noticeText, Stats, statsText, type NoticeAction } from "../src/notice.ts";
+import { fmtK, noticeText, type NoticeAction } from "../src/notice.ts";
 import { clipMid, handleFor, makePlaceholder, makePlaceholderFor, outcomeHint, pickKeyLines, shortArgs } from "../src/placeholder.ts";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { A, type Any, R, U } from "./helpers.ts";
@@ -546,30 +546,6 @@ describe("notices and stats", () => {
 		expect(merged).toContain("waited 8.4 s");
 		expect(noticeText([{ ...fold, count: 1, ms: 4.44 }])).toContain("folded 1 old output · ");
 	});
-	test("honest stats: avoided writes and reads, minus summary calls, recalls and pressure rewrites", () => {
-		const s = new Stats();
-		s.writeSavedTokens = 100_000;
-		s.readSavedTokens = 1_000_000;
-		s.summaryUsd = 0.05;
-		s.recallChars = 40_000; // ~10K tokens re-entering the context at the write price
-		s.pressureRewriteTokens = 100_000;
-		const p = { cacheWrite: 3.75, cacheRead: 0.3 };
-		// 100K*3.75 + 1M*0.3 = 0.675 ; - 0.05 - 10K*3.75 (0.0375) - 100K*(3.75-0.3) (0.345) = 0.2425
-		expect(s.savedUsd(p)).toBeCloseTo(0.2425, 6);
-		expect(s.savedUsd(null)).toBeNull();
-		s.folds = 3; s.foldedTokens = 50_000; s.recalls = 2;
-		const txt = statsText(s, { cost: { cacheWrite: 3.75, cacheRead: 0.3 } });
-		expect(txt).toContain("folded 3 outputs (50K tokens)");
-		expect(txt).toContain("2 recalls");
-		expect(txt).toContain("$0.24,");
-		expect(statsText(new Stats(), {})).toContain("n/a");
-	});
-	test("recalling costs more than it saved is reported as a loss, not hidden", () => {
-		const s = new Stats();
-		s.writeSavedTokens = 1000;
-		s.recallChars = 400_000;
-		expect(s.savedUsd({ cacheWrite: 3.75, cacheRead: 0.3 })!).toBeLessThan(0);
-	});
 });
 
 test("token estimate follows Pi's chars/4 rules", () => {
@@ -584,13 +560,13 @@ describe("/zip status after a restart", async () => {
 	const { fakeCtx, fakePi } = await import("./helpers.ts");
 	test("reports what the session carries (folds and summaries persisted in its file), not only this process's counters", () => {
 		const ph = (id: string) => ({ type: "context_edit", targetId: id, replacement: { content: [{ type: "text", text: `[folded by pi-zip · bash ls · handle ${id}]` }] } });
-		const branch = [ph("a"), ph("b"), ph("c"), { type: "context_edit", targetId: "x", replacement: { content: [{ type: "text", text: "someone else" }] } }, { type: "compaction", summary: "s", details: { by: "pi-zip" } }, { type: "compaction", summary: "pi", details: {} }];
-		const zip = new Zip(fakePi().pi);
+		const out = (id: string) => ({ type: "message", id, message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "x".repeat(40_000) }] } });
+		const recall = { type: "message", id: "rc", message: { role: "toolResult", toolName: "zip_recall", content: [{ type: "text", text: "y" }] } };
+		const branch = [out("a"), out("b"), out("c"), ph("a"), ph("b"), ph("c"), recall, { type: "context_edit", targetId: "x", replacement: { content: [{ type: "text", text: "someone else" }] } }, { type: "compaction", summary: "s", details: { by: "pi-zip" } }, { type: "compaction", summary: "pi", details: {} }];
+		const zip = new Zip(fakePi().pi); // a fresh process: its own counters are all 0
 		const { ctx } = fakeCtx([], { branch });
-		const s = zip.status(ctx);
-		expect(s).toContain("since pi started: folded 0 outputs, 0 summaries");
-		expect(s).toContain("this session so far: 3 folded outputs, 1 summary");
-		expect(zip.statsLine(ctx)).toContain("this session so far: 3 folded outputs, 1 summary");
-		expect(zip.status()).not.toContain("this session");
+		expect(zip.status(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
+		expect(zip.status(ctx)).not.toContain("since pi started");
+		expect(zip.statsLine(ctx)).toContain("this session: 3 folded outputs (~30K tokens), 1 summary, 1 recall");
 	});
 });
