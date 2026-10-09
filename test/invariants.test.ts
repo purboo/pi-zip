@@ -33,6 +33,7 @@ const turnEnd = (all: Any[], lastId: string, turnIndex = 0) => ({
 });
 const norm = (ms: Any[]) => JSON.stringify(ms.map((m) => (m.role === "compactionSummary" ? { ...m, timestamp: 0, tokensBefore: 0 } : m)));
 
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 // ---- deterministic random sessions --------------------------------------------------------------------------
 function prng(seed: number) {
 	let s = seed >>> 0;
@@ -719,6 +720,24 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		expect(fold.count).toBe(expected.length);
 		expect(new Set(fold.trigs)).toEqual(new Set(["cold(inturn)"]));
 		rmSync(ledger, { force: true });
+	});
+
+	test("the fold notice stays in the transcript: a custom entry with its own renderer, not a status line", async () => {
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const renderers = new Map<string, Any>();
+		const entries = session();
+		const r = await rig(entries, COLD_TS(), {}, { registerEntryRenderer: (t: string, fn: Any) => renderers.set(t, fn) });
+		await r.fire("before_agent_start", {});
+		await r.fire("context_with_system", { messages: flat(entries) });
+		await r.fire("turn_end", turnEnd([...entries, ...tail, A("a63")], "a63", 1));
+		await sleep(5);
+		const kept = r.appended.filter((x: Any) => x.customType === "pi-zip/notice");
+		expect(kept).toHaveLength(1);
+		expect(kept[0].data.text).toMatch(/^pi-zip · folded \d+ old outputs/);
+		expect(r.notes).toHaveLength(0); // not also a status line
+		const line = renderers.get("pi-zip/notice")({ data: kept[0].data }, { expanded: false }, { fg: (_c: string, t: string) => t }).render(30);
+		expect(line).toHaveLength(1);
+		expect(line[0].length).toBeLessThanOrEqual(30);
 	});
 
 	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {

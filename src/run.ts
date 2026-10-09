@@ -16,6 +16,7 @@ import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
 export const STEER_CUSTOM = "pi-zip/steer";
+export const NOTICE_CUSTOM = "pi-zip/notice"; // a fold/summary notice kept in the transcript (rendered by index.ts, never sent to the model)
 export const UNUSED_SUMMARY_CUSTOM = "pi-zip/unused-summary"; // a background summary nobody adopted: its cost, so the session totals stay honest
 export const AWAY_FRACTION = 0.8; // the away-timer fires this far into the cache lifetime
 // Other context managers rewrite the view too (F14); two writers give unpredictable results, so we pause and keep only the Guard.
@@ -95,6 +96,8 @@ export class Zip implements ZipControl {
 
 	/** zip_recall declared to the model? Checked at session start and before every run (index.ts); a `--tools` allowlist hides it. */
 	recallOk = true;
+	/** index.ts registered the transcript renderer for NOTICE_CUSTOM (Pi versions without registerEntryRenderer fall back to a status line). */
+	entryRenderer = false;
 	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
 	summarizedWarm = false;
 	setRecallOk(ok: boolean) {
@@ -111,9 +114,19 @@ export class Zip implements ZipControl {
 		} catch {}
 	}
 
-	private notify(ctx: Any, text: string) {
+	/** keep = a fold/summary notice: written to the session as a custom entry, so it stays in the transcript (also after a restart)
+	 *  next to Pi's own "[compaction]" block instead of a status line the next status overwrites. Custom entries never reach the model. */
+	private notify(ctx: Any, text: string, keep = false) {
 		this.stats.notices++;
 		this.ledger({ type: "notice", text });
+		if (keep && ctx?.mode === "tui" && this.entryRenderer) {
+			setTimeout(() => { // after Pi has appended this turn's edits
+				try {
+					this.pi.appendEntry(NOTICE_CUSTOM, { text });
+				} catch {}
+			}, 0);
+			return;
+		}
 		if (ctx?.ui?.notify && (ctx.mode === "tui" || ctx.mode === "rpc")) {
 			try {
 				ctx.ui.notify(text, "info");
@@ -565,7 +578,7 @@ export class Zip implements ZipControl {
 			const prepared = plan.source === "settle" && waitMs < 500; // finished while the user was away: report the real production time, not the zero wait
 			notices.push({ kind: "summary", count: cut.count, tokensBefore: ctxTokens - (before - after), tokensAfter: ctxTokens - (before - after) - cutSaved, ms: prepared ? cut.ms : waitMs, prepared, pressure: valve });
 		}
-		if (notices.length && !this.quiet) this.notify(ctx, noticeText(notices));
+		if (notices.length && !this.quiet) this.notify(ctx, noticeText(notices), true);
 		return { entries: [...e.entries, ...ours] }; // append, never overwrite other extensions' drafts
 	}
 
