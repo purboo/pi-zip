@@ -5,6 +5,7 @@ import { type NoticeData, registerZipCommand, renderNotice } from "./notice.ts";
 import { RECALL_TOOL } from "./placeholder.ts";
 import { registerRecallTool } from "./recall.ts";
 import { NOTICE_CUSTOM, Zip } from "./run.ts";
+import { markFirstLine, measure, renderCard, renderState, setMeasure } from "./ui.ts";
 
 export default function piZip(pi: ExtensionAPI) {
 	if (process.env.PI_ZIP_OFF === "1") return; // test only: behave exactly as if not installed (registers nothing)
@@ -12,20 +13,22 @@ export default function piZip(pi: ExtensionAPI) {
 	registerRecallTool(pi, zip); // stays registered even when off: earlier folds must stay recallable, and a tool-list change would bust the cache
 	registerZipCommand(pi, zip);
 	try {
-		// fold/summary notices stay in the transcript as one dim line (a custom entry: never part of the model's context)
-		let vw: (s: string) => number = (s) => s.length;
+		// Everything pi-zip shows lives in the transcript as custom entries (never part of the model's context): fold/summary
+		// notices, state lines and the /zip status card. Widths are measured with Pi's own pi-tui once it has loaded.
 		import("@earendil-works/pi-tui").then((m: Any) => {
-			if (typeof m?.visibleWidth === "function") vw = m.visibleWidth;
+			if (typeof m?.visibleWidth === "function" && typeof m?.truncateToWidth === "function")
+				setMeasure({ vw: m.visibleWidth, cut: (s: string, w: number) => (m.visibleWidth(s) <= w ? s : w <= 0 ? "" : m.truncateToWidth(s, w, "…")) });
 		}, () => {});
 		pi.registerEntryRenderer?.(NOTICE_CUSTOM, (entry: Any, o: Any, theme: Any) => {
 			const d = entry?.data;
 			if (!d?.text) return undefined;
-			const data: NoticeData = d.v === 2 ? d : { v: 2, text: d.text, before: 0, after: 0, desc: "" };
 			return {
 				render: (width: number) => {
-					if (d.v !== 2) return [theme.fg("dim", vw(d.text) > width ? d.text.slice(0, Math.max(0, width - 1)) + "…" : d.text)];
 					try {
-						return renderNotice(data, !!o?.expanded, width, theme, vw);
+						if (d.v !== 2) return [theme.fg("dim", measure.cut(d.text, width))];
+						if (d.kind === "state") return renderState(d.word, d.reason ?? "", width, theme, measure);
+						if (d.kind === "card" && d.card) return renderCard(d.card, width, theme, measure);
+						return renderNotice(d as NoticeData, !!o?.expanded, width, theme, measure.vw);
 					} catch {
 						return [];
 					}
@@ -34,25 +37,56 @@ export default function piZip(pi: ExtensionAPI) {
 			};
 		});
 		zip.entryRenderer = typeof pi.registerEntryRenderer === "function";
+		// a folded output keeps its place in the transcript; its call row gets a dim "▸ folded · <handle>" on the right
+		pi.registerToolRenderer?.((toolName: string, next: () => Any) => {
+			const base = next();
+			if (toolName === RECALL_TOOL || typeof base?.renderCall !== "function") return base;
+			return {
+				...base,
+				renderCall: (args: Any, theme: Any, c: Any) => {
+					const comp = base.renderCall(args, theme, c);
+					const id = c?.toolCallId;
+					if (!comp || typeof comp.render !== "function" || typeof id !== "string") return comp;
+					return new Proxy(comp, {
+						get(t, p, r) {
+							if (p !== "render") return Reflect.get(t, p, r);
+							return (width: number) => {
+								const lines = t.render(width);
+								const h = zip.foldedHandle(id);
+								try {
+									return h ? markFirstLine(lines, h, width, theme, measure) : lines;
+								} catch {
+									return lines;
+								}
+							};
+						},
+					});
+				},
+			};
+		});
 	} catch {
 		/* older Pi: notices fall back to the status line */
 	}
 	// A tool allowlist (`pi --tools read,bash`, sub-agent launchers) replaces the whole selection and Pi then does not even register
 	// zip_recall; folds of outputs the model could not get back would be lost, so only rereadable outputs fold then (plan rereadOnly).
-	const checkRecall = () => {
+	const checkRecall = (ctx: Any) => {
 		try {
 			const active = pi.getActiveTools?.();
-			if (Array.isArray(active)) zip.setRecallOk(active.includes(RECALL_TOOL));
+			if (Array.isArray(active)) zip.setRecallOk(active.includes(RECALL_TOOL), ctx);
 		} catch {
 			/* never in the way */
 		}
 	};
 	pi.on("session_start", (_e, ctx) => {
-		checkRecall();
-		return zip.sessionStart(ctx);
+		const r = zip.sessionStart(ctx);
+		checkRecall(ctx);
+		zip.refreshFolded(ctx);
+		zip.welcome(ctx);
+		return r;
 	});
 	pi.on("before_agent_start", (_e, ctx) => {
-		checkRecall();
+		checkRecall(ctx);
+		zip.refreshFolded(ctx); // the branch may have changed (/tree, fork)
 		return zip.beforeAgentStart(ctx);
 	});
 	pi.on("context_with_system", (e, ctx) => zip.context(e, ctx)); // the complete transcript: system messages stay where Pi put them

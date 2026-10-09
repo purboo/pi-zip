@@ -53,7 +53,41 @@ The second line appears once per session. Expand tool output (ctrl+o) to see why
           … 10 more
 ```
 
-These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it. Recalls show up as ordinary `zip_recall` tool calls.
+These lines are saved in the session, so they are still there after a restart, but they are never sent to the model. On narrow terminals the words go first, then the bar; the numbers always stay. A summary still shows up as Pi's own `[compaction]` block as well; the pi-zip line next to it tells you who made it.
+
+Everything else pi-zip shows uses the same one-line grammar, and only when something changed:
+
+```
+▸ pi-zip  on  folds old tool output after the prompt cache expires (5 min here) · nothing to set up · /zip for status
+▸ pi-zip  reread-only  a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall to fold more
+▸ pi-zip  paused  billion-context also manages context, so pi-zip only guards requests · to use pi-zip: pi remove the other one
+```
+
+The first one appears once per machine. A folded output keeps its place in the transcript; its tool row gets a dim mark on the right, so you can see what the model no longer sees in full:
+
+```
+ $ npm test                                                              ▸ folded · k3x9q2m7ab
+```
+
+A recall is one quiet row (ctrl+o shows the recalled text):
+
+```
+ ↺ recall k3x9q2m7ab  grep "Expected"
+ bash npm test · turn 1  3 of 812 lines
+```
+
+While a summary started in the background is being finished, Pi's working line says so (Esc skips the wait). `/zip` prints a small card into the transcript:
+
+```
+▸ pi-zip  on
+  cache    anthropic/claude-sonnet-5-5 · explicit · lives ~5 min (declared)
+  alive    ██████▁▁▁▁▁▁▁▁▁▁  30 s → 2 h
+  session  56 folds ~310K  ·  2 summaries $0.41  ·  3 recalls
+  last     10:50  folded 12 old outputs · cache cold (away 47 min): this request rewrites it anyway, so editing is free
+  mode     full (zip_recall available)
+```
+
+`alive` is what pi-zip currently believes about the cache: how likely it is to be still warm after 30 s, 1 min, … 2 h away, learned from the provider's replies (see below).
 
 ## The three rules
 
@@ -61,11 +95,11 @@ These lines are saved in the session, so they are still there after a restart, b
 2. **Edit only when the cache is already gone.** Provider prompt caches expire (the model's declared TTL, usually minutes). Changing the context while the cache is warm means paying to rewrite it; changing it after it expired is free, because the whole context is rewritten anyway, and a smaller context makes that rewrite cheaper. So when you come back after the TTL (or after switching model, or when the session was last touched longer ago than the TTL), pi-zip folds old outputs down to about 40K real tokens in one step, and every request of that turn sends the same bytes. While the cache is warm it does nothing, with one exception, the warm valve: above the 40K target it applies that plan, minus the previous user turn (a warm edit never folds the turn you just finished, except when you come back after the declared TTL: there the previous turn is eligible exactly as at a cold return, so a provider whose cache outlives its TTL does not keep it at every return), when the edit pays for the rewrite it causes, and never on the request right after an edited one (no back-to-back warm rewrites). That is one inequality, r Δ²/(2g) + η Δ ≥ K with K = (w − r)(P T − (1 − P) Δ): the reads the removed Δ tokens would cost while the context grows back at g tokens per request (measured in the session), plus, near Pi's compaction trigger, what Pi would charge for the same room (η), against the rewrite of the T = A tokens left after the edit (pricing only the suffix after the earliest edit fires warm edits earlier and lost quality in the offline evaluation; the suffix is logged as `Tsuf` for measurement). r and w are the read and rewrite price ratios of the cache class, never the model's price table: explicit write premium 0.1 / 1.25 x input (2 x on the 1-hour tier), automatic prefix cache 0.2 / 1 x input; the class is read from the provider's usage reports, and until the first response the old fixed rule applies. P is the probability that the cache is still warm. A cold return is P = 0, so K < 0 and it always fires; a single small fold never pays at a warm cache, a large one does.
 3. **Never in the way.** Planning is local and takes milliseconds. Anything that needs a model call (a summary, only when folding is not enough and the same inequality prices the extra model call in) is prepared while you are away: if the cache is about to expire (0.8 x its lifetime after your last request) and you have not come back, a background timer writes the summary with a separate, uncached call. The timer is cancelled the moment you send a prompt. If you return before the summary finishes, only the remaining time is waited, Esc stops the waiting, and the notice says so. If you return while the cache is still warm and the valve does not fire, the prepared summary is discarded (its cost is still counted). In non-interactive modes (`-p`, `--mode json`) nothing is ever started in the background: a cold return that needs a summary computes it right then.
 
-**The cache lifetime is learned, not configured.** Every response says how much of the prompt came from the cache. pi-zip compares that read with what the request re-sent unchanged (the previous prompt, or the untouched prefix before one of its own edits: on an automatic prefix cache every edit leaves the first 8K tokens alone, so even the response right after a fold says whether the cache survived) and so learns, per provider and model, whether the cache survived a gap of that length: a few counts per gap bin (30 s to 90 min, with bin edges on the 5-minute and 1-hour tiers), monotone in the gap, older evidence halved after 16 newer observations of the same bin, stored without any content in `~/.pi/agent/pi-zip/cache-survival.json`. Before any evidence the model's declared TTL decides, exactly as before (300 s when it declares none; too short a guess is cheaper than too long); beyond it one clean read overrides it, inside it a lone miss counts as noise (warm caches do miss now and then) and only repeated misses do. A GLM cache read in full after 365 s makes the next 365 s return warm; a Claude 5-minute cache that read nothing after 360 s stays dead. Whether the provider bills cache writes (explicit cache) or not (automatic prefix cache) is read from the first response too. `/zip status` shows the class, its price ratios, and the learned survival per bin with its sample count.
+**The cache lifetime is learned, not configured.** Every response says how much of the prompt came from the cache. pi-zip compares that read with what the request re-sent unchanged (the previous prompt, or the untouched prefix before one of its own edits: on an automatic prefix cache every edit leaves the first 8K tokens alone, so even the response right after a fold says whether the cache survived) and so learns, per provider and model, whether the cache survived a gap of that length: a few counts per gap bin (30 s to 90 min, with bin edges on the 5-minute and 1-hour tiers), monotone in the gap, older evidence halved after 16 newer observations of the same bin, stored without any content in `~/.pi/agent/pi-zip/cache-survival.json`. Before any evidence the model's declared TTL decides, exactly as before (300 s when it declares none; too short a guess is cheaper than too long); beyond it one clean read overrides it, inside it a lone miss counts as noise (warm caches do miss now and then) and only repeated misses do. A GLM cache read in full after 365 s makes the next 365 s return warm; a Claude 5-minute cache that read nothing after 360 s stays dead. Whether the provider bills cache writes (explicit cache) or not (automatic prefix cache) is read from the first response too. `/zip status` shows the class, the lifetime it currently believes, and the learned survival as the `alive` row.
 
 Protected from folding: the current user turn and the previous one. When the context is above the target, re-readable outputs of the previous turn (an unchanged file, a read-only command) can still be folded at a cold return or at any return after the declared TTL (never on a warm request inside it), and any output in either turn can be folded once it is 60 assistant requests old (so a long agent run that is a single user turn with hundreds of tool calls is not exempt from folding; the newest 59 requests' outputs always stay, and every fold stays recallable). Messages you type while the agent is running (steering, follow-up) belong to that turn and do not start a new one. Outputs you have already recalled, and `zip_recall` results themselves, are never folded again. "Read-only" is a conservative whitelist: `find -delete` or `-exec`, command substitution, redirects, background jobs, `git diff --output` and the like are not.
 
-**Token counts are calibrated, not guessed.** Sizes are estimated as chars/4, which undercounts real tokens (typically by about 1.7x in coding sessions). So the cold cap, the compaction room and the law's token counts are all compared against `k` x the estimate, where `k` = real tokens / estimated tokens for the newest assistant message that reports usage (input + cache read + cache write, over the estimate of the context that request carried; clamped to 1 to 2.5). `k` is read from the session itself on every decision, so a restart, `pi -p` or a resumed session calibrates exactly like a long-lived one, and nothing extra is stored. With no usage to read (a brand-new session, or a provider that reports none) `k` is 1.7. Sizes in the notices, `/zip stats` and the ledger use the same scale.
+**Token counts are calibrated, not guessed.** Sizes are estimated as chars/4, which undercounts real tokens (typically by about 1.7x in coding sessions). So the cold cap, the compaction room and the law's token counts are all compared against `k` x the estimate, where `k` = real tokens / estimated tokens for the newest assistant message that reports usage (input + cache read + cache write, over the estimate of the context that request carried; clamped to 1 to 2.5). `k` is read from the session itself on every decision, so a restart, `pi -p` or a resumed session calibrates exactly like a long-lived one, and nothing extra is stored. With no usage to read (a brand-new session, or a provider that reports none) `k` is 1.7. Sizes in the notices, `/zip status` and the ledger use the same scale.
 
 The cold cap is kept below Pi's own compaction trigger (window minus `compaction.reserveTokens`), so on small windows Pi's lossy compaction does not get there first.
 
@@ -73,13 +107,12 @@ The cold cap is kept below Pi's own compaction trigger (window minus `compaction
 
 | Command | Effect |
 |---|---|
-| `/zip status` | on / off / paused, cache TTL, what this session has folded, summarised and recalled, learned cache survival |
-| `/zip stats` | this session's folds (with tokens removed), summaries and recalls; persisted in the session, so a restart does not reset them |
+| `/zip` or `/zip status` | the card above: state, cache class and lifetime, learned survival, this session's folds, summaries and recalls (counted from the session, so a restart does not reset them) |
 | `/zip off` | strict no-op: no folds, no summaries, requests left untouched (earlier folds stay recallable) |
 | `/zip on` | resume |
 | `/zip quiet` | toggle the per-turn notice (folding continues) |
 
-`off` and `quiet` are remembered per session.
+`off` and `quiet` are remembered per session; each change is one line in the transcript. In `-p` / json mode `/zip status` prints plain text to stderr.
 
 ## Recall
 
@@ -121,9 +154,9 @@ The guard has two parts. Before saving a fold or a summary it checks that the ed
 
 ## FAQ
 
-**Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm it edits only when the inequality above says the rewrite pays back (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip stats` shows what this session has folded (and roughly how many tokens that removed), its summaries with what their model calls cost, and its recalls. The numbers live in the session file, so a restart does not reset them.
+**Will it save money?** Mostly on cold returns, which is where a long session pays for a full cache rewrite. While the cache is warm it edits only when the inequality above says the rewrite pays back (large contexts, near Pi's compaction trigger, outputs 60+ requests old). `/zip status` shows what this session has folded (and roughly how many tokens that removed), its summaries with what their model calls cost, and its recalls. The numbers live in the session file, so a restart does not reset them.
 
-**Does it cost extra?** Planning is free. A summary is one extra model call (the current model, no tools, no prompt cache), shown in `/zip stats`. A background summary you never use (you came back while the cache was warm) is counted there too. Recalled content re-enters the context at normal prices.
+**Does it cost extra?** Planning is free. A summary is one extra model call (the current model, no tools, no prompt cache), shown in `/zip status`. A background summary you never use (you came back while the cache was warm) is counted there too. Recalled content re-enters the context at normal prices.
 
 **Can the model lose information?** Folded outputs are replaced by a placeholder with key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your requests verbatim and never paraphrase the model's reasoning. If the model ignores the handle and guesses, that is a model failure pi-zip cannot catch; this is why only re-readable outputs of the previous turn are folded at a cold return; other outputs of the protected turns wait until they are 60 requests old.
 

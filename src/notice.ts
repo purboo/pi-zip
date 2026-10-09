@@ -1,6 +1,7 @@
 // User-facing text (F15, F16): one notice line per turn, honest stats, the /zip command. Notices never enter model context.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type Any, PRODUCT } from "./util.ts";
+import type { CardData, StateWord } from "./ui.ts";
 
 export interface NoticeAction {
 	kind: "fold" | "summary";
@@ -23,6 +24,10 @@ export interface NoticeItem {
 /** What a transcript notice stores (custom entry data; never sent to the model). `text` is the plain one-line form (status-line fallback, ledger). */
 export interface NoticeData {
 	v: 2;
+	kind?: "state" | "card"; // absent: a fold/summary notice
+	word?: StateWord;
+	reason?: string;
+	card?: CardData;
 	text: string;
 	before: number;
 	after: number;
@@ -118,6 +123,9 @@ export class Stats {
 
 export interface ZipControl {
 	status(ctx?: Any): string;
+	card?(ctx?: Any): CardData;
+	/** Show a /zip result in the transcript; false = no transcript surface here (print/json/rpc or an older Pi). */
+	show?(ctx: Any, data: NoticeData): boolean;
 	statsLine(ctx?: Any): string;
 	setOff(off: boolean): string;
 	toggleQuiet(): string;
@@ -125,16 +133,25 @@ export interface ZipControl {
 
 export function registerZipCommand(pi: ExtensionAPI, zip: ZipControl) {
 	pi.registerCommand("zip", {
-		description: `${PRODUCT}: status | stats | off | on | quiet`,
+		description: `${PRODUCT}: status | off | on | quiet`,
 		handler: async (args: string, cctx: Any) => {
 			const sub = (args ?? "").trim().toLowerCase() || "status";
+			if ((sub === "status" || sub === "stats") && zip.card && zip.show) {
+				const card = zip.card(cctx);
+				if (zip.show(cctx, { v: 2, kind: "card", card, text: zip.status(cctx), before: 0, after: 0, desc: "" })) return;
+			}
 			const text =
 				sub === "status" ? zip.status(cctx)
 				: sub === "stats" ? zip.statsLine(cctx)
 				: sub === "off" ? zip.setOff(true)
 				: sub === "on" ? zip.setOff(false)
 				: sub === "quiet" ? zip.toggleQuiet()
-				: `${PRODUCT}: unknown subcommand "${sub}" (use status | stats | off | on | quiet)`;
+				: `${PRODUCT}: unknown subcommand "${sub}" (use status | off | on | quiet)`;
+			if (zip.show && (sub === "off" || sub === "on" || sub === "quiet")) {
+				const word: StateWord = sub === "quiet" ? (/notices off/.test(text) ? "quiet" : "notices on") : sub;
+				const reason = text.replace(/^pi-zip: (off|on)\.? ?/, "").replace(/^pi-zip: /, "");
+				if (zip.show(cctx, { v: 2, kind: "state", word, reason: reason || "folding resumes", text, before: 0, after: 0, desc: "" })) return;
+			}
 			if (cctx?.ui?.notify && (cctx.mode === "tui" || cctx.mode === "rpc")) {
 				try {
 					cctx.ui.notify(text);

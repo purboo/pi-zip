@@ -1,6 +1,7 @@
 // zip_recall (F3): exact, batched retrieval of folded originals from the session file (I2).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { handleFor, RECALL_TOOL } from "./placeholder.ts";
+import { handleFor, RECALL_TOOL, shortArgs } from "./placeholder.ts";
+import { measure, recallCallLine, recallResultLines, type RecallSectionInfo } from "./ui.ts";
 import { type Any, clamp, textOf } from "./util.ts";
 
 const RECALL_PAGE_CHARS = 20_000; // default page
@@ -101,34 +102,50 @@ export interface RecallItem {
 	handle: string;
 	text: string | null;
 	tool: string | null;
+	label?: string; // tool + short args of the call that produced it (transcript only)
+	turn?: number;
 }
 
-export function recallSections(items: RecallItem[], opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown }): { text: string; ok: number; missing: number } {
+export function recallSections(items: RecallItem[], opts: { grep?: string; range?: string; offset?: unknown; limit?: unknown }): { text: string; ok: number; missing: number; sections: RecallSectionInfo[] } {
 	const parts: string[] = [];
+	const sections: RecallSectionInfo[] = [];
 	let ok = 0;
 	let missing = 0;
 	for (const it of items) {
 		if (it.text === null) {
 			missing++;
+			sections.push({ handle: it.handle, missing: true });
 			parts.push(`[handle ${it.handle}] not found. Copy the handle exactly from the folded block's marker line or the summary's handle table.`);
 			continue;
 		}
 		ok++;
 		const slice = sliceRecall(it.text, opts);
+		const grep = opts.grep !== undefined && String(opts.grep).trim() !== "", range = opts.range !== undefined && String(opts.range).trim() !== "";
+		const how = grep ? "grep" : range ? "range" : slice.clipped || slice.offset > 0 ? "page" : "all";
+		const shown = grep ? (slice.matched ?? 0) : slice.body ? slice.body.split("\n").length : 0;
+		sections.push({ handle: it.handle, label: it.label ?? it.tool ?? undefined, turn: it.turn, totalLines: slice.totalLines, shownLines: shown, how });
 		parts.push(`[handle ${it.handle}${it.tool ? " · " + it.tool : ""} · ${it.text.length} chars · ${slice.totalLines} lines]\n${slice.text}`);
 	}
-	return { text: parts.join("\n\n"), ok, missing };
+	return { text: parts.join("\n\n"), ok, missing, sections };
 }
 
 /** Resolve handles against the session branch (which spans entries before any compaction): exact originals. */
 export function resolveHandlesInBranch(branch: Any[], handles: string[]): { items: RecallItem[]; entryIds: (string | null)[] } {
 	const items: RecallItem[] = handles.map((h) => ({ handle: h, text: null, tool: null }));
 	const entryIds: (string | null)[] = handles.map(() => null);
+	const calls = new Map<string, Any>();
+	let turn = 0;
 	for (const en of branch) {
-		if (en?.type !== "message" || en.message?.role !== "toolResult") continue;
+		const msg = en?.type === "message" ? en.message : null;
+		if (msg?.role === "user") turn++;
+		if (msg?.role === "assistant" && Array.isArray(msg.content)) for (const c of msg.content) if (c?.type === "toolCall" && c.id) calls.set(c.id, c);
+		if (msg?.role !== "toolResult") continue;
 		const k = handles.indexOf(handleFor(en.id));
 		if (k < 0) continue;
-		items[k] = { handle: handles[k], text: textOf(en.message.content), tool: en.message.toolName ?? null };
+		const call = calls.get(msg.toolCallId);
+		const tool = msg.toolName ?? call?.name ?? null;
+		const args = call ? shortArgs(call.arguments) : "";
+		items[k] = { handle: handles[k], text: textOf(msg.content), tool, label: tool ? `${tool}${args ? " " + args : ""}` : undefined, turn: turn || undefined };
 		entryIds[k] = en.id;
 	}
 	return { items, entryIds };
@@ -177,6 +194,14 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			},
 			required: [],
 		} as Any,
+		renderCall(args: Any, theme: Any) {
+			return lines((w) => recallCallLine(args ?? {}, w, theme, measure));
+		},
+		renderResult(result: Any, options: Any, theme: Any) {
+			const text = textOf(result?.content);
+			const secs: RecallSectionInfo[] = Array.isArray(result?.details?.sections) ? result.details.sections : [];
+			return lines((w) => recallResultLines(secs, text, !!options?.expanded, w, theme, measure));
+		},
 		async execute(_id: string, params: Any, _signal: Any, _onUpdate: Any, ctx: Any): Promise<Any> {
 			const grep = params?.grep !== undefined ? String(params.grep) : undefined;
 			const range = params?.range !== undefined ? String(params.range) : undefined;
@@ -190,10 +215,15 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 				const { items, entryIds } = resolveHandlesInBranch(ctx.sessionManager.getBranch() as Any[], handles);
 				const out = recallSections(items, { grep, range, offset, limit });
 				hooks.onRecall(handles, items.reduce((a, it) => a + (it.text?.length ?? 0), 0), entryIds);
-				return { content: [{ type: "text", text: out.text }], details: { handles, resolved: out.ok, missing: out.missing }, isError: out.ok === 0 };
+				return { content: [{ type: "text", text: out.text }], details: { handles, resolved: out.ok, missing: out.missing, sections: out.sections }, isError: out.ok === 0 };
 			} catch (err) {
 				return { content: [{ type: "text", text: `${RECALL_TOOL} failed: ${err instanceof Error ? err.message : String(err)}` }], details: {}, isError: true };
 			}
 		},
 	});
+}
+
+/** A minimal pi-tui Component: lines computed for the width at render time. */
+function lines(fn: (width: number) => string[]): Any {
+	return { render: (width: number) => fn(Math.max(1, width)), invalidate: () => {} };
 }

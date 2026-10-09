@@ -1,10 +1,10 @@
 // The per-session state machine behind index.ts: cold detection, the run plan (F8), the warm valve (F10), persistence at turn_end,
 // settle preparation and the away-timer for the summary (F12).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { detectCold, lastMessageMs, lastPrompt, modelKey, resolveTtl, ttlFor } from "./cache.ts";
-import { describe, lawPrices, loadStats, pWarm, record, sample, GAP_EDGES, type Entry } from "./learn.ts";
+import { describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { validateEdits, repairPayload } from "./guard.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, calibrate, countUserTurns, G0, planContext, reserveTokensFor, untouchedEst, type Block, type Calibration, type Cut, type FoldTarget, type Law, type PlanOpts, type PlanResult, type RunPlan } from "./plan.ts";
@@ -12,6 +12,7 @@ import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { recalledHandlesFromBranch } from "./recall.ts";
 import { buildCut } from "./summary.ts";
 import { type Any, PRODUCT, textOf, tok4 } from "./util.ts";
+import { fmtLife, SPARK_GAPS, type CardData, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
 export const STATE_CUSTOM = "pi-zip/state";
@@ -103,9 +104,62 @@ export class Zip implements ZipControl {
 	private noticed = false; // a transcript notice was written in this process (the branch may not show it yet)
 	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
 	summarizedWarm = false;
-	setRecallOk(ok: boolean) {
+	setRecallOk(ok: boolean, ctx?: Any) {
 		if (ok !== this.recallOk) this.ledger({ type: "recall_available", ok });
 		this.recallOk = ok;
+		if (!ok && ctx) this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall to fold more");
+	}
+
+	/** Folded tool outputs of the current branch by toolCallId -> handle (the transcript marks them). */
+	readonly foldedCalls = new Map<string, string>();
+	foldedHandle = (toolCallId: string): string | undefined => this.foldedCalls.get(toolCallId);
+	refreshFolded(ctx: Any) {
+		const branch = this.branch(ctx);
+		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
+		this.foldedCalls.clear();
+		for (const e of branch) {
+			if (e?.type !== "context_edit" || !String(e?.replacement?.content?.[0]?.text ?? "").startsWith(PH_MARK)) continue;
+			const id = byId.get(e.targetId)?.message?.toolCallId;
+			if (typeof id === "string") this.foldedCalls.set(id, handleFor(e.targetId));
+		}
+	}
+
+	/** /zip output in the transcript (custom entry, never sent to the model). */
+	show(ctx: Any, data: NoticeData): boolean {
+		if (ctx?.mode !== "tui" || !this.entryRenderer) return false;
+		try {
+			this.pi.appendEntry(NOTICE_CUSTOM, data);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** A state change as one transcript line ("▸ pi-zip  paused  …"); each word once per session unless always. */
+	stateLine(ctx: Any, word: StateWord, reason: string, once = true) {
+		const text = `${PRODUCT}  ${word}  ${reason}`;
+		if (ctx?.mode !== "tui" && word !== "paused") return; // print/json/rpc (sub-agents): no transcript to keep it in
+		if (once && (this.statesShown.has(word) || this.branch(ctx).some((e: Any) => e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.kind === "state" && e.data?.word === word))) return;
+		this.statesShown.add(word);
+		this.ledger({ type: "state", word, reason });
+		// a state is not tied to this turn's edits: append now, so it sits where it happened
+		if (!this.show(ctx, { v: 2, kind: "state", word, reason, text, before: 0, after: 0, desc: "" })) this.notify(ctx, text);
+	}
+	private statesShown = new Set<string>();
+
+	/** First pi-zip session on this machine: one line that sets the expectation (nothing visible happens until the cache expires). */
+	welcome(ctx: Any) {
+		if (ctx?.mode !== "tui" || !this.entryRenderer || this.off || this.conflict) return;
+		const flag = `${dirname(process.env.PI_ZIP_CACHE_STATS || statsPath())}/welcomed`;
+		try {
+			if (existsSync(flag)) return;
+			mkdirSync(dirname(flag), { recursive: true });
+			writeFileSync(flag, new Date().toISOString() + "\n");
+		} catch {
+			return;
+		}
+		const ttl = ttlFor(ctx.model ?? this.model);
+		this.stateLine(ctx, "on", `folds old tool output after the prompt cache expires (${fmtLife(ttl / 1000).slice(1)} here) · nothing to set up · /zip for status`);
 	}
 
 	ledger(rec: Record<string, unknown>) {
@@ -202,7 +256,7 @@ export class Zip implements ZipControl {
 		this.conflict = found;
 		if (found && !this.conflictNoticed) {
 			this.conflictNoticed = true;
-			this.notify(ctx, `${PRODUCT} · "${found}" also manages context, so folding is paused (only the request guard stays on)`);
+			this.stateLine(ctx, "paused", `${found} also manages context, so pi-zip only guards requests · to use pi-zip: pi remove the other one`, true);
 		}
 	}
 
@@ -272,7 +326,7 @@ export class Zip implements ZipControl {
 		this.ledger({ type: "prompt", cold, reason, ttlMs: ttl.ms, ttlSource: ttl.source, settleTargets: this.settleIds.length, gapS: gapS === null ? null : Math.round(gapS), pWarm: Math.round(p * 1000) / 1000, survSrc: src, cls: this.ent?.cls ?? null });
 		if (ttl.note && !this.ttlNoticed) {
 			this.ttlNoticed = true; // once per session
-			if (!this.quiet) this.notify(ctx, ttl.note);
+			if (!this.quiet) this.stateLine(ctx, "cache", ttl.note.replace(`${PRODUCT} · `, ""));
 		}
 	}
 
@@ -323,14 +377,29 @@ export class Zip implements ZipControl {
 	}
 
 	/** A prepared summary for this cut, or null. A summary still being written is waited for (only the remainder); Esc stops the waiting, not the work. */
-	private async takeBg(key: string | null, signal?: AbortSignal): Promise<{ cut: Cut | null; adopted: boolean }> {
+	/** While the user waits for a summary, Pi's working line says what for (and that Esc skips a prepared one). */
+	private async working<T>(ctx: Any, text: string, p: Promise<T>): Promise<T> {
+		const ui = ctx?.mode === "tui" ? ctx?.ui : null;
+		try {
+			ui?.setWorkingMessage?.(text);
+		} catch {}
+		try {
+			return await p;
+		} finally {
+			try {
+				ui?.setWorkingMessage?.(undefined);
+			} catch {}
+		}
+	}
+
+	private async takeBg(key: string | null, signal?: AbortSignal, ctx?: Any): Promise<{ cut: Cut | null; adopted: boolean }> {
 		const b = this.bg;
 		if (!b || key === null || b.key !== key) {
 			this.discardBg();
 			return { cut: null, adopted: false };
 		}
 		const w0 = performance.now();
-		const cut = b.done ?? (await waitFor(b.promise, signal));
+		const cut = b.done ?? (await this.working(ctx, `${PRODUCT}: finishing the summary it started while you were away · Esc skips it`, waitFor(b.promise, signal)));
 		this.bgWaitMs = performance.now() - w0;
 		if (cut) {
 			this.bg = null;
@@ -364,7 +433,7 @@ export class Zip implements ZipControl {
 		let cut: Cut | null = null;
 		let adopted = false;
 		if (p && p.cutIdx !== null) {
-			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal);
+			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal, ctx);
 			cut = got.cut;
 			adopted = got.adopted;
 		} else {
@@ -373,7 +442,7 @@ export class Zip implements ZipControl {
 		const sameSet = this.settleIds.length === folds.length && this.settleIds.every((id) => folds.some((u) => u.entryId === id));
 		const source: RunPlan["source"] = !this.cold ? "valve" : adopted || (this.settleIds.length > 0 && sameSet) ? "settle" : "runstart";
 		const foldMs = performance.now() - t0;
-		if (!cut && p && p.cutIdx !== null && !ctx.signal?.aborted) cut = await buildCut(p, ctx); // produced now, before the first request: the user waits
+		if (!cut && p && p.cutIdx !== null && !ctx.signal?.aborted) cut = await this.working(ctx, `${PRODUCT}: writing a summary (folding alone cannot make the context small enough)`, buildCut(p, ctx)); // produced now, before the first request: the user waits
 		// a plan that cannot be persisted must never be sent: the request view would differ from what turn_end can write (I1)
 		if (p) {
 			const invalid = checkEdits(p.blocks, p.userTurns, folds, cut);
@@ -518,8 +587,8 @@ export class Zip implements ZipControl {
 		if (!p || (!p.folds.length && p.cutIdx === null)) return undefined;
 		let cut: Cut | null = null;
 		if (p.cutIdx !== null) {
-			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal);
-			cut = got.cut ?? (await buildCut(p, ctx)); // the user is here and the cache is warm; the alternative is Pi's lossy compaction
+			const got = await this.takeBg(p.firstKeptEntryId, ctx.signal, ctx);
+			cut = got.cut ?? (await this.working(ctx, `${PRODUCT}: writing a summary (the context is close to the window)`, buildCut(p, ctx))); // the user is here and the cache is warm; the alternative is Pi's lossy compaction
 		} else this.discardBg();
 		const plan: RunPlan = { source: "valve", folds: p.folds, cut, ctxBefore: p.ctxTokens, ctxAfter: p.ctxAfterFolds, ms: performance.now() - t0, k: p.k, persisted: false, untouched: p.k * untouchedEst(p.blocks, p.folds, !!cut, popts.sys) };
 		return this.commit(e, ctx, plan, o);
@@ -547,6 +616,7 @@ export class Zip implements ZipControl {
 		}
 		if (!plan.sent) this.nextEdit = plan.untouched ?? 0; // persisted now, first sent with the next request
 		const ours: Any[] = live.map((t) => ({ type: "context_edit", targetId: t.entryId, replacement: { content: [{ type: "text", text: t.ph }] } }));
+		for (const t of live) if (t.toolCallId) this.foldedCalls.set(t.toolCallId, handleFor(t.entryId));
 		if (cut) ours.push({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger }, usage: cut.usage });
 		const before = Math.round(k * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(k * live.reduce((a, t) => a + t.phTokens, 0));
@@ -668,10 +738,11 @@ export class Zip implements ZipControl {
 		} catch {}
 	}
 	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
-	private sessionTotals(ctx: Any): string {
+	private totals(ctx: Any) {
 		const branch = ctx ? this.branch(ctx) : [];
 		const byId = new Map(branch.map((e: Any) => [e?.id, e]));
 		let folds = 0, folded = 0, summaries = 0, recalls = 0, usd = 0;
+		let last: Any = null;
 		for (const e of branch) {
 			const ph = String(e?.replacement?.content?.[0]?.text ?? "");
 			if (e?.type === "context_edit" && ph.startsWith(PH_MARK)) {
@@ -681,10 +752,35 @@ export class Zip implements ZipControl {
 				summaries++;
 				usd += Number(e.usage?.cost?.total) || 0;
 			} else if (e?.type === "custom" && e.customType === UNUSED_SUMMARY_CUSTOM) usd += Number(e.data?.usd) || 0;
+			else if (e?.type === "custom" && e.customType === NOTICE_CUSTOM && e.data?.v === 2 && !e.data?.kind) last = e;
 			else if (e?.type === "message" && e.message?.role === "toolResult" && e.message?.toolName === RECALL_TOOL) recalls++;
 		}
+		return { folds, folded, summaries, recalls, usd, last };
+	}
+	/** What this session carries: folds and summaries persisted in its file (they survive restarts) and the recalls in its branch. */
+	private sessionTotals(ctx: Any): string {
+		const { folds, folded, summaries, recalls, usd } = this.totals(ctx);
 		const n = (x: number, one: string, many: string) => `${x} ${x === 1 ? one : many}`;
 		return `this session: ${n(folds, "folded output", "folded outputs")} (~${fmtK(folded)} tokens), ${n(summaries, "summary", "summaries")}${usd > 0 ? ` (summary calls $${usd.toFixed(4)})` : ""}, ${n(recalls, "recall", "recalls")}`;
+	}
+	/** The /zip status card (rendered by ui.ts renderCard). */
+	card(ctx?: Any): CardData {
+		const t = this.totals(ctx);
+		const model = ctx?.model ?? this.model;
+		const key = modelKey(model), ttlS = ttlFor(model) / 1000, ent = key ? loadStats().models[key] : undefined;
+		const alive = key ? SPARK_GAPS.map((g) => pWarm(ent, g, ttlS).p) : undefined;
+		let lifeS = 0;
+		for (let g = 30; g <= 7200; g += 30) if (pWarm(ent, g, ttlS).p >= 0.5) lifeS = g;
+		const learned = !!ent && ent.n > 0 && pWarm(ent, Math.max(30, lifeS), ttlS).src === "learned";
+		const life = key ? `${lifeS >= 7200 ? "over 2 h" : fmtLife(lifeS || ttlS)} (${learned ? `learned from ${Math.round(ent!.n)} ${Math.round(ent!.n) === 1 ? "reply" : "replies"}` : "declared"})` : undefined;
+		const ts = t.last?.timestamp ? new Date(t.last.timestamp) : null;
+		const hhmm = ts && !Number.isNaN(ts.getTime()) ? `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}  ` : "";
+		const last = t.last ? `${hhmm}${t.last.data.desc}${t.last.data.why ? " · " + t.last.data.why : ""}` : undefined;
+		const state = this.off ? "off" : this.conflict ? "paused" : this.recallOk ? "on" : "reread-only";
+		return {
+			state, stateNote: state === "paused" ? `${this.conflict} also manages context` : state === "off" ? "/zip on to resume" : undefined,
+			model: key || undefined, cls: ent?.cls, life, alive, folds: t.folds, foldedTokens: fmtK(t.folded), summaries: t.summaries, summaryUsd: t.usd, recalls: t.recalls, last, quiet: this.quiet,
+		};
 	}
 	status(ctx?: Any): string {
 		const state = this.off ? "off" : this.conflict ? `paused ("${this.conflict}" also manages context; only the request guard is on)` : "on";
