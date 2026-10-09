@@ -7,10 +7,12 @@ pi-zip folds old tool output out of the context **only when the prompt cache has
 ## Install
 
 ```bash
+pi install npm:pi-zip
+# or
 pi install git:github.com/purboo/pi-zip
 ```
 
-(Not published on npm yet.)
+Try it for one run without installing: `pi -e npm:pi-zip`.
 
 ## Measured results (v0.2.0)
 
