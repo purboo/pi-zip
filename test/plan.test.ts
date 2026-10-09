@@ -86,6 +86,20 @@ describe("summary gain gate", () => {
 		expect(s.prefixTokens).toBe(r.prefixTokens);
 		expect(s.folds).toHaveLength(0);
 	});
+	test("one summary per warm stretch: noSummary blocks a second cut below the compaction room, not at it", () => {
+		const view = [...sumCtx, U("u4", "back")];
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm" }))!.cutIdx).not.toBeNull();
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true }))?.cutIdx ?? null).toBeNull();
+		const tiny = { contextWindow: 60_000 }; // ~83K estimated context is above this room
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, mode: "warm", noSummary: true, model: tiny }))!.cutIdx).not.toBeNull();
+	});
+	test("the next summary is planned at least as big as the previous one it carries (no re-summary of a small new prefix)", () => {
+		const SUM = "S".repeat(48_000); // previous summary ~12K tokens, as in a real migrated session
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", summary: SUM, firstKeptEntryId: "k1" }, messages: [{ role: "compactionSummary", summary: SUM, content: SUM }] };
+		const view = [comp, U("k1", "one"), A("a1", ["c1"]), R("r1", "c1", 14_000), AX("a2", 8_000), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
+		// legacy gate: prefix ~18K, a 1.8K planned summary would "gain" 16K; planned at >= 12K the gain is ~6K: no summary
+		expect(planContext(view, opts({ coldCap: 6000, promptPending: false, relax: false }))!.cutIdx).toBeNull();
+	});
 	test("no summary when the gain gate fails (small context)", () => {
 		const small = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 3000), A("a2"), U("u2", "two"), A("a3"), U("u3", "three"), A("a4")];
 		expect(planContext(small, opts({ coldCap: 100, promptPending: false, relax: false }))!.cutIdx).toBeNull();

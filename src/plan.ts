@@ -282,6 +282,7 @@ export interface PlanOpts {
 	relax?: boolean; // default RELAX_PREV_TURN
 	minGain?: number;
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
+	noSummary?: boolean; // a summary was already made while this cache stayed warm: no second one unless the context is at/above the compaction room
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
 }
@@ -417,7 +418,13 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 		}
 	}
 	let ctxAfterFolds = ctxEst - savings();
-	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > coldCap ? trig : null;
+	// what no summary can remove: the system prompt, the protected turns (after their folds) and the previous summary, which the next
+	// one carries forward; the cap is never chased below it (a context that is mostly this floor would be re-summarised for nothing)
+	const prevSum = blocks[0]?.kind === "summary" ? blocks[0].tokens : 0;
+	const floor = o.sys + prevSum + blocks.reduce((a, b) => a + (protectedTurn(b) ? (tokOverride.get(b.idx) ?? b.tokens) : 0), 0);
+	const target = Math.max(coldCap, floor + SUMMARY_FLOOR);
+	const atRoom = room !== null && k * ctxAfterFolds >= room;
+	const sumTrigger: "cold" | "valve" | null = ctxAfterFolds > target && (!o.noSummary || atRoom) ? trig : null;
 	let cutIdx: number | null = null;
 	let prefixTokens = 0;
 	let summaryTokensPlanned = 0;
@@ -436,7 +443,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 			acc += tokOverride.get(i) ?? blocks[i].tokens;
 		}
 		const total = o.sys + acc;
-		const S = (x: number) => clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP);
+		const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * x, SUMMARY_FLOOR, SUMMARY_CAP), prevSum); // the next summary carries the previous one forward
 		if (cuts.length) {
 			let pick = cuts[cuts.length - 1];
 			for (const c of cuts) if (total - pre[c] + S(pre[c]) <= coldCap) { pick = c; break; }

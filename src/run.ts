@@ -94,6 +94,8 @@ export class Zip implements ZipControl {
 
 	/** zip_recall declared to the model? Checked at session start and before every run (index.ts); a `--tools` allowlist hides it. */
 	recallOk = true;
+	/** A summary was persisted since the last cold run start: later warm plans make none unless at the compaction room. */
+	summarizedWarm = false;
 	setRecallOk(ok: boolean) {
 		if (ok !== this.recallOk) this.ledger({ type: "recall_available", ok });
 		this.recallOk = ok;
@@ -146,7 +148,7 @@ export class Zip implements ZipControl {
 	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1): { o: PlanOpts; cal: Calibration } {
 		const sys = this.sysTokens(ctx);
 		const cal = calibrate(entries, sys);
-		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, noSummary: mode === "warm" && this.summarizedWarm, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {
@@ -234,6 +236,7 @@ export class Zip implements ZipControl {
 		if (!this.prevKey) ({ key: this.prevKey, total: this.prevTotal } = lastPrompt(branch)); // fresh process: the session's newest response
 		const { cold, reason, ttl, pWarm: p, src, gapS, pastTtl } = detectCold(ctx.model, this.lastReqMs, branch, Date.now(), this.lastModelKey, (g, prior) => pWarm(this.ent, g, prior));
 		this.cold = cold;
+		if (cold) this.summarizedWarm = false; // a cold return may summarise again
 		this.pastTtl = pastTtl;
 		this.pWarm = p;
 		this.survSrc = src;
@@ -512,6 +515,7 @@ export class Zip implements ZipControl {
 			return undefined;
 		}
 		const bad = checkEdits(o.blocks, o.userTurns, live, cut);
+		if (!bad && cut) this.summarizedWarm = true; // one summary per warm stretch (two in a row cost two uncached calls; the second gains little)
 		if (bad) {
 			this.ledger({ type: "guard_drop", turnIndex: e.turnIndex, reason: bad, folds: live.length, source: plan.source });
 			plan.persisted = false; // keep the request-local view: never switch the fold set mid-run
