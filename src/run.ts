@@ -92,6 +92,13 @@ export class Zip implements ZipControl {
 
 	active = () => !this.off && !this.conflict;
 
+	/** zip_recall declared to the model? Checked at session start and before every run (index.ts); a `--tools` allowlist hides it. */
+	recallOk = true;
+	setRecallOk(ok: boolean) {
+		if (ok !== this.recallOk) this.ledger({ type: "recall_available", ok });
+		this.recallOk = ok;
+	}
+
 	ledger(rec: Record<string, unknown>) {
 		const path = process.env.PI_ZIP_LEDGER; // test only
 		if (!path) return;
@@ -139,7 +146,7 @@ export class Zip implements ZipControl {
 	private opts(ctx: Any, pending: boolean, mode: "cold" | "warm", entries: Any[], pWarm = mode === "cold" ? 0 : 1): { o: PlanOpts; cal: Calibration } {
 		const sys = this.sysTokens(ctx);
 		const cal = calibrate(entries, sys);
-		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
+		return { cal, o: { mode, sys, k: cal.k, cwd: (ctx?.cwd as string) ?? process.cwd(), recalled: this.recalled, model: ctx?.model, promptPending: pending, rereadOnly: !this.recallOk, reserve: this.reserve(ctx), steerIds: this.steerIds, law: this.law(ctx, pWarm), trace: [] } };
 	}
 
 	private law(ctx: Any, pWarm: number): Law {

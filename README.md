@@ -29,6 +29,7 @@ Known limits:
 
 - **GLM** (automatic prefix cache that outlives its declared 5 minutes): v0.1 cost about 1.2× BC live. v0.2 learns the real cache lifetime and folds the previous turn after the declared TTL (offline 0.95–0.97× v0.1), but this was not verified live.
 - **Long autonomous runs** (one prompt, hundreds of tool calls, e.g. sub-agents): roughly on par with BC, not better. Outputs are only folded inside a running turn once they are 60 requests old.
+- **Tool allowlists** (`pi --tools read,bash`, and sub-agent launchers that pass one): Pi then hides `zip_recall`, so pi-zip folds only outputs the model can re-read (files, read-only commands) and the placeholder says to re-read. Add `zip_recall` to the list to get full folding.
 - If you always answer within the cache lifetime, there is little to save, by design.
 
 ## What you see

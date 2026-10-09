@@ -716,6 +716,22 @@ describe("in-turn folds through the real extension: one user message, 60 tool ca
 		rmSync(ledger, { force: true });
 	});
 
+	test("zip_recall hidden by a --tools allowlist (sub-agents): only rereadable outputs fold, placeholders point at re-reading", async () => {
+		process.env.PI_ZIP_COLD_CAP = "8000";
+		const entries = session();
+		const r = await rig(entries, COLD_TS(), {}, { getActiveTools: () => ["read", "bash"] });
+		await r.fire("session_start", {});
+		await r.fire("before_agent_start", {});
+		const req1 = await r.fire("context_with_system", { messages: flat(entries) });
+		expect(folded(req1.messages)).toEqual(expected.filter((x) => !["r3", "r10"].includes(x)).sort()); // npm test outputs stay
+		const ph = req1.messages.filter((m: Any) => m.role === "toolResult" && String(m.content[0].text).startsWith("[folded by pi-zip")).map((m: Any) => String(m.content[0].text));
+		expect(ph.length).toBeGreaterThan(0);
+		for (const t of ph) {
+			expect(t).toContain("re-read the file");
+			expect(t).not.toContain("zip_recall(\"");
+		}
+	});
+
 	test("the second request repeats the first byte for byte, and so does the persisted projection", async () => {
 		const { req1, req2, projected } = await run();
 		const n = req1.messages.length;

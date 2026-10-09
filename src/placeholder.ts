@@ -108,6 +108,7 @@ export function outcomeHint(text: string, tool: string, isError?: boolean): stri
 export interface PlaceholderMeta {
 	turn?: number; // user turn the output belongs to (1-based, as seen in the projection when it was folded)
 	isError?: boolean;
+	noRecall?: boolean; // zip_recall is not declared to the model (`--tools` allowlist): point at re-reading instead
 }
 
 /** Placeholder text, or null when the output is too short to be worth folding. The text is stored with the fold (context_edit),
@@ -121,15 +122,17 @@ export function makePlaceholder(text: string, tool: string, args: string, handle
 	return (
 		`${PH_MARK} · ${tool}${args ? " " + args : ""}${meta.turn ? ` · turn ${meta.turn}` : ""}${outcome ? ` · ${outcome}` : ""} · ${text.length} chars, ${lines} lines · handle ${handle}]\n` +
 		(keys.length ? `key lines kept (original line numbers; up to ${keep}):\n${body}\n` : "") +
-		`Original kept byte for byte, recallable even after summaries or compaction: ${RECALL_TOOL}("${handle}") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.`
+		(!meta.noRecall
+			? `Original kept byte for byte, recallable even after summaries or compaction: ${RECALL_TOOL}("${handle}") (optional grep/range) is instant, free, no side effects; prefer it to re-running or re-reading (output may differ). Do not guess its content.`
+			: `Original not shown (${RECALL_TOOL} is not enabled in this session): re-read the file or re-run the read-only command if you need it. Do not guess its content.`)
 	);
 }
 
 /** Placeholder for a toolResult block (null for image results, entries without an id, or short outputs). */
-export function makePlaceholderFor(b: Block, calls: Calls, keep = 8): string | null {
+export function makePlaceholderFor(b: Block, calls: Calls, keep = 8, noRecall = false): string | null {
 	const content = b.msg.content;
 	if (Array.isArray(content) && content.some((c: Any) => c?.type !== "text")) return null;
 	if (!b.entryId) return null;
 	const call = calls.get(b.msg.toolCallId);
-	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { turn: b.userTurn, isError: !!b.msg.isError });
+	return makePlaceholder(textOf(content), call?.name ?? b.msg.toolName ?? "tool", call ? shortArgs(call.args) : "", handleFor(b.entryId), keep, { turn: b.userTurn, isError: !!b.msg.isError, noRecall });
 }

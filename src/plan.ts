@@ -282,6 +282,7 @@ export interface PlanOpts {
 	relax?: boolean; // default RELAX_PREV_TURN
 	minGain?: number;
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
+	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	pastTtl?: boolean; // a user return after the declared TTL: a warm plan may relax into the previous user turn too (RELAX_PREV_TURN)
 }
 
@@ -366,7 +367,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
-		const ph = makePlaceholderFor(b, calls, keepLines);
+		const ph = makePlaceholderFor(b, calls, keepLines, !!o.rereadOnly);
 		if (ph === null) return false;
 		const phTok = tok4(ph);
 		if (!(phTok < 0.9 * b.tokens)) return false;
@@ -384,7 +385,7 @@ export function planContext(entries: Any[], o: PlanOpts): PlanResult | null {
 	const head = law.pr?.cls === "automatic" ? MIN_EXPECT / k : 0;
 	const start: number[] = [];
 	blocks.reduce((acc, b) => ((start[b.idx] = acc), acc + b.tokens), o.sys);
-	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head;
+	const foldable = (b: Block) => b.kind === "toolResult" && !b.edited && !!b.entryId && b.tokens > foldMin && !isRecall(b) && start[b.idx] >= head && (!o.rereadOnly || classify(b) === "rereadable");
 	const protectedTurn = (b: Block) => b.userTurn >= userTurns - PROTECT_USER_TURNS + 1;
 	const savings = () => folds.reduce((a, t) => a + t.entryTokens - t.phTokens, 0);
 	const cands = blocks.filter((b) => foldable(b) && !protectedTurn(b));
