@@ -59,10 +59,7 @@ const foreignCompaction = (e: Any): boolean => e?.type === "compaction" && !!e.f
 /** pi-zip's own compaction takes milliseconds: the summary is done. Pi runs every extension's session_before_compact handler for it, so
  *  one that is not finished by this deadline has another handler at work (writing its own summary, say): pi-zip cancels it then, so it
  *  can never land during the run, and the draft path takes the summary (the idle door's, only while no run is announced). */
-const nativeDeadlineMs = () => envInt("NATIVE_MS", 2_000);
-/** A compaction slower than this (or half the deadline) had another handler at work too: the native path ends for the process, so its
- *  work (a model call, say) is not paid for, and waited for, at every cold return. */
-const NATIVE_SLOW_MS = 250;
+const nativeDeadlineMs = () => envInt("NATIVE_MS", 60_000);
 /** The idle door (research pi-tricks §1b variant 4, "\u03b5"): on; PI_ZIP_IDLE_DOOR=0 is an emergency off switch, not a setting. */
 const idleDoorOn = () => process.env.PI_ZIP_IDLE_DOOR !== "0";
 /** A relay that pools accounts (sub2api, say) keeps a conversation on one account only when the request names it, as Claude Code's
@@ -274,6 +271,12 @@ export class Zip implements ZipControl {
 	show(ctx: Any, data: NoticeData): boolean {
 		if (ctx?.mode !== "tui" || !this.entryRenderer) return false;
 		return attempt(() => (this.pi.appendEntry(NOTICE_CUSTOM, data), true), false);
+	}
+
+	private zippedNotice(ctx: Any): NoticeData | null {
+		return ctx?.mode === "tui" && this.entryRenderer && !this.quiet
+			? { v: 2, kind: "zipped", text: "Conversation zipped!", before: 0, after: 0, desc: "" }
+			: null;
 	}
 
 	/** A state change as one transcript line ("ƶ pi-zip  paused  …"); each word once per session unless always. */
@@ -828,7 +831,7 @@ export class Zip implements ZipControl {
 	 * "before", provider scale), so Pi's "[compaction] Compacted from N tokens" shows that number. It takes milliseconds: the summary is
 	 * done. The run plan folds the resulting projection; a closed native door defers the summary to turn_end.
 	 * Pi runs every extension's session_before_compact handler for it (the last answer wins, a cancel stops it): unless pi-zip's own
-	 * entry is the one that went in, fast, the native path ends for the process (endNative). A compaction not finished by the deadline
+	 * entry is the only one that went in, the native path ends for the process (endNative). A compaction not finished by the deadline
 	 * is cancelled first (at the idle door, while no run is announced), and a summary prepared for a context another extension's compaction has replaced is never used (its head is gone).
 	 */
 	private async nativeSummary(ctx: Any, e: Any, s: Start, door: "input" | "idle" = "input"): Promise<void> {
@@ -904,7 +907,7 @@ export class Zip implements ZipControl {
 		const appendedAt = entry?.timestamp ? Date.parse(entry.timestamp) : NaN;
 		const handlerMs = entry && askMs !== null ? askMs + (Number.isFinite(appendedAt) && ask.askedWall ? Math.max(0, appendedAt - ask.askedWall) : 0) : ms;
 		const off = entry
-			? added.length > 1 ? "another compaction went in as well" : handlerMs > Math.min(NATIVE_SLOW_MS, deadline / 2) ? `Pi's compaction spent ${handlerMs} ms in session_before_compact handlers: another handler at work` : null
+			? added.length > 1 ? "another compaction went in as well" : null
 			: last ? "another extension's compaction went in instead of pi-zip's"
 			: res.late ? (ask.answered ? `Pi's compaction was not done ${deadline} ms after pi-zip answered (cancelled)` : `another session_before_compact handler ran before pi-zip's (cancelled after ${deadline} ms)`)
 			: `Pi's compaction failed: ${res.err ?? "no compaction entry"}`;
@@ -919,6 +922,8 @@ export class Zip implements ZipControl {
 			}
 			return; // nothing went in: the prepared summary waits for turn_end
 		}
+		const zipped = this.zippedNotice(ctx);
+		if (zipped) this.show(ctx, zipped);
 		// the summary is in the session from now on, whatever the run does: book it here (commit() does not book it again), the way a
 		// draft of the same kind is booked: a cold return's saves a rewrite, a warm one is a valve edit of the warm cache
 		const cutSaved = Math.round(p.scale.c * (cut.prefixTokens - cut.summaryTokens));
@@ -1444,7 +1449,7 @@ export class Zip implements ZipControl {
 		const why = valve ? this.turnWhy || WARM_WHY : !this.cold ? WARM_WHY : this.coldWhy;
 		// reqTs identifies the first request carrying the final view: a folds-only notice keeps its first-request time when announced
 		// at the boundary; a newly joined room summary uses the boundary time, because only the next request can carry it.
-		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM), reqTs: plan.cut ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
+		const data: NoticeData = { v: 2, text: noticeText(notices), before: Math.round(notices[0].tokensBefore), after: Math.round(notices[notices.length - 1].tokensAfter), desc: noticeDesc(notices), why: why || undefined, items, more: Math.max(0, live.length - ITEMS) || undefined, first: !this.noticed && !this.branch(ctx).some((en: Any) => en?.type === "custom" && en.customType === NOTICE_CUSTOM && en.data?.kind !== "zipped"), reqTs: plan.cut ? Date.now() : (plan.noticeTs ?? Date.now()), ...(cut && this.nativeNote ? { native: this.nativeNote.native, ...(this.nativeNote.ms !== undefined ? { nativeMs: this.nativeNote.ms } : {}), ...(this.nativeNote.askMs !== undefined ? { nativeAskMs: this.nativeNote.askMs } : {}) } : {}) };
 		this.noticed = true;
 		this.notify(ctx, data.text, data);
 	}
@@ -1476,6 +1481,8 @@ export class Zip implements ZipControl {
 		// fold drafted before it would make Pi's "Compacted from N tokens" the chars/4 of a half-applied projection (research pi-tricks §1a)
 		if (cut) ours.unshift({ type: "compaction", summary: cut.text, firstKeptEntryId: cut.firstKeptEntryId, details: { by: PRODUCT, trigger: cut.trigger, carried: false }, usage: cut.usage });
 		ours.push({ type: "custom", customType: COMMIT_CUSTOM, data: { carried: sentBefore, ...((cut || mixed) && sentBefore ? { next: true } : {}), ...(mixed ? { carriedIds: [...plan.carriedIds!] } : {}) } }); // says who first carried these edits (state.ts, plan.ts calibrate)
+		const zipped = cut ? this.zippedNotice(ctx) : null;
+		if (zipped) ours.push({ type: "custom", customType: NOTICE_CUSTOM, data: zipped });
 		const before = Math.round(c * live.reduce((a, t) => a + t.entryTokens, 0));
 		const after = Math.round(c * live.reduce((a, t) => a + t.phTokens, 0));
 		const cutSaved = cut ? Math.round(c * (cut.prefixTokens - cut.summaryTokens)) : 0;

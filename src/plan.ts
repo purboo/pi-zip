@@ -6,6 +6,8 @@ import { type Any, COMMIT_CUSTOM, PRODUCT, clamp, envInt, piTokensOf, textOf, to
 import { PH_MARK } from "./placeholder.ts";
 import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
+import { parseSummary } from "./summary.ts";
+import { mandatoryUserPrefixTokens, userTextBefore } from "./user-text.ts";
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -615,6 +617,7 @@ export interface PlanOpts {
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
+	branch?: Any[];
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
 	ready?: readonly string[];
@@ -707,7 +710,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	}
 	const classify = (b: Block): Recover => {
 		const call = calls.get(b.msg.toolCallId);
-		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd);
+		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd, { exactRecall: !o.rereadOnly || !!o.fileRecall });
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
@@ -764,8 +767,27 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
-	const S = (x: number) => Math.max(clamp(SUMMARY_RATIO * c * x, SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum) / c; // the next summary carries the previous one forward
-	const result = (pick: number | null, summary = pick === null ? 0 : S(pre[pick])): PlanResult => ({
+	const previousText = blocks[0]?.kind === "summary" ? String(blocks[0].msg.summary ?? "") : "";
+	const previousUsers = parseSummary(previousText).users;
+	const previousBoundary = o.branch?.find((e) => e?.id === blocks[0]?.entryId)?.firstKeptEntryId;
+	const recoveredUsers = previousBoundary ? userTextBefore(o.branch, previousBoundary, previousUsers) : null;
+	const currentUserCount: number[] = [];
+	const currentUsers: string[] = [];
+	for (const b of blocks) {
+		currentUserCount.push(currentUsers.length);
+		if (b.kind === "user") currentUsers.push(textOf((b.raw ?? b.msg).content));
+	}
+	const userSizes = mandatoryUserPrefixTokens(
+		{ items: recoveredUsers ?? previousUsers.items, omitted: recoveredUsers ? 0 : previousUsers.omitted }, currentUsers,
+	);
+	const userHeadingAt = previousText.lastIndexOf("\n## User requests");
+	const userStart = userHeadingAt >= 0 ? userHeadingAt + 1 : previousText.startsWith("## User requests") ? 0 : -1;
+	const userEnd = userStart >= 0 ? previousText.indexOf("\n## ", userStart + 1) : -1;
+	const priorNonUser = userStart >= 0
+		? Math.ceil((previousText.length - ((userEnd < 0 ? previousText.length : userEnd) - userStart)) / 4)
+		: prevSum;
+	const S = (k: number) => Math.max(clamp(SUMMARY_RATIO * c * pre[k], SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum, c * (priorNonUser + userSizes[currentUserCount[k]] + 300)) / c;
+	const result = (pick: number | null, summary = pick === null ? 0 : S(pick)): PlanResult => ({
 		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
 		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
 		summaryTokensPlanned: summary, sumTrigger, scale: o.scale ?? UNIT,
@@ -779,17 +801,17 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const limit = blocks.findIndex(protectedTurn), cuts: number[] = [];
 	for (let i = minCut; i < blocks.length && (limit < 0 || i <= limit); i++) if (isCutBlock(blocks[i])) cuts.push(i);
 	if (!cuts.length) return { f, c: null, a: null };
-	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(pre[k]) <= coldCap);
+	const cw = cuts.findIndex((k) => ctxAfterFolds - pre[k] + S(k) <= coldCap);
 	const first = cw < 0 ? cuts.length - 1 : cw;
 	const paying = cuts.slice(first).find((k) => {
-		const X = c * pre[k], Sr = c * S(pre[k]);
+		const X = c * pre[k], Sr = c * S(k);
 		if (X < 2 * Sr) return false;
-		const call = law.pr.w * c * Math.max(0, pre[k] - prevSum) + law.pr.out * Math.min(c * S(pre[k]), NARRATIVE_MAX);
+		const call = law.pr.w * c * Math.max(0, pre[k] - prevSum) + law.pr.out * Math.min(c * S(k), NARRATIVE_MAX);
 		return gate("summary", X, Sr, null, call, Sr, undefined, undefined, false, blocks[k].entryId ?? undefined)
-			&& gate("plan", real(ctxEst), real(ctxAfterFolds - pre[k] + S(pre[k])), room, call, real(ctxAfterFolds - pre[k] + S(pre[k])), undefined, true);
+			&& gate("plan", real(ctxEst), real(ctxAfterFolds - pre[k] + S(k)), room, call, real(ctxAfterFolds - pre[k] + S(k)), undefined, true);
 	});
 	const bound = paying ?? cuts[first], ready = new Set(o.ready ?? []);
-	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(pre[k]);
+	const readySize = (k: number) => o.readySizes?.[blocks[k].entryId!] ?? S(k);
 	const have = cuts.filter((k) => k <= bound && ready.has(blocks[k].entryId!) && pre[k] >= 2 * readySize(k)).pop();
 	return { f, c: paying === undefined ? null : result(paying), a: have === undefined ? null : result(have, readySize(have)) };
 }

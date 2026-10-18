@@ -1,0 +1,155 @@
+{
+  "candidateCommit": "b45bed8cd329237e6dbdba2b0f8a85c85a9ee8ff",
+  "liveCandidate": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+  "sourceDelta": [
+    "src/plan.ts",
+    "src/user-text.ts"
+  ],
+  "liveCalls": 0,
+  "checked": [
+    {
+      "scenario": "user-long",
+      "replicate": 0,
+      "viewHash": "7ff73f1f8692386fbc80bc4fda2032e711ccfbbffc517d60f20dcb0de81d2650",
+      "fullViewHash": "233a15fba023bd47bc3ed4aa75bb54eaffd405f3820081311c4aa227f648e62c"
+    },
+    {
+      "scenario": "user-many",
+      "replicate": 0,
+      "viewHash": "888a21510b9fad0f0641b692b02e6309182d54681261c781b67ab1c31b12459b",
+      "fullViewHash": "c121fc2aae4fb57c90beeae20c88f0443ccc19a23b0a00efb19e3e943d7f736b"
+    },
+    {
+      "scenario": "user-long",
+      "replicate": 1,
+      "viewHash": "f3eb86966233f1cbeb76cba1f9e73b9fba8d5a9865e4c61a30202ceb083430fc",
+      "fullViewHash": "d5152737e05df99179a8a65f9ee3dbde6da5a8d0c5e309ddba2f5e0c4d5c5976"
+    },
+    {
+      "scenario": "user-many",
+      "replicate": 1,
+      "viewHash": "586fbbc9222cf5fd32ca34410d0ae31e9b1292c0c67ffe03eecc2ff96c22e534",
+      "fullViewHash": "838b7e9f8042c331a3bdf939a8d464a44e7966750e27e0d381c1288f71b6a9e9"
+    },
+    {
+      "scenario": "user-long",
+      "replicate": 2,
+      "viewHash": "e0efa4abf898c221dfe4337adf9e0846036db84140dd85b09ed1f398a42fb844",
+      "fullViewHash": "a3ee512a7370211e3d3537548ebf6db8d1ea319feac4254aa5ba62e12e89a73b"
+    },
+    {
+      "scenario": "user-many",
+      "replicate": 2,
+      "viewHash": "c8d38fe52343b36aa8318604c0a70a24c9abf5c0ad54a18ea8bb66be0e73d6c2",
+      "fullViewHash": "a59439540cc734c1e1cc01a258637364fc90e781b48664583509032492ee3663"
+    },
+    {
+      "scenario": "arc-unneeded",
+      "replicate": 0,
+      "viewHash": "3a592720d642b3fd0adbc406aa834d128841441abf832693fcc624cdc87ff00f",
+      "fullViewHash": "7f4317e96e5eaca82f04d26c2df0f1b97ce767e15463993b31a792782578bc52"
+    },
+    {
+      "scenario": "arc-needed",
+      "replicate": 0,
+      "viewHash": "9d3cdfeeea366038cb046b840674e39eccf11df1bb13683862de4a521b02130b",
+      "fullViewHash": "48b45f0d41f2ce41e91e6384df561670dfde848381675729ee6b8ece4e1d4d36"
+    },
+    {
+      "scenario": "arc-unneeded",
+      "replicate": 1,
+      "viewHash": "3a592720d642b3fd0adbc406aa834d128841441abf832693fcc624cdc87ff00f",
+      "fullViewHash": "7f4317e96e5eaca82f04d26c2df0f1b97ce767e15463993b31a792782578bc52"
+    },
+    {
+      "scenario": "arc-needed",
+      "replicate": 1,
+      "viewHash": "9d3cdfeeea366038cb046b840674e39eccf11df1bb13683862de4a521b02130b",
+      "fullViewHash": "48b45f0d41f2ce41e91e6384df561670dfde848381675729ee6b8ece4e1d4d36"
+    },
+    {
+      "scenario": "arc-unneeded",
+      "replicate": 2,
+      "viewHash": "3a592720d642b3fd0adbc406aa834d128841441abf832693fcc624cdc87ff00f",
+      "fullViewHash": "7f4317e96e5eaca82f04d26c2df0f1b97ce767e15463993b31a792782578bc52"
+    },
+    {
+      "scenario": "arc-needed",
+      "replicate": 2,
+      "viewHash": "9d3cdfeeea366038cb046b840674e39eccf11df1bb13683862de4a521b02130b",
+      "fullViewHash": "48b45f0d41f2ce41e91e6384df561670dfde848381675729ee6b8ece4e1d4d36"
+    },
+    {
+      "scenario": "arc-no-recall",
+      "replicate": 0,
+      "viewHash": "42a41eb4a9278d757d88df8c10cd2b20a56efcd4169633d0a6058e40b19b00a2",
+      "fullViewHash": "d56044a65b45e88534b3ca1d9c50fd447bd7d592257b6883f26633a5b6f4970e"
+    },
+    {
+      "scenario": "changed-large-read",
+      "replicate": 0,
+      "viewHash": "0d218fb6e1f2786e8d9ffccb72305f4b1346c02e840fdc38e3293cda110a8b5e",
+      "fullViewHash": "5a9ccc0d0d1ffbf1cd542fc075b8a766b6b4a0c7b0c806ad26fca1f6ea20f0c4"
+    },
+    {
+      "scenario": "arc-no-recall",
+      "replicate": 1,
+      "viewHash": "b6d8a5700348f7dbc8656731d01a5850501e34c8e221304febe846cf4e44f248",
+      "fullViewHash": "c82a2b17165c1d1eb113aae62199fb996edc8e7c3ed0ef6e38ef1d5f1322f8d6"
+    },
+    {
+      "scenario": "changed-large-read",
+      "replicate": 1,
+      "viewHash": "a5012ff87657c9124b8c9c8ccd7d7de88f6ab656b545aa728e1b3a698c5bf908",
+      "fullViewHash": "ed2db09737d5d5085597ef3095a8618292a08e7039931b699dad247fb800801e"
+    },
+    {
+      "scenario": "arc-no-recall",
+      "replicate": 2,
+      "viewHash": "3d308e5f381865cb4a747b7e2a52a859e3a0d4351f4ef98ed19cba6376ec4a01",
+      "fullViewHash": "e25f7432aedee7468450b0edebfbc81434ccaf72d221957880551beaea136377"
+    },
+    {
+      "scenario": "changed-large-read",
+      "replicate": 2,
+      "viewHash": "419f192e36c8d892c5592327317d79f0337578eeb813c11740ce300d330affed",
+      "fullViewHash": "dd88ef0f4adaa9cd3f349492e28ee6b24e2d650a4d1dc6213bc8842db65430d7"
+    },
+    {
+      "scenario": "regex-hostile",
+      "replicate": 0,
+      "viewHash": "e12f5632f4d627989851e7780668002560499b0d6e1bc4a2e94100ba0d6b0603",
+      "fullViewHash": "fd03300ad3612c9db357245966fc12dffcfd9999d668d6c49f577595cc598e86"
+    },
+    {
+      "scenario": "regex-control",
+      "replicate": 0,
+      "viewHash": "2d4c57c199d416204def8a7abdb6625438878fdcd784e2115ca4ed56b9a8589f",
+      "fullViewHash": "2d45eaeb37185baf2d72cd2ffd399b58d86fdf9c5fbfd4365526d73732041b41"
+    },
+    {
+      "scenario": "regex-hostile",
+      "replicate": 1,
+      "viewHash": "e12f5632f4d627989851e7780668002560499b0d6e1bc4a2e94100ba0d6b0603",
+      "fullViewHash": "fd03300ad3612c9db357245966fc12dffcfd9999d668d6c49f577595cc598e86"
+    },
+    {
+      "scenario": "regex-control",
+      "replicate": 1,
+      "viewHash": "2d4c57c199d416204def8a7abdb6625438878fdcd784e2115ca4ed56b9a8589f",
+      "fullViewHash": "2d45eaeb37185baf2d72cd2ffd399b58d86fdf9c5fbfd4365526d73732041b41"
+    },
+    {
+      "scenario": "regex-hostile",
+      "replicate": 2,
+      "viewHash": "e12f5632f4d627989851e7780668002560499b0d6e1bc4a2e94100ba0d6b0603",
+      "fullViewHash": "fd03300ad3612c9db357245966fc12dffcfd9999d668d6c49f577595cc598e86"
+    },
+    {
+      "scenario": "regex-control",
+      "replicate": 2,
+      "viewHash": "2d4c57c199d416204def8a7abdb6625438878fdcd784e2115ca4ed56b9a8589f",
+      "fullViewHash": "2d45eaeb37185baf2d72cd2ffd399b58d86fdf9c5fbfd4365526d73732041b41"
+    }
+  ]
+}

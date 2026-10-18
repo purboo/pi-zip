@@ -1,0 +1,284 @@
+{
+  "exploratoryOnly": true,
+  "excludedFromFinalAggregates": true,
+  "ab-live-no-recall-pilot": [
+    {
+      "name": "arc-no-recall",
+      "rep": 0,
+      "arm": "baseline",
+      "fixtureHash": "814f9e9fbc0700f476e64e2af24adb467eb5b55361bf1f2b34dc51803f6c23ad",
+      "viewHash": "42a41eb4a9278d757d88df8c10cd2b20a56efcd4169633d0a6058e40b19b00a2",
+      "folded": [],
+      "chars": 209917,
+      "success": true,
+      "failure": null,
+      "answer": {
+        "value": "amber_020b9d98"
+      },
+      "expected": {
+        "value": "amber_020b9d98"
+      },
+      "final": "{\"value\":\"amber_020b9d98\"}",
+      "usage": {
+        "input": 47240,
+        "output": 15,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 47255,
+        "cost": {
+          "input": 0.09448,
+          "output": 0.00015000000000000001,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.09462999999999999
+        }
+      },
+      "inputIncludingCache": 47240,
+      "elapsedMs": 2187.398125,
+      "calls": 1,
+      "toolCalls": []
+    },
+    {
+      "name": "arc-no-recall",
+      "rep": 0,
+      "arm": "candidate",
+      "fixtureHash": "814f9e9fbc0700f476e64e2af24adb467eb5b55361bf1f2b34dc51803f6c23ad",
+      "viewHash": "edc0f08a82e2de58052920bc6111d003105efe8d46035be21c5861d0fb97cd83",
+      "folded": [
+        "entry-4"
+      ],
+      "chars": 43379,
+      "success": false,
+      "failure": null,
+      "answer": {
+        "value": "unknown: the earlier output is unavailable in the retained context"
+      },
+      "expected": {
+        "value": "amber_020b9d98"
+      },
+      "final": "{\"value\":\"unknown: the earlier output is unavailable in the retained context\"}",
+      "usage": {
+        "input": 7568,
+        "output": 19,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 7587,
+        "cost": {
+          "input": 0.015136,
+          "output": 0.00019,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.015326
+        }
+      },
+      "inputIncludingCache": 7568,
+      "elapsedMs": 3050.242958,
+      "calls": 1,
+      "toolCalls": []
+    }
+  ],
+  "ab-live-regex-pilot": [
+    {
+      "name": "regex-hostile",
+      "rep": 0,
+      "arm": "baseline",
+      "fixtureHash": "ab96b75abc8c316a598c14f6fe61a39efe4f4192dfeaf20e406d73f745c7768f",
+      "viewHash": "e12f5632f4d627989851e7780668002560499b0d6e1bc4a2e94100ba0d6b0603",
+      "folded": [
+        "entry-2"
+      ],
+      "chars": 1733,
+      "success": false,
+      "failure": "recall_timeout",
+      "answer": null,
+      "expected": {
+        "matchingLines": 0
+      },
+      "final": "",
+      "usage": {
+        "input": 696,
+        "output": 30,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 726,
+        "cost": {
+          "input": 0.001392,
+          "output": 0.00030000000000000003,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.001692
+        }
+      },
+      "inputIncludingCache": 696,
+      "elapsedMs": 5869.115833,
+      "calls": 1,
+      "toolCalls": [
+        {
+          "name": "zip_recall",
+          "args": {
+            "handle": "116k8w60bm",
+            "grep": "a+a+$"
+          },
+          "timedOut": true,
+          "ms": 3007.543458
+        }
+      ]
+    },
+    {
+      "name": "regex-hostile",
+      "rep": 0,
+      "arm": "candidate",
+      "fixtureHash": "ab96b75abc8c316a598c14f6fe61a39efe4f4192dfeaf20e406d73f745c7768f",
+      "viewHash": "e12f5632f4d627989851e7780668002560499b0d6e1bc4a2e94100ba0d6b0603",
+      "folded": [
+        "entry-2"
+      ],
+      "chars": 1733,
+      "success": true,
+      "failure": null,
+      "answer": {
+        "matchingLines": 0
+      },
+      "expected": {
+        "matchingLines": 0
+      },
+      "final": "{\"matchingLines\":0}",
+      "usage": {
+        "input": 1524,
+        "output": 40,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 1564,
+        "cost": {
+          "input": 0.0030479999999999995,
+          "output": 0.0004,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.0034479999999999997
+        }
+      },
+      "inputIncludingCache": 1524,
+      "elapsedMs": 5801.133459000001,
+      "calls": 2,
+      "toolCalls": [
+        {
+          "name": "zip_recall",
+          "args": {
+            "handle": "116k8w60bm",
+            "grep": "a+a+$"
+          },
+          "ms": 1.0175839999999994,
+          "wallMs": 197.72095900000022
+        }
+      ]
+    },
+    {
+      "name": "regex-control",
+      "rep": 0,
+      "arm": "candidate",
+      "fixtureHash": "e4c6420eecf67272fd95a09a46beb0838c37d84e61494978cfaed374433a9f9d",
+      "viewHash": "2d4c57c199d416204def8a7abdb6625438878fdcd784e2115ca4ed56b9a8589f",
+      "folded": [
+        "entry-2"
+      ],
+      "chars": 1738,
+      "success": true,
+      "failure": null,
+      "answer": {
+        "matchingLines": 2
+      },
+      "expected": {
+        "matchingLines": 2
+      },
+      "final": "{\"matchingLines\":2}",
+      "usage": {
+        "input": 1521,
+        "output": 40,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 1561,
+        "cost": {
+          "input": 0.0030419999999999996,
+          "output": 0.0004,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.0034419999999999997
+        }
+      },
+      "inputIncludingCache": 1521,
+      "elapsedMs": 65196.001625000004,
+      "calls": 2,
+      "toolCalls": [
+        {
+          "name": "zip_recall",
+          "args": {
+            "handle": "116k8w60bm",
+            "grep": "ERROR|FAIL"
+          },
+          "ms": 1.4074999999999989,
+          "wallMs": 200.87812499999927
+        }
+      ]
+    },
+    {
+      "name": "regex-control",
+      "rep": 0,
+      "arm": "baseline",
+      "fixtureHash": "e4c6420eecf67272fd95a09a46beb0838c37d84e61494978cfaed374433a9f9d",
+      "viewHash": "2d4c57c199d416204def8a7abdb6625438878fdcd784e2115ca4ed56b9a8589f",
+      "folded": [
+        "entry-2"
+      ],
+      "chars": 1738,
+      "success": true,
+      "failure": null,
+      "answer": {
+        "matchingLines": 2
+      },
+      "expected": {
+        "matchingLines": 2
+      },
+      "final": "{\"matchingLines\":2}",
+      "usage": {
+        "input": 1483,
+        "output": 40,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 1523,
+        "cost": {
+          "input": 0.002966,
+          "output": 0.0004,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0.003366
+        }
+      },
+      "inputIncludingCache": 1483,
+      "elapsedMs": 5929.297999999995,
+      "calls": 2,
+      "toolCalls": [
+        {
+          "name": "zip_recall",
+          "args": {
+            "handle": "116k8w60bm",
+            "grep": "ERROR|FAIL"
+          },
+          "ms": 1.1163329999999974,
+          "wallMs": 221.6739169999928
+        }
+      ]
+    }
+  ],
+  "interruption": {
+    "state": "interrupted",
+    "completedEpisodes": 8,
+    "pendingEpisode": {
+      "scenario": "regex-hostile",
+      "replicate": 0,
+      "arm": "baseline"
+    },
+    "reason": "Parent bash tool exceeded 540 seconds while the original SIGTERM recall watchdog did not complete the baseline hostile-regex subprocess.",
+    "partialUsage": "Unknown for the interrupted episode; do not count it as zero.",
+    "recovery": "Harness now uses SIGKILL solely for its owned disposable recall subprocess. Separate ab-live-regex-pilot completed both arms and control. This interrupted campaign is exploratory, not final evidence. No active benchmark process remained after interruption."
+  }
+}

@@ -26,7 +26,7 @@ export interface NoticeItem {
 /** What a transcript notice stores (custom entry data; never sent to the model). `text` is the plain one-line form (status-line fallback, ledger). */
 export interface NoticeData {
 	v: 2;
-	kind?: "state" | "card"; // absent: a fold/summary notice
+	kind?: "state" | "card" | "zipped"; // absent: a fold/summary notice
 	word?: StateWord;
 	key?: string; // a state line shown once per session under this key (default: its word)
 	reason?: string;

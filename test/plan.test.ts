@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, plan, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
+import { buildCut } from "../src/summary.ts";
+import { mandatoryUserTokens } from "../src/user-text.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 import { validateEdits } from "../src/guard.ts";
 const blockIdx = (blocks: { entryId: string | null }[], id: string) => blocks.findIndex((b) => b.entryId === id);
@@ -77,6 +79,56 @@ describe("after a pause (previous user turn)", () => {
 });
 
 describe("summary gate", () => {
+	test("prior non-user narrative plus new long request is priced against the actual buildCut", async () => {
+		const previousUser = "initial";
+		const previousText = "[summary of earlier conversation by pi-zip]\nCovers 4 earlier messages.\n## Narrative (model-written)\n" + "carry-forward-fact ".repeat(100) + "\n## User requests (available originals, oldest first; JSON strings decode to exact user messages)\n" + JSON.stringify({ messages: [previousUser], unavailableEarlier: 0 });
+		const newUser = "retain-this-approval ".repeat(2200);
+		const comp = { sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: previousText }] };
+		const entries = [comp, U("u1", newUser), AX("a1", 160_000), U("u2", "second"), AX("a2", 160_000), U("u3", "current"), A("a3"), U("u4", "now")];
+		const trace: NonNullable<PlanOpts["trace"]> = [];
+		const q = plan(entries, opts({ coldCap: 5000, promptPending: false, trace }));
+		const cut = q?.c;
+		expect(cut?.cutIdx).not.toBeNull();
+		const actual = await buildCut(cut!, { model: null } as Any);
+		const mandatory = mandatoryUserTokens({ items: [previousUser], omitted: 0 }, [newUser, "second"]);
+		expect(actual.summaryTokens).toBeGreaterThan(Math.max(8000, cut!.blocks[0].tokens, mandatory + 300));
+		expect(cut!.summaryTokensPlanned).toBeGreaterThanOrEqual(mandatory + 300);
+		expect(cut!.summaryTokensPlanned).toBeGreaterThanOrEqual(actual.summaryTokens);
+	});
+	test("legacy user section is not charged twice with its retained non-user narrative", () => {
+		const oldRequest = "legacy-request ".repeat(1800);
+		const previousText = `## User requests (verbatim, oldest first)\n1. ${oldRequest}\n## Narrative (model-written)\n${"retained-note ".repeat(120)}`;
+		const nextRequest = "new-request ".repeat(1000);
+		const comp = { sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: previousText }] };
+		const entries = [comp, U("u1", nextRequest), AX("a1", 200_000), U("u2", "second"), AX("a2", 200_000), U("u3", "current"), A("a3"), U("u4", "now")];
+		const cut = plan(entries, opts({ coldCap: 5000, promptPending: false }))?.c;
+		expect(cut?.cutIdx).not.toBeNull();
+		const mandatory = mandatoryUserTokens({ items: [oldRequest], omitted: 0 }, [nextRequest, "second"]);
+		expect(cut!.summaryTokensPlanned).toBeGreaterThanOrEqual(mandatory + 300);
+		expect(cut!.summaryTokensPlanned).toBeLessThan(cut!.blocks[0].tokens + mandatory);
+	});
+
+	test("legacy clipped summary is priced using active-branch user originals", () => {
+		const original = "approval constraint ".repeat(3500);
+		const head = "## User requests (verbatim, oldest first, continuation lines indented)\n1. ≈ clipped approval\n## Narrative\nold";
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", firstKeptEntryId: "tail" }, messages: [{ role: "compactionSummary", summary: head }] };
+		const entries = [comp, U("tail", "kept"), AX("old", 90_000), U("u2", "second"), AX("more", 90_000), U("u3", "third"), A("last"), U("u4", "now")];
+		const branch = [U("original", original).sourceEntry, { id: "cmp", type: "compaction", firstKeptEntryId: "tail" }, U("tail", "kept").sourceEntry];
+		const trace: NonNullable<PlanOpts["trace"]> = [];
+		plan(entries, opts({ coldCap: 3000, promptPending: false, branch, trace }));
+		expect(trace.filter((t) => t.where === "summary").length).toBeGreaterThan(0);
+		expect(trace.filter((t) => t.where === "summary").every((t) => t.A > original.length / 4)).toBe(true);
+	});
+
+	test("mandatory user text can exceed the summary cap and blocks a false saving", () => {
+		const large = "approval constraint ".repeat(4000);
+		const entries = [U("u1", large), AX("x1", 90_000), U("u2", large), AX("x2", 90_000), U("u3", "current"), A("a3"), U("u4", "now")];
+		const trace: NonNullable<PlanOpts["trace"]> = [];
+		const q = plan(entries, opts({ coldCap: 3000, promptPending: false, trace }));
+		expect(q).not.toBeNull();
+		if (q!.c) expect(q!.c.summaryTokensPlanned).toBeGreaterThan(large.length / 2);
+		else expect(trace.filter((t) => t.where === "summary").every((t) => t.A > large.length / 2 || !t.ok)).toBe(true);
+	});
 	const sumCtx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
 	test("a big prefix plans the same cut in the settle and run-start views; folds before the cut are void", () => {
 		const s = planContext(sumCtx, opts({ coldCap: 6000 }))!;

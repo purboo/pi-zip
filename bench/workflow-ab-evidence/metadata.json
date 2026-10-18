@@ -1,0 +1,110 @@
+[
+  {
+    "batch": "users",
+    "version": 1,
+    "provider": "openai-codex",
+    "modelId": "gpt-6.1-sol",
+    "reasoning": "low",
+    "live": true,
+    "reps": 3,
+    "scenarios": [
+      "user-long",
+      "user-many"
+    ],
+    "harnessHash": "9cbd149858f1d7713276ede4a0780055b6962dbe268235e0e84440a1d1f93919",
+    "baselineSourceHash": "8c5df472e5022ebf23982bbc898d67bd1cbc45b16b027ed7e884dd8704ddefc6",
+    "candidateSourceHash": "76348d1e90faa12bc35f2adccb283e22936e7df990af7c0ef540d6a48ce8ad49",
+    "bunVersion": "1.3.6",
+    "baselineCommit": "031741781fb08a39440e6bd19d2731b2d971774e",
+    "candidateCommit": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+    "assumptions": [
+      "Synthetic paired replay, not a longitudinal autonomous-agent benchmark",
+      "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms",
+      "No actual cache-lifetime measurement; user-* cases call real buildCut at a fixed protected cut with an injected narrative failure, independently testing deterministic retention",
+      "Fresh session ids and alternating order; provider caching still recorded",
+      "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog",
+      "Subscription cost metadata is not actual marginal billing"
+    ]
+  },
+  {
+    "batch": "arc",
+    "version": 1,
+    "provider": "openai-codex",
+    "modelId": "gpt-6.1-sol",
+    "reasoning": "low",
+    "live": true,
+    "reps": 3,
+    "scenarios": [
+      "arc-unneeded",
+      "arc-needed"
+    ],
+    "harnessHash": "9cbd149858f1d7713276ede4a0780055b6962dbe268235e0e84440a1d1f93919",
+    "baselineSourceHash": "8c5df472e5022ebf23982bbc898d67bd1cbc45b16b027ed7e884dd8704ddefc6",
+    "candidateSourceHash": "76348d1e90faa12bc35f2adccb283e22936e7df990af7c0ef540d6a48ce8ad49",
+    "bunVersion": "1.3.6",
+    "baselineCommit": "031741781fb08a39440e6bd19d2731b2d971774e",
+    "candidateCommit": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+    "assumptions": [
+      "Synthetic paired replay, not a longitudinal autonomous-agent benchmark",
+      "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms",
+      "No actual cache-lifetime measurement; user-* cases call real buildCut at a fixed protected cut with an injected narrative failure, independently testing deterministic retention",
+      "Fresh session ids and alternating order; provider caching still recorded",
+      "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog",
+      "Subscription cost metadata is not actual marginal billing"
+    ]
+  },
+  {
+    "batch": "safety",
+    "version": 1,
+    "provider": "openai-codex",
+    "modelId": "gpt-6.1-sol",
+    "reasoning": "low",
+    "live": true,
+    "reps": 3,
+    "scenarios": [
+      "arc-no-recall",
+      "changed-large-read"
+    ],
+    "harnessHash": "9cbd149858f1d7713276ede4a0780055b6962dbe268235e0e84440a1d1f93919",
+    "baselineSourceHash": "8c5df472e5022ebf23982bbc898d67bd1cbc45b16b027ed7e884dd8704ddefc6",
+    "candidateSourceHash": "76348d1e90faa12bc35f2adccb283e22936e7df990af7c0ef540d6a48ce8ad49",
+    "bunVersion": "1.3.6",
+    "baselineCommit": "031741781fb08a39440e6bd19d2731b2d971774e",
+    "candidateCommit": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+    "assumptions": [
+      "Synthetic paired replay, not a longitudinal autonomous-agent benchmark",
+      "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms",
+      "No actual cache-lifetime measurement; user-* cases call real buildCut at a fixed protected cut with an injected narrative failure, independently testing deterministic retention",
+      "Fresh session ids and alternating order; provider caching still recorded",
+      "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog",
+      "Subscription cost metadata is not actual marginal billing"
+    ]
+  },
+  {
+    "batch": "regex",
+    "version": 1,
+    "provider": "openai-codex",
+    "modelId": "gpt-6.1-sol",
+    "reasoning": "low",
+    "live": true,
+    "reps": 3,
+    "scenarios": [
+      "regex-hostile",
+      "regex-control"
+    ],
+    "harnessHash": "9cbd149858f1d7713276ede4a0780055b6962dbe268235e0e84440a1d1f93919",
+    "baselineSourceHash": "8c5df472e5022ebf23982bbc898d67bd1cbc45b16b027ed7e884dd8704ddefc6",
+    "candidateSourceHash": "76348d1e90faa12bc35f2adccb283e22936e7df990af7c0ef540d6a48ce8ad49",
+    "bunVersion": "1.3.6",
+    "baselineCommit": "031741781fb08a39440e6bd19d2731b2d971774e",
+    "candidateCommit": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+    "assumptions": [
+      "Synthetic paired replay, not a longitudinal autonomous-agent benchmark",
+      "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms",
+      "No actual cache-lifetime measurement; user-* cases call real buildCut at a fixed protected cut with an injected narrative failure, independently testing deterministic retention",
+      "Fresh session ids and alternating order; provider caching still recorded",
+      "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog",
+      "Subscription cost metadata is not actual marginal billing"
+    ]
+  }
+]

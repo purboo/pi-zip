@@ -53,6 +53,7 @@ function populate(sm: SessionManager, prose = 0) {
 }
 
 const sendPrompt = (sm: SessionManager, text: string) => sm.appendMessage(user(text, 10_000_000));
+const zippedNotices = (sm: SessionManager) => sm.getBranch().filter((e: Any) => e.type === "custom" && e.customType === "pi-zip/notice" && e.data?.kind === "zipped");
 // timestamps are bookkeeping: no provider puts them in a request payload
 const llm = (messages: Any[], mid: boolean) => JSON.stringify(resolveTranscript(normalizeContext({ messages: convertToLlm(messages) }), mid).messages, (k, v) => (k === "timestamp" ? undefined : v));
 
@@ -245,7 +246,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		return { contextEntries: projection.entries, contextMessages: projection.messages, llmMessages: convertToLlm(projection.messages), pendingMessages: [], canContinue: false };
 	};
 	/** What Pi's agent session does at turn_end: boundary handlers propose entries, the drafts are applied to the real session. */
-	const turnEnd = async (assistantEntryId: string, message: Any) => {
+	const turnEnd = async (assistantEntryId: string, message: Any, persist = true) => {
 		const out = await runner.emitBoundary({ type: "turn_end", turnIndex: 1, message, toolResults: [], messageEntryId: assistantEntryId, toolResultEntryIds: [], outcome: message.stopReason === "aborted" ? "aborted" : "completed" } as Any, build as Any);
 		const drafts = out.entries as Any[];
 		const marker = drafts.find((d) => d.type === "custom" && d.customType === "pi-zip/commit");
@@ -253,6 +254,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 			if (draft.type === "compaction" && draft.details?.by === "pi-zip" && draft.details.carried !== containsCut(actualRequest, draft)) checks.carry.push("summary carried flag disagrees with request");
 			if (draft.type === "context_edit" && JSON.stringify(draft.replacement).includes("[folded by pi-zip") && marker && (marker.data.carried && (!marker.data.carriedIds || marker.data.carriedIds.includes(draft.targetId))) !== containsFold(actualRequest, draft.targetId, draft.replacement.content)) checks.carry.push("fold carried flag disagrees with request");
 		}
+		if (!persist) return drafts;
 		apply(sm, drafts);
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		checkSizes(projectionMessages());
@@ -279,9 +281,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		await runner.emitInput(text, undefined, "interactive", undefined);
 		await o.afterInput?.();
 		if (order === "1.2") busy = true;
-		const r = order === "1.2"
-			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
-			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+		const r = await runner.emitBeforeAgentStart({ messageType: "user", prompt: text }, { cwd: CWD } as Any);
 		await o.afterStart?.();
 		busy = !o.fail;
 		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
@@ -296,7 +296,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const message = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: Date.now() };
 		if (order === "1.2") {
 			busy = true;
-			await runner.emit({ type: "before_agent_start", messageType: "custom", message, systemPromptOptions: { cwd: CWD } } as Any);
+			await runner.emitBeforeAgentStart({ messageType: "custom", message } as Any, { cwd: CWD } as Any);
 		}
 		busy = true;
 		await runner.emit({ type: "agent_start" } as Any);
@@ -810,6 +810,35 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		for (const mid of [true, false]) expect(llm(req3.slice(after), mid)).toBe(llm(req2.slice(at), mid));
 	});
 
+	for (const [tui, quiet] of [[true, false], [true, true], [false, false]]) test(`zipped confirmation belongs to the accepted compaction draft, not summary production (tui=${tui}, quiet=${quiet})`, async () => {
+		const r = await rig((sm) => populate(sm, 6000), { tui });
+		r.zip.quiet = quiet;
+		try {
+			sendPrompt(r.sm, "next request");
+			await produced(r);
+			await r.request();
+			expect(zippedNotices(r.sm)).toHaveLength(0);
+			const response = asst([call("zipped-draft")], "toolUse", 10_000_001);
+			const id = r.sm.appendMessage(response);
+			r.sm.appendMessage(result("zipped-draft", "tiny", 10_000_002));
+			const drafts = await r.turnEnd(id, response, false);
+			expect(drafts.filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(zippedNotices(r.sm)).toHaveLength(0);
+			expect(r.sm.getBranch().some((e: Any) => e.type === "compaction")).toBe(false);
+			(AgentSession.prototype as Any)._applyBoundaryDrafts.call({}, r.sm, drafts);
+			expect(zippedNotices(r.sm)).toHaveLength(tui && !quiet ? 1 : 0);
+			if (tui && !quiet) {
+				expect((zippedNotices(r.sm)[0] as Any).data.text).toBe("Conversation zipped!");
+				const branch = r.sm.getBranch();
+				expect(branch.indexOf(zippedNotices(r.sm)[0])).toBeGreaterThan(branch.findIndex((e: Any) => e.type === "compaction"));
+			}
+			expect(JSON.stringify(await r.request())).not.toContain("Conversation zipped!");
+		} finally {
+			await r.shutdown();
+		}
+	});
+
 	test("a summary and a fold persisted together: Pi's 'Compacted from N' is its usage-based size before the edits, not chars/4 of a half-applied batch", async () => {
 		const r = await rig((sm) => populate(sm, 6000), { tui: true });
 		sendPrompt(r.sm, "next request");
@@ -824,7 +853,7 @@ describe("real Pi: the request view is identical before and after turn_end persi
 		expect(piBefore).toBe(40_050 + Math.ceil(4_000 / 4)); // usage + the trailing tool result at chars/4
 		const all = await r.turnEnd(a, { ...asst([call("c8")], "toolUse"), usage: real });
 		expect(all.find((d: Any) => d.customType === "pi-zip/commit")).toMatchObject({ type: "custom", data: { carried: true, next: true } }); // a run plan: the run's requests had carried these edits
-		expect(all.filter((d: Any) => d.type === "custom").map((d: Any) => d.customType)).toEqual(["pi-zip/commit", "pi-zip/summary"]); // the record of the call, which ended inside the run
+		expect(all.filter((d: Any) => d.type === "custom").map((d: Any) => d.customType)).toEqual(["pi-zip/commit", "pi-zip/notice", "pi-zip/summary"]); // the record of the call, which ended inside the run
 		const drafts = all.filter((d: Any) => d.type !== "custom");
 		expect(drafts.map((d: Any) => d.type)).toEqual(["compaction", ...drafts.slice(1).map(() => "context_edit")]);
 		expect(drafts.length).toBeGreaterThan(1); // a fold in the kept part rides along
@@ -1576,6 +1605,25 @@ for (const order of ORDERS) describe(`the typed-prompt door opens at Pi's input 
 		expect(notice.native).toBe("ok");
 	});
 
+	if (order === "1.2") for (const at of ["before", "after"] as const) test(`memory-saving handler ${at} pi-zip completes without disabling native compaction`, async () => {
+		let saved = false;
+		const r = await readyRig({ foreign: { at, on: async (event) => {
+			await sleep(400);
+			expect(event.signal.aborted).toBe(false);
+			saved = true;
+		} } });
+		try {
+			expect(zippedNotices(r.sm)).toHaveLength(0);
+			await r.prompt();
+			expect(saved).toBe(true);
+			expect(r.compactions).toHaveLength(1);
+			expect(r.zip.nativeOff).toBeNull();
+			expect(zippedNotices(r.sm)).toHaveLength(1);
+		} finally {
+			await r.shutdown();
+		}
+	});
+
 	for (const behavior of ["steer", "followUp"] as const) test(`a ${behavior} typed while the run streams does not open the door`, async () => {
 		const r = await readyRig();
 		await r.drive(); // a run is streaming; its ready summary waits for turn_end (never a compaction inside a run)
@@ -1722,6 +1770,8 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		const { r, led } = await coldRig();
 		expect(r.compactCalls.n).toBe(1); // old code: none; the driven run's first request carried the whole folded history
 		expect(r.compactions[0].details).toMatchObject({ by: "pi-zip", via: "native", trigger: "cold", door: "idle" });
+		expect(zippedNotices(r.sm)).toHaveLength(1);
+		expect((zippedNotices(r.sm)[0] as Any).data.text).toBe("Conversation zipped!");
 		expect(led).toContainEqual(expect.objectContaining({ type: "idle_door", taken: true, pWarm: 0 }));
 		const carried = r.zip.idleNat;
 		expect(carried?.nat.before).toBe(r.compactions[0].tokensBefore);
@@ -1742,6 +1792,11 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 		const drafts = await r.turnEnd(id, response);
 		expect(drafts.some((d: Any) => d.type === "compaction")).toBe(false);
 		expect(r.sm.getBranch().filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+		expect(zippedNotices(r.sm)).toHaveLength(1);
+		expect(JSON.stringify(req)).not.toContain("Conversation zipped!");
+		const restored = await rig(undefined, { file: [r.sm.getHeader() as Any, ...r.sm.getBranch()], tui: true, start: false });
+		expect(zippedNotices(restored.sm)).toHaveLength(1);
+		await restored.shutdown();
 	});
 
 	/** Old compactions: one an extension since removed supplied (Pi's own details, fromHook), then one of pi-zip's, or the reverse. */
@@ -1883,6 +1938,7 @@ for (const order of ORDERS) describe(`the idle door: a ready summary goes in whi
 			expect(r.compactCalls.n).toBe(1);
 			expect(aborted, "a slow handler at the idle door is cancelled").toBe(true);
 			expect(r.compactions.length).toBe(0);
+			expect(zippedNotices(r.sm)).toHaveLength(0);
 			expect(r.abortsInRun.n).toBe(0);
 			expect(led.some((x: Any) => x.type === "native_fail" && x.error === "deadline")).toBe(true);
 		} finally {
@@ -2374,7 +2430,7 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "f6d9629b3c18c8a4101cfd5d92bc94b1"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "384dbbd126b2279dc19bf6d1d2fe48f5"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -2444,13 +2500,15 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		return parts;
 	};
 
-	test("three no-UI scenarios hash to the recorded digest; each summarises with one call nobody waits for, as with a UI", async () => {
+	test("three no-UI scenarios hash to the recorded digest; background calls do not block compaction", async () => {
 		const parts = await scenarios();
 		const digest = createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
 		if (process.env.R5_PRINT_DIGEST) console.log("R5 NO-UI DIGEST", digest, parts.map((p) => createHash("sha256").update(p).digest("hex").slice(0, 12)).join(" "));
-		// every scenario summarises (a compaction draft at a turn_end after its call finished), each with one narrative call made in the
-		// background (0.3.1: inside the hook, waited for)
-		for (const p of parts) expect([p.includes('"type":"compaction"'), /"narrativeCalls":1\b/.test(p)]).toEqual([true, true]);
+		parts.forEach((p, i) => {
+			const session = JSON.parse(p).at(-1);
+			expect(session.entries.filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+			expect(session.narrativeCalls).toBe(i === 2 ? 2 : 1);
+		});
 		expect(parts[1]).toContain('"trigger":"valve"');
 		expect(digest).toBe(NOUI_DIGEST);
 		// the same warm return with a UI and a slow call: no summary in its first request, and no wait
