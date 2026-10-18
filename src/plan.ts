@@ -617,7 +617,7 @@ export interface PlanOpts {
 	inturnAge?: number; // default settings().inturnAge (PI_ZIP_INTURN_AGE, 60); 0 = outputs of the protected turns never fold on age
 	rereadOnly?: boolean; // zip_recall is not available to the model: fold only outputs that can be re-read (classify "rereadable")
 	fileRecall?: FileRecall; // zip_recall is hidden but read, grep or bash is active: fold as in full mode, placeholders name the recall file
-	branch?: Any[]; // active branch for recovering earlier user messages from clipped legacy summaries
+	branch?: Any[];
 	cutAt?: string; // cut at this entry or not at all (a summary for that cut is produced or being produced: core.ts adopt)
 	foldsOnly?: boolean; // no cut: the plan of the folds alone (its summary is not ready: core.ts unready)
 	ready?: readonly string[];
