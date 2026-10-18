@@ -279,9 +279,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		await runner.emitInput(text, undefined, "interactive", undefined);
 		await o.afterInput?.();
 		if (order === "1.2") busy = true;
-		const r = order === "1.2"
-			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
-			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+		const r = await runner.emitBeforeAgentStart({ messageType: "user", prompt: text }, { cwd: CWD } as Any);
 		await o.afterStart?.();
 		busy = !o.fail;
 		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
@@ -296,7 +294,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		const message = { role: "custom", customType: "owed-drive", content: text, display: true, timestamp: Date.now() };
 		if (order === "1.2") {
 			busy = true;
-			await runner.emit({ type: "before_agent_start", messageType: "custom", message, systemPromptOptions: { cwd: CWD } } as Any);
+			await runner.emitBeforeAgentStart({ messageType: "custom", message } as Any, { cwd: CWD } as Any);
 		}
 		busy = true;
 		await runner.emit({ type: "agent_start" } as Any);
