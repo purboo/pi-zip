@@ -417,8 +417,11 @@ describe("recall", () => {
 		const seen: any[] = [];
 		registerRecallTool({ registerTool: (t: any) => (def = t) } as any, { onRecall: (...a: any[]) => seen.push(a) });
 		const ctx = { sessionManager: { getBranch: () => session } };
-		const r = await def.execute("t", { grep: "timeout \\d+s" }, undefined, undefined, ctx);
+		const r = await def.execute("t", { grep: "timeout [0-9][0-9]s" }, undefined, undefined, ctx);
 		expect(r.isError).toBe(false);
+		const unsupported = await def.execute("t", { grep: "timeout \\d+s" }, undefined, undefined, ctx);
+		expect(unsupported.content[0].text).toContain("searched as literal text");
+		expect(unsupported.content[0].text).toContain("0 matching line(s)");
 		expect(r.content[0].text).toContain("1 matching line(s) in 1 output(s)");
 		expect(r.content[0].text).toContain(`[handle ${handleFor("e1")} \u00b7 bash npm test`);
 		expect(seen[0][0]).toEqual([]); // a search marks nothing as recalled

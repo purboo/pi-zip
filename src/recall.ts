@@ -20,14 +20,34 @@ export function parseRange(spec: string): { from: number; to: number } | null {
 	return from >= 1 && to >= from && to - from <= 100_000 ? { from, to } : null;
 }
 
-// Regex shapes that can backtrack catastrophically on a long line: a quantified group that itself holds a quantifier or an
-// alternation, and back-references. They are searched as literal text instead (a sync regex cannot be interrupted).
-const RISKY_REGEX = /\((?:[^()\\]|\\.)*(?:[+*]|\{\d*,\d*\}|\|)(?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d)|\\[1-9]|\\k</;
+const SIMPLE_ESCAPE = /[dDsSwWnrtfv0.*+?^${}()|[\]\\/\-]/;
 
-/** Case-insensitive regex for a grep pattern, or the pattern as literal text when it does not compile or could backtrack badly. */
+/** Only unquantified atoms, classes, anchors and alternation reach the synchronous regex engine; every branch has bounded width. */
+function boundedRegexPattern(p: string): boolean {
+	let inClass = false;
+	let classStart = -1;
+	for (let i = 0; i < p.length; i++) {
+		const c = p[i];
+		if (c === "\\") {
+			if (++i === p.length || !SIMPLE_ESCAPE.test(p[i])) return false;
+			continue;
+		}
+		if (inClass) {
+			if (c === "]" && i > classStart + 1 && !(i === classStart + 2 && p[classStart + 1] === "^")) inClass = false;
+			continue;
+		}
+		if (c === "[") { inClass = true; classStart = i; continue; }
+		if (c === "^" && i !== 0 && p[i - 1] !== "|") return false;
+		if (c === "$" && i !== p.length - 1 && p[i + 1] !== "|") return false;
+		if ("*+?{}()]".includes(c)) return false;
+	}
+	return !inClass;
+}
+
+/** Case-insensitive grep regex for bounded-width syntax; unsupported or invalid patterns search as literal text. */
 export function grepMatcher(p: string): { re: RegExp; literal: boolean } {
 	const escaped = () => new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-	if (p.length > GREP_MAX_PATTERN || RISKY_REGEX.test(p)) return { re: escaped(), literal: true };
+	if (p.length > GREP_MAX_PATTERN || !boundedRegexPattern(p)) return { re: escaped(), literal: true };
 	try {
 		return { re: new RegExp(p, "i"), literal: false };
 	} catch {
@@ -252,7 +272,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			"listed with a handle in a pi-zip summary. Whenever you need what such an output said, recall it first: it is instant, free and has no side effects, " +
 			"while re-running a command or re-reading a file costs a step and may give a different result. Never guess the content of a folded output. " +
 			"Pass its handle (10 characters, from the block's marker line or the summary; handles stay valid after later summaries or compaction), or several with handles. " +
-			'For a part, add grep (case-insensitive regular expression; matching lines with line numbers) or range (e.g. "120-240"). ' +
+			'For a part, add grep (case-insensitive bounded-width regex: classes, anchors, alternation; repetition, groups and unsupported syntax search as literal text) or range (e.g. "120-240"). ' +
 			"No handle at hand? grep alone searches every earlier tool output of the session and labels each match with its output's handle and command. " +
 			"Large results come in pages of characters: when a page says more is left, call again with offset.",
 		parameters: {
@@ -260,7 +280,7 @@ export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 			properties: {
 				handle: { type: "string", description: "A handle from a folded block's marker line or a summary" },
 				handles: { type: "array", items: { type: "string" }, description: "Optional batch: several handles at once; each is returned as its own labelled section" },
-				grep: { type: "string", description: "Optional: only lines matching this case-insensitive regular expression, with line numbers (applied to every handle). Without any handle: searches every earlier tool output of the session" },
+				grep: { type: "string", description: "Optional: case-insensitive bounded-width regex (classes, anchors, alternation); repetition, groups and unsupported syntax search as literal text. Lines include numbers. Without a handle: searches every earlier tool output" },
 				range: { type: "string", description: 'Optional: only this line range, e.g. "120-240" (applied to every handle)' },
 				offset: { type: "number", description: "Optional: start this many characters into the (selected) text, for the next page of a large output or a very long single line (applied to every handle)" },
 				limit: { type: "number", description: `Optional: page size in characters (default ${RECALL_PAGE_CHARS}; ${SEARCH_PAGE_CHARS} for grep without a handle; at most ${RECALL_MAX_PAGE_CHARS})` },

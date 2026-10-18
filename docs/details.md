@@ -115,7 +115,7 @@ zip_recall({ handle: "k3f9a0x1qz", offset: 20000 })               // next page, 
 zip_recall({ handle: "k3f9a0x1qz", offset: 20000, limit: 50000 }) // up to 50,000 characters per page
 ```
 
-Paging is by characters, so even one 45,000-character line can be read in full, and the pages add up to the original byte for byte. `offset` and `limit` also page a `grep` or `range` selection. `grep` is a case-insensitive regular expression; patterns that could backtrack badly (nested quantifiers, quantified alternation, back-references, very long patterns) are searched as literal text instead.
+Paging is by characters, so even one 45,000-character line can be read in full, and the pages add up to the original byte for byte. `offset` and `limit` also page a `grep` or `range` selection. `grep` is a case-insensitive regular expression for bounded-width syntax (literal characters, character classes, `.`, simple escapes such as `\d` and `\s`, anchors and `|`). Repetition (`*`, `+`, `?`, `{…}`), groups, back-references, lookaround, unsupported escapes, invalid expressions and patterns longer than 256 characters are searched as literal text instead; the result header says when this happens. This keeps synchronous searches safe on long lines, but queries using those constructs need a simpler pattern or a literal substring.
 
 ### Recall through files
 
