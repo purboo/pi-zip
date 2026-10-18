@@ -5,6 +5,7 @@ import { isAbsolute, join } from "node:path";
 import type { Any } from "./util.ts";
 
 export type Recover = "rereadable" | "nonrereadable";
+export interface RecoverabilityPolicy { exactRecall: boolean }
 
 const READ_ONLY_CMDS = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "file", "stat", "du", "pwd", "echo"]);
 const READ_ONLY_GIT = new Set(["log", "show", "diff", "status", "blame", "shortlog"]);
@@ -20,13 +21,13 @@ const ARC_FLAGS: Record<string, Set<string>> = {
 	show: new Set(["--quiet", "-q", "--oneline", "--stat", "--name-only", "--name-status", "--no-color", "--no-decorate"]),
 };
 
-/** Read-only bash whitelist: every pipe/;/&& segment must be a whitelisted command with no write or exec option; substitutions, redirections and background jobs are never read-only. */
-export function isReadOnlyBash(cmd: string): boolean {
+/** Read-only bash whitelist: every pipe/;/&& segment must be whitelisted; Arc additionally requires exact recall before its output can be folded. */
+export function isReadOnlyBash(cmd: string, policy: RecoverabilityPolicy = { exactRecall: true }): boolean {
 	const c = String(cmd ?? "").replace(/2>(\/dev\/null|&1)/g, " ").trim();
 	if (!c || /[<>`]|\$\(/.test(c)) return false; // any remaining redirection can write; $(...) and backticks run arbitrary commands
 	if (/&/.test(c.replace(/&&/g, ";"))) return false; // a lone & backgrounds a job (and `&>` redirects)
 	const cdArc = /^cd\s+\/[A-Za-z0-9._/-]+\s*&&\s*(arc\s+[^\n;&|]+)$/.exec(c);
-	if (cdArc) return isReadOnlyBash(cdArc[1]);
+	if (cdArc) return isReadOnlyBash(cdArc[1], policy);
 	const segments = c.split(/[|;\n]|&&/).map((s) => s.trim()).filter(Boolean);
 	if (!segments.length) return false;
 	for (const seg of segments) {
@@ -47,6 +48,7 @@ export function isReadOnlyBash(cmd: string): boolean {
 			continue;
 		}
 		if (head === "arc") {
+			if (!policy.exactRecall) return false;
 			const flags = ARC_FLAGS[toks[1] ?? ""];
 			if (!flags || !toks.slice(2).every((t) => flags.has(t) || /^[A-Za-z0-9_./:@^~+]+$/.test(t))) return false;
 			continue;
@@ -63,9 +65,9 @@ export function isReadOnlyBash(cmd: string): boolean {
 
 /**
  * read: rereadable only for a bounded-size full read whose file content still equals the tool result; partial and oversized reads cannot be verified here.
- * bash: rereadable iff read-only, including a narrow Arc history/status whitelist and a literal cd prefix. grep/find/ls/glob: re-runnable queries. Everything else: not rereadable.
+ * bash: rereadable iff read-only; Arc commands require exact recall. grep/find/ls/glob: re-runnable queries. Everything else: not rereadable.
  */
-export function classifyRecoverability(tool: string, args: Any, rawText: string, cwd: string): Recover {
+export function classifyRecoverability(tool: string, args: Any, rawText: string, cwd: string, policy: RecoverabilityPolicy = { exactRecall: true }): Recover {
 	tool = String(tool ?? "").toLowerCase();
 	const a: Any = args ?? {};
 	if (tool === "read") {
@@ -83,7 +85,7 @@ export function classifyRecoverability(tool: string, args: Any, rawText: string,
 			return "nonrereadable";
 		}
 	}
-	if (tool === "bash") return typeof a.command === "string" && isReadOnlyBash(a.command) ? "rereadable" : "nonrereadable";
+	if (tool === "bash") return typeof a.command === "string" && isReadOnlyBash(a.command, policy) ? "rereadable" : "nonrereadable";
 	if (tool === "grep" || tool === "find" || tool === "ls" || tool === "glob") return "rereadable";
 	return "nonrereadable";
 }

@@ -707,7 +707,7 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	}
 	const classify = (b: Block): Recover => {
 		const call = calls.get(b.msg.toolCallId);
-		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd);
+		return classifyRecoverability(call?.name ?? b.msg.toolName ?? "", call?.args, textOf((b.raw ?? b.msg).content), o.cwd, { exactRecall: !o.rereadOnly || !!o.fileRecall });
 	};
 	const addFold = (b: Block, trig: string): boolean => {
 		if (tokOverride.has(b.idx) || recalled.has(handleFor(b.entryId!))) return false; // F4: never refold what the model recalled
