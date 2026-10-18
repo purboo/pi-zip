@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
+import { applyPlanToMessages, buildBlocks, compactionRoom, contentKeyOf, plan, planContext, settings, type Cut, type FoldTarget, type PlanOpts, type RunPlan } from "../src/plan.ts";
 import { lawPrices } from "../src/learn.ts";
 import { A, AX, flat, longTurn, R, U, type Any } from "./helpers.ts";
 import { validateEdits } from "../src/guard.ts";
@@ -77,6 +77,27 @@ describe("after a pause (previous user turn)", () => {
 });
 
 describe("summary gate", () => {
+	test("legacy clipped summary is priced using active-branch user originals", () => {
+		const original = "approval constraint ".repeat(3500);
+		const head = "## User requests (verbatim, oldest first, continuation lines indented)\n1. ≈ clipped approval\n## Narrative\nold";
+		const comp = { sourceEntry: { id: "cmp", type: "compaction", firstKeptEntryId: "tail" }, messages: [{ role: "compactionSummary", summary: head }] };
+		const entries = [comp, U("tail", "kept"), AX("old", 90_000), U("u2", "second"), AX("more", 90_000), U("u3", "third"), A("last"), U("u4", "now")];
+		const branch = [U("original", original).sourceEntry, { id: "cmp", type: "compaction", firstKeptEntryId: "tail" }, U("tail", "kept").sourceEntry];
+		const trace: NonNullable<PlanOpts["trace"]> = [];
+		plan(entries, opts({ coldCap: 3000, promptPending: false, branch, trace }));
+		expect(trace.filter((t) => t.where === "summary").length).toBeGreaterThan(0);
+		expect(trace.filter((t) => t.where === "summary").every((t) => t.A > original.length / 4)).toBe(true);
+	});
+
+	test("mandatory user text can exceed the summary cap and blocks a false saving", () => {
+		const large = "approval constraint ".repeat(4000);
+		const entries = [U("u1", large), AX("x1", 90_000), U("u2", large), AX("x2", 90_000), U("u3", "current"), A("a3"), U("u4", "now")];
+		const trace: NonNullable<PlanOpts["trace"]> = [];
+		const q = plan(entries, opts({ coldCap: 3000, promptPending: false, trace }));
+		expect(q).not.toBeNull();
+		if (q!.c) expect(q!.c.summaryTokensPlanned).toBeGreaterThan(large.length / 2);
+		else expect(trace.filter((t) => t.where === "summary").every((t) => t.A > large.length / 2 || !t.ok)).toBe(true);
+	});
 	const sumCtx = [U("u1", "one"), A("a1", ["c1"]), R("r1", "c1", 44_000), AX("a2", 120_000), U("u2", "two"), A("a3", ["c3"]), R("r3", "c3", 44_000), AX("a4", 120_000), U("u3", "three"), A("a5")];
 	test("a big prefix plans the same cut in the settle and run-start views; folds before the cut are void", () => {
 		const s = planContext(sumCtx, opts({ coldCap: 6000 }))!;

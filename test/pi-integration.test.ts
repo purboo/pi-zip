@@ -2372,7 +2372,7 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "f6d9629b3c18c8a4101cfd5d92bc94b1"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	const NOUI_DIGEST = "384dbbd126b2279dc19bf6d1d2fe48f5"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -2442,13 +2442,15 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		return parts;
 	};
 
-	test("three no-UI scenarios hash to the recorded digest; each summarises with one call nobody waits for, as with a UI", async () => {
+	test("three no-UI scenarios hash to the recorded digest; background calls do not block compaction", async () => {
 		const parts = await scenarios();
 		const digest = createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 32);
 		if (process.env.R5_PRINT_DIGEST) console.log("R5 NO-UI DIGEST", digest, parts.map((p) => createHash("sha256").update(p).digest("hex").slice(0, 12)).join(" "));
-		// every scenario summarises (a compaction draft at a turn_end after its call finished), each with one narrative call made in the
-		// background (0.3.1: inside the hook, waited for)
-		for (const p of parts) expect([p.includes('"type":"compaction"'), /"narrativeCalls":1\b/.test(p)]).toEqual([true, true]);
+		parts.forEach((p, i) => {
+			const session = JSON.parse(p).at(-1);
+			expect(session.entries.filter((e: Any) => e.type === "compaction")).toHaveLength(1);
+			expect(session.narrativeCalls).toBe(i === 2 ? 2 : 1);
+		});
 		expect(parts[1]).toContain('"trigger":"valve"');
 		expect(digest).toBe(NOUI_DIGEST);
 		// the same warm return with a UI and a slow call: no summary in its first request, and no wait

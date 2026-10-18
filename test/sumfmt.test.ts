@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, toolCallIndex } from "../src/plan.ts";
 import { cmdLabel, distinctLines, handleFor, jsonKeyFields, keyTexts, makePlaceholder, makePlaceholderFor, sharedCdDirs, shortArgs, strippableCdDirs } from "../src/placeholder.ts";
-import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, skeleton, TABLE_ROWS } from "../src/summary.ts";
+import { BUDGET, buildCut, handleRowsOf, INDEX_TOKENS, parseSummary, skeleton, TABLE_ROWS } from "../src/summary.ts";
 import { A, type Any, U } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -197,7 +197,6 @@ describe("times instead of turn numbers (2026-10-11 item 4, 2026-10-10 item 5)",
 
 describe("smaller mechanical lists (2026-10-11 item 2, 2026-10-10 item 3)", () => {
 	test("the budgets are the eval-chosen ones (research round5/sumfmt.md), about 60% of v0.3.0's", () => {
-		expect(BUDGET.users + BUDGET.usersFirst + BUDGET.usersShort).toBeLessThanOrEqual(8000); // was 16,000
 		expect(BUDGET.cmds).toBeLessThanOrEqual(5000); // was 10,000
 		expect(BUDGET.others).toBeLessThanOrEqual(3000); // was 5,000
 		expect(BUDGET.errors).toBeLessThanOrEqual(2000); // was 4,000
@@ -205,7 +204,7 @@ describe("smaller mechanical lists (2026-10-11 item 2, 2026-10-10 item 3)", () =
 		expect(INDEX_TOKENS).toBeGreaterThanOrEqual(2500); // was 1,500: handles moved from the lists to the index, one short row each
 	});
 
-	test("a long session: 200 requests and 600 commands give a summary of about 22K chars (v0.3.0: 31K), the first request and the newest verbatim, every handle accounted for", async () => {
+	test("a long session: all 200 requests survive while the other mechanical lists stay bounded", async () => {
 		let prev: string | null = null;
 		let text = "";
 		for (let L = 0; L < 10; L++) {
@@ -218,10 +217,8 @@ describe("smaller mechanical lists (2026-10-11 item 2, 2026-10-10 item 3)", () =
 			text = await cutOf(entries);
 			prev = text;
 		}
-		expect(text.length).toBeLessThan(26_000); // 22.2K (v0.3.0: 31.3K)
-		expect(text).toContain("\n1. REQUEST 1: please");
-		expect(text).toContain("\n200. REQUEST 200: please");
-		expect(text).toMatch(/\n\d+\. ≈ REQUEST \d+: please/);
+		expect(parseSummary(text).users.items).toEqual(Array.from({ length: 200 }, (_, i) => `REQUEST ${i + 1}: ` + "please do the next thing on the list, carefully ".repeat(8)));
+		expect(text.length).toBeLessThan(105_000);
 		expect(text).toContain('a leading "cd <dir> &&" is left out for: /work/repo');
 	});
 });

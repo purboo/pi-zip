@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildBlocks, NARRATIVE_CALL_MAX, NARRATIVE_MAX, toolCallIndex } from "../src/plan.ts";
 import { handleFor } from "../src/placeholder.ts";
-import { BUDGET, buildCut, FIRST_REQUESTS, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS, EFFORT_REFUSED_RE } from "../src/summary.ts";
+import { BUDGET, buildCut, handleRowsOf, handleTable, parseSummary, PREV_NARRATIVE_CHARS, previousNarrative, narrative, skeleton, TABLE_ROWS, EFFORT_REFUSED_RE } from "../src/summary.ts";
 import { A, R, U, type Any } from "./helpers.ts";
 
 const tcall = (id: string, name: string, args: Any) => {
@@ -56,25 +56,13 @@ const prevBlockOf = (prompt: string) => /<previous-narrative[^>]*>\n([\s\S]*?)\n
 const cmdHandle = (L: number, k: number) => handleFor(`r-b${L}-${k}`);
 
 describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
-	test("requests: the session's first one and the newest are verbatim, the ones between shortened then counted; numbers are the session's", async () => {
+	test("all requests survive every summary in order without shortening", async () => {
 		const texts = await chain(4);
-		const last = texts[3];
-		const lines = sec(last, "## User requests").split("\n").slice(1);
-		const nums = lines.filter((l) => /^\d+\. /.test(l)).map((l) => Number(/^(\d+)\./.exec(l)![1]));
-		expect(nums).toEqual([...nums].sort((a, b) => a - b)); // in order
-		expect(last).toContain(`\n1. REQ-1-1 please keep working on item 1.1; `); // the first request defines the task: kept, as number 1
-		expect(last).toContain(`\n16. REQ-4-4 please keep working on item 4.4; `); // the newest, verbatim
-		const verbatim = lines.filter((l) => /^\d+\. REQ-/.test(l)).length;
-		const short = lines.filter((l) => /^\d+\. ≈ REQ-\d+-\d+ please/.test(l));
-		const omitted = [...last.matchAll(/\[… (\d+) older requests omitted …\]/g)].reduce((a, m) => a + Number(m[1]), 0);
-		expect(short.length).toBeGreaterThan(0);
-		expect(short.every((l) => l.length <= 110)).toBe(true);
-		expect(verbatim + short.length + omitted).toBe(16); // every request is accounted for
-		expect(last.split("\n")[2]).toMatch(/^## User requests \(.*≈ shortened/);
-		// a shortened request stays shortened in the next summary; numbering stays the session's
-		const s3 = sec(texts[2], "## User requests").split("\n").filter((l) => /^\d+\. ≈ /.test(l));
-		for (const l of s3) if (last.includes(l.slice(0, 12))) expect(last).toContain(l);
-		expect(sec(last, "## User requests").length).toBeLessThan(BUDGET.users + BUDGET.usersFirst + BUDGET.usersShort + 500);
+		const requests = Array.from({ length: 4 }, (_, i) => level(i + 1).filter((e) => e.sourceEntry.message?.role === "user").map((e) => e.sourceEntry.message.content)).flat();
+		for (let i = 0; i < texts.length; i++) {
+			expect(parseSummary(texts[i]).users.items).toEqual(requests.slice(0, (i + 1) * 4));
+			expect(texts[i].endsWith(JSON.stringify({ messages: requests.slice(0, (i + 1) * 4), unavailableEarlier: 0 }))).toBe(true);
+		}
 	});
 
 	test("handles: the newest commands are listed, older ones are counted and their handles move to the index; nothing newer than the budget is lost", async () => {
@@ -231,10 +219,11 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 		expect(cut.text).toContain("KEYFACT-1: value-1");
 	});
 
-	test("size stays flat from level 2 on (it does not grow with depth)", async () => {
-		const sizes = (await chain(5)).map((t) => Math.ceil(t.length / 4));
-		expect(sizes[4]).toBeLessThan(sizes[2] * 1.25);
-		expect(sizes[4]).toBeLessThan(12_000); // tokens (chars/4)
+	test("non-user sections stay bounded while mandatory user text grows with the session", async () => {
+		const summaries = await chain(5);
+		const sizes = summaries.map((t) => Math.ceil(t.slice(0, t.indexOf("## User requests")).length / 4));
+		expect(sizes[4]).toBeLessThan(sizes[2] * 1.5);
+		expect(parseSummary(summaries[4]).users.items).toHaveLength(20);
 	});
 
 	test("the folded-outputs table keeps earlier rows with their hints, newest TABLE_ROWS, and counts the rest", async () => {
@@ -313,7 +302,7 @@ describe("old formats and foreign summaries", () => {
 		const t = skeleton(blocks, aeText).text;
 		expect(t.indexOf("OLD-ONE")).toBeLessThan(t.indexOf("OLD-TWO"));
 		expect(t.indexOf("OLD-TWO")).toBeLessThan(t.indexOf("NEW-ONE"));
-		expect(t).toContain("3. NEW-ONE");
+		expect(parseSummary(t).users.items.at(-1)).toBe("NEW-ONE");
 		expect(t).toContain("`bun test` -> exit 1 (turn 1, " + H("o1") + ")");
 		expect(t).toContain("`ls` -> exit 0 (turn 1)");
 		expect(t).toContain("- src/a.ts (read, edit)");
@@ -328,7 +317,8 @@ describe("old formats and foreign summaries", () => {
 		expect(p.users.omitted).toBe(5);
 		expect(p.narrative).toEqual([]); // "(unavailable ...)" is not content
 		const t = skeleton(buildBlocks([U("u1", "N1"), A("e")]), preV2).text;
-		expect(t).toContain("[… 5 older requests omitted …]\n6. P1\n7. P2\n8. P3\n9. P9\n10. P10\n11. N1");
+		expect(parseSummary(t).users.items).toEqual(["P1", "P2", "P3", "P9", "P10", "N1"]);
+		expect(t).not.toContain("requests omitted");
 	});
 
 	test("the older nested format (clipped carried-forward block inside a carried-forward block) keeps the newest level's items", () => {
@@ -356,7 +346,7 @@ describe("old formats and foreign summaries", () => {
 		const p = parseSummary(native);
 		expect(p.structured).toBe(false);
 		const t = skeleton(buildBlocks([U("u1", "NEW"), A("e")]), native).text;
-		expect(t).toContain("1. NEW");
+		expect(parseSummary(t).users.items).toEqual(["NEW"]);
 		expect(t).not.toContain("GOAL-LINE"); // not an excerpt in the skeleton any more
 		const prompts: string[] = [];
 		const merged = await cutOver(1, native, prompts);
@@ -381,31 +371,55 @@ describe("old formats and foreign summaries", () => {
 	test("empty, '(none)'-only, null and a bare mark all merge into an empty-but-valid summary", () => {
 		for (const prev of [null, "", "[summary of earlier conversation by pi-zip]", "## User requests (verbatim, oldest first)\n(none)\n## Files touched\n(none)"]) {
 			const t = skeleton(buildBlocks([U("u1", "ONLY"), A("e")]), prev).text;
-			expect(t).toContain("## User requests (verbatim, oldest first, continuation lines indented)\n1. ONLY\n## Files touched\n(none)");
+			expect(t).toContain("## Files touched\n(none)");
+			expect(parseSummary(t).users.items).toEqual(["ONLY"]);
 			expect(t).not.toContain("Earlier narrative");
 		}
 	});
 
-	test("the first request(s) of the session stay verbatim while they fit their budget (they define the task); the rest go oldest first, with a count", () => {
+	test("every request stays verbatim even when their combined length exceeds the former budgets", () => {
 		const big = (n: number) => `R${n} ` + "w".repeat(2700);
 		let prev: string | null = null;
 		for (let i = 0; i < 4; i++) prev = skeleton(buildBlocks([U(`a${i}`, big(i * 3)), U(`b${i}`, big(i * 3 + 1)), U(`c${i}`, big(i * 3 + 2)), A(`e${i}`)]), prev).text;
 		const t = prev!;
-		expect(t).toContain("\n1. R0 www"); // pinned
-		expect(t).not.toContain("\n2. R1 www"); // the second does not fit beside it: not pinned
-		expect(t).toContain("\n12. R11 www");
-		const listed = (t.match(/^\d+\. (≈ )?R\d+ /gm) ?? []).length;
-		const omitted = [...t.matchAll(/\[… (\d+) older requests omitted …\]/g)].reduce((a, m) => a + Number(m[1]), 0);
-		expect(listed + omitted).toBe(12);
-		expect(FIRST_REQUESTS).toBeGreaterThanOrEqual(1);
+		expect(parseSummary(t).users.items).toEqual(Array.from({ length: 12 }, (_, i) => big(i)));
 		// short first requests: the first FIRST_REQUESTS stay
 		let q: string | null = null;
 		for (let i = 0; i < 6; i++) q = skeleton(buildBlocks([U(`s${i}`, i === 0 ? "TASK: build X" : i === 1 ? "TASK2: and Y" : big(i)), A(`f${i}`)]), q).text;
-		expect(q).toContain("\n1. TASK: build X\n2. TASK2: and Y\n");
+		expect(parseSummary(q).users.items.slice(0, 2)).toEqual(["TASK: build X", "TASK2: and Y"]);
 	});
 });
 
 describe("user requests survive carry-forward intact", () => {
+	test("middle approval over 3000 characters, duplicates and whitespace survive repeated summaries", () => {
+		const approval = "  approve ONLY option B  \n" + "constraint=retain-this; ".repeat(220) + "\n\n## Errors\n1. literal heading  \n";
+		const items = [" first  ", approval, "same", "same", "\nlast\n"];
+		let t = skeleton(buildBlocks(items.flatMap((value, i) => [U(`req${i}`, value), A(`ans${i}`)])), null).text;
+		for (let i = 0; i < 3; i++) t = skeleton(buildBlocks([U(`later${i}`, `later ${i}`), A(`answer${i}`)]), t).text;
+		expect(parseSummary(t).users.items).toEqual([...items, "later 0", "later 1", "later 2"]);
+		expect(t.endsWith(JSON.stringify({ messages: parseSummary(t).users.items, unavailableEarlier: 0 }))).toBe(true);
+	});
+
+	test("clipped legacy requests recover only from active branch before its kept boundary", async () => {
+		const approval = "approve B " + "do not drop this constraint ".repeat(150);
+		const old = skeleton(buildBlocks([U("a", "first"), U("b", approval), U("c", "last")]), null).text;
+		const clipped = old.replace(JSON.stringify({ messages: ["first", approval, "last"], unavailableEarlier: 0 }), JSON.stringify({ messages: ["first", "last"], unavailableEarlier: 1 }));
+		const abandoned = U("abandoned", "approval from abandoned branch").sourceEntry;
+		const branch = [U("a", "first").sourceEntry, U("b", approval).sourceEntry, U("c", "last").sourceEntry,
+			{ type: "compaction", id: "comp", firstKeptEntryId: "tail" }, U("tail", "already kept").sourceEntry, U("new", "new instruction").sourceEntry];
+		const entries = [summaryEntry(clipped), U("tail", "already kept"), A("old"), U("new", "new instruction"), U("keep", "kept")];
+		const blocks = buildBlocks(entries);
+		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep"), prefixTokens: 20000, summaryTokensPlanned: 2000 };
+		const ctx = { model: { id: "m" }, modelRegistry: { complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: "narrative" }] }) }, sessionManager: { getBranch: () => branch } };
+		const recovered = parseSummary((await buildCut(p, ctx)).text).users;
+		expect(recovered.items).toEqual(["first", approval, "last", "already kept", "new instruction"]);
+		expect(recovered.omitted).toBe(0);
+		expect(branch).not.toContain(abandoned);
+		expect(recovered.items).not.toContain("approval from abandoned branch");
+		const unavailable = parseSummary((await buildCut(p, { ...ctx, sessionManager: { getBranch: () => branch.slice(3) } })).text).users;
+		expect(unavailable.items).toEqual(["first", "last", "already kept", "new instruction"]);
+		expect(unavailable.omitted).toBe(1);
+	});
 	const reqs = ["Steps:\n1. fix A\n2. fix B\n3. fix C", "ok go"];
 	const level = (names: string[]) => buildBlocks(names.flatMap((t, i) => [U(`x${i}-${t.length}-${Math.random()}`, t), A(`a${i}-${Math.random()}`)]));
 	const users = (text: string) => parseSummary(text).users;
@@ -416,27 +430,22 @@ describe("user requests survive carry-forward intact", () => {
 		expect(users(t).items).toEqual([...reqs, heading]);
 		t = skeleton(level(["next"]), t).text;
 		expect(users(t).items).toEqual([...reqs, heading, "next"]);
-		expect(t).toContain("1. Steps:\n   1. fix A");
+		expect(t).toContain(JSON.stringify(reqs[0]));
 		t = skeleton(level(["last"]), t).text;
 		expect(users(t).items).toEqual([...reqs, heading, "next", "last"]);
-		expect(t).toContain("4. next");
-		expect(t).toContain("5. last");
+		expect(users(t).items.slice(-2)).toEqual(["next", "last"]);
 		// the heading inside the request did not cut the real sections short
 		expect(t).toContain("\n## Files touched\n");
 	});
 
-	test("with the budget forcing a drop, whole requests go or are shortened, the count is exact and every request keeps its number", () => {
+	test("no request is shortened or dropped under a large former-budget overflow", () => {
 		const big = (n: number) => `REQ${n}\n1. item\n2. item\n` + "x".repeat(5000);
 		let t = skeleton(level(Array.from({ length: 10 }, (_, i) => big(i + 1))), null).text;
 		t = skeleton(level(Array.from({ length: 10 }, (_, i) => big(i + 11))), t).text;
 		t = skeleton(level([big(21)]), t).text;
 		const u = users(t);
-		expect(u.items.length + u.omitted).toBe(21);
-		expect(u.omitted).toBeGreaterThan(0);
-		for (const [i, item] of u.items.entries()) expect(item.replace(/^≈ /, "").startsWith(`REQ${u.nums![i]}`)).toBe(true);
-		expect(u.items.filter((x) => !x.startsWith("≈ ")).map((_, i) => u.nums![i])).toContain(1);
-		expect(t).toContain(`\n21. REQ21\n   1. item`);
-		expect(t).toContain(`\n1. REQ1\n   1. item`);
+		expect(u.items).toEqual(Array.from({ length: 21 }, (_, i) => big(i + 1)));
+		expect(u.omitted).toBe(0);
 	});
 
 	test("repeated identical requests are all kept, in order, across levels", () => {
@@ -444,7 +453,7 @@ describe("user requests survive carry-forward intact", () => {
 		expect(users(t).items).toEqual(["first", "yes", "now do Y", "yes"]);
 		t = skeleton(level(["yes", "yes"]), t).text;
 		expect(users(t).items).toEqual(["first", "yes", "now do Y", "yes", "yes", "yes"]);
-		expect(t).toContain("6. yes");
+		expect(t).toContain(JSON.stringify({ messages: users(t).items, unavailableEarlier: 0 }));
 	});
 
 	test("an older-format summary still parses heuristically (list numbers do not split when they are not last+1)", () => {
