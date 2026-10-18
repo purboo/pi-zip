@@ -310,7 +310,6 @@
       "src/user-text.ts"
     ]
   },
-  "rawArtifactsRoot": "/tmp/pi-zip-review.lcWYdr",
   "rawBatches": [
     "ab-final-users",
     "ab-final-arc",
@@ -322,5 +321,7 @@
     "User cases fix cut and inject narrative failure; successful live narrative generation is not tested",
     "Regex candidate explicitly searches unsupported syntax literally; baseline watchdog is external",
     "Final planning-only fixes have byte-identical replay views; gate changes validated with local tests, not new live runs"
-  ]
+  ],
+  "evidenceDirectory": "workflow-ab-evidence",
+  "rawArtifactsIncluded": false
 }
