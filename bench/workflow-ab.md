@@ -1,5 +1,7 @@
 # Workflow A/B replay
 
+Recorded local results and limitations: [workflow-ab-results.md](workflow-ab-results.md).
+
 `workflow-ab.ts` compares two checkout trees using the exact `openai-codex/gpt-6.1-sol` model, low reasoning, synthetic history only. It never runs model-proposed shell commands. File reads are restricted to generated fixture files; recall executes in an externally killable subprocess.
 
 ```sh

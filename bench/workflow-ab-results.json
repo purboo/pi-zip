@@ -1,0 +1,326 @@
+{
+  "version": 1,
+  "model": "openai-codex/gpt-6.1-sol",
+  "reasoning": "low",
+  "baselineCommit": "031741781fb08a39440e6bd19d2731b2d971774e",
+  "liveCandidateCommit": "b38aae106b2834956e0206a2ac09c127a8b74c4b",
+  "verifiedCandidateCommit": "b45bed8cd329237e6dbdba2b0f8a85c85a9ee8ff",
+  "baselineSourceHash": "8c5df472e5022ebf23982bbc898d67bd1cbc45b16b027ed7e884dd8704ddefc6",
+  "liveCandidateSourceHash": "76348d1e90faa12bc35f2adccb283e22936e7df990af7c0ef540d6a48ce8ad49",
+  "harnessHash": "9cbd149858f1d7713276ede4a0780055b6962dbe268235e0e84440a1d1f93919",
+  "pairedReplicatesPerScenario": 3,
+  "episodes": 48,
+  "modelCalls": 66,
+  "scenarios": [
+    {
+      "name": "user-long",
+      "baseline": {
+        "episodes": 3,
+        "successes": 0,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 2291.3333333333335,
+        "elapsedMsMedian": 6332.495125000001,
+        "usageSum": {
+          "input": 6874,
+          "output": 100,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 6974
+        }
+      },
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 1465.3333333333333,
+        "elapsedMsMedian": 2628.8887079999986,
+        "usageSum": {
+          "input": 4396,
+          "output": 43,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 4439
+        }
+      },
+      "inputRatioCandidateToBaseline": 0.6395112016293278
+    },
+    {
+      "name": "user-many",
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 3048.3333333333335,
+        "elapsedMsMedian": 2295.813374999998,
+        "usageSum": {
+          "input": 9145,
+          "output": 43,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 9188
+        }
+      },
+      "baseline": {
+        "episodes": 3,
+        "successes": 0,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 3629.6666666666665,
+        "elapsedMsMedian": 4896.586584000001,
+        "usageSum": {
+          "input": 10889,
+          "output": 95,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 10984
+        }
+      },
+      "inputRatioCandidateToBaseline": 0.8398383689962348
+    },
+    {
+      "name": "arc-unneeded",
+      "baseline": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 47582.333333333336,
+        "elapsedMsMedian": 3814.464209,
+        "usageSum": {
+          "input": 142747,
+          "output": 45,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 142792
+        }
+      },
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 7953,
+        "elapsedMsMedian": 2877.123916999997,
+        "usageSum": {
+          "input": 23859,
+          "output": 45,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 23904
+        }
+      },
+      "inputRatioCandidateToBaseline": 0.16714186637897818
+    },
+    {
+      "name": "arc-needed",
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 16031.333333333334,
+        "elapsedMsMedian": 6767.5559170000015,
+        "usageSum": {
+          "input": 40158,
+          "output": 127,
+          "cacheRead": 7936,
+          "cacheWrite": 0,
+          "totalTokens": 48221
+        }
+      },
+      "baseline": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 47598.333333333336,
+        "elapsedMsMedian": 2608.4055420000004,
+        "usageSum": {
+          "input": 142795,
+          "output": 43,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 142838
+        }
+      },
+      "inputRatioCandidateToBaseline": 0.3368045099618334
+    },
+    {
+      "name": "arc-no-recall",
+      "baseline": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 47239.333333333336,
+        "elapsedMsMedian": 2799.3702919999996,
+        "usageSum": {
+          "input": 94614,
+          "output": 43,
+          "cacheRead": 47104,
+          "cacheWrite": 0,
+          "totalTokens": 141761
+        }
+      },
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 47239.333333333336,
+        "elapsedMsMedian": 2498.000915999999,
+        "usageSum": {
+          "input": 141718,
+          "output": 43,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 141761
+        }
+      },
+      "inputRatioCandidateToBaseline": 1
+    },
+    {
+      "name": "changed-large-read",
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 38430.333333333336,
+        "elapsedMsMedian": 2744.9939999999997,
+        "usageSum": {
+          "input": 115291,
+          "output": 43,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 115334
+        }
+      },
+      "baseline": {
+        "episodes": 3,
+        "successes": 0,
+        "modelCalls": 3,
+        "toolCalls": 0,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 23380,
+        "elapsedMsMedian": 2490.214667000001,
+        "usageSum": {
+          "input": 70140,
+          "output": 27,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 70167
+        }
+      },
+      "inputRatioCandidateToBaseline": 1.6437268320501854
+    },
+    {
+      "name": "regex-hostile",
+      "baseline": {
+        "episodes": 3,
+        "successes": 0,
+        "modelCalls": 3,
+        "toolCalls": 3,
+        "recallTimeouts": 3,
+        "inputIncludingCacheMean": 696,
+        "elapsedMsMedian": 5722.100584,
+        "usageSum": {
+          "input": 2088,
+          "output": 90,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 2178
+        }
+      },
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 1524,
+        "elapsedMsMedian": 4998.616542,
+        "usageSum": {
+          "input": 4572,
+          "output": 120,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 4692
+        }
+      },
+      "inputRatioCandidateToBaseline": 2.189655172413793
+    },
+    {
+      "name": "regex-control",
+      "candidate": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 1521,
+        "elapsedMsMedian": 5887.414499999999,
+        "usageSum": {
+          "input": 4563,
+          "output": 120,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 4683
+        }
+      },
+      "baseline": {
+        "episodes": 3,
+        "successes": 3,
+        "modelCalls": 6,
+        "toolCalls": 3,
+        "recallTimeouts": 0,
+        "inputIncludingCacheMean": 1483,
+        "elapsedMsMedian": 4994.691708999999,
+        "usageSum": {
+          "input": 4449,
+          "output": 120,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 4569
+        }
+      },
+      "inputRatioCandidateToBaseline": 1.0256237356709372
+    }
+  ],
+  "finalViewEquivalence": {
+    "candidateViewsCompared": 24,
+    "sameFullView": true,
+    "liveCallsAdded": 0,
+    "sourceChanges": [
+      "src/plan.ts",
+      "src/user-text.ts"
+    ]
+  },
+  "rawArtifactsRoot": "/tmp/pi-zip-review.lcWYdr",
+  "rawBatches": [
+    "ab-final-users",
+    "ab-final-arc",
+    "ab-final-safety",
+    "ab-final-regex"
+  ],
+  "limits": [
+    "Synthetic bounded cold-return replay; no universal quality, latency, cache or billing claim",
+    "User cases fix cut and inject narrative failure; successful live narrative generation is not tested",
+    "Regex candidate explicitly searches unsupported syntax literally; baseline watchdog is external",
+    "Final planning-only fixes have byte-identical replay views; gate changes validated with local tests, not new live runs"
+  ]
+}
