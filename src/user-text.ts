@@ -16,3 +16,20 @@ export function userTextBefore(branch: Any[] | undefined, firstKeptEntryId: stri
 export function mandatoryUserTokens(previous: KnownUsers, current: string[]): number {
 	return tok4(`\n## User requests (available originals, oldest first; JSON strings decode to exact user messages)\n${JSON.stringify({ messages: [...previous.items, ...current], unavailableEarlier: previous.omitted })}`);
 }
+
+/** JSON-encoded request-section sizes for each prefix of current messages; each string is encoded once. */
+export function mandatoryUserPrefixTokens(previous: KnownUsers, current: string[]): number[] {
+	const head = '\n## User requests (available originals, oldest first; JSON strings decode to exact user messages)\n{"messages":[';
+	const tail = `],"unavailableEarlier":${JSON.stringify(previous.omitted)}}`;
+	let chars = head.length + tail.length;
+	let count = 0;
+	for (const message of previous.items) {
+		chars += JSON.stringify(message).length + (count++ ? 1 : 0);
+	}
+	const sizes = [Math.ceil(chars / 4)];
+	for (const message of current) {
+		chars += JSON.stringify(message).length + (count++ ? 1 : 0);
+		sizes.push(Math.ceil(chars / 4));
+	}
+	return sizes;
+}

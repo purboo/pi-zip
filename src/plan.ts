@@ -7,7 +7,7 @@ import { PH_MARK } from "./placeholder.ts";
 import { lawPrices, MIN_EXPECT, type Prices } from "./learn.ts";
 import { commandNamesRecall, parseRecallPath, type FileRecall } from "./recallfile.ts";
 import { parseSummary } from "./summary.ts";
-import { mandatoryUserTokens, userTextBefore } from "./user-text.ts";
+import { mandatoryUserPrefixTokens, userTextBefore } from "./user-text.ts";
 
 /** Default age, in assistant requests, from which ANY foldable output (every recoverability class) inside the protected user turns may
  *  still be folded. A sub-agent session is one user turn with hundreds of tool rounds, so without this its candidate set is empty for
@@ -767,14 +767,26 @@ export function plan(entries: Any[], o: PlanOpts): { f: PlanResult; c: PlanResul
 	const sumTrigger: "cold" | "valve" | null = !o.foldsOnly && ctxAfterFolds > coldCap ? trig : null;
 	const minCut = blocks[0].kind === "summary" ? 2 : 1; // never re-summarise a prefix that is only the previous summary
 	const pre: number[] = [];
-	const previousUsers = parseSummary(blocks[0]?.kind === "summary" ? String(blocks[0].msg.summary ?? "") : null).users;
+	const previousText = blocks[0]?.kind === "summary" ? String(blocks[0].msg.summary ?? "") : "";
+	const previousUsers = parseSummary(previousText).users;
 	const previousBoundary = o.branch?.find((e) => e?.id === blocks[0]?.entryId)?.firstKeptEntryId;
 	const recoveredUsers = previousBoundary ? userTextBefore(o.branch, previousBoundary, previousUsers) : null;
-	const userFloor = (k: number) => mandatoryUserTokens(
-		{ items: recoveredUsers ?? previousUsers.items, omitted: recoveredUsers ? 0 : previousUsers.omitted },
-		blocks.slice(blocks[0]?.kind === "summary" ? 1 : 0, k).filter((b) => b.kind === "user").map((b) => textOf((b.raw ?? b.msg).content)),
+	const currentUserCount: number[] = [];
+	const currentUsers: string[] = [];
+	for (const b of blocks) {
+		currentUserCount.push(currentUsers.length);
+		if (b.kind === "user") currentUsers.push(textOf((b.raw ?? b.msg).content));
+	}
+	const userSizes = mandatoryUserPrefixTokens(
+		{ items: recoveredUsers ?? previousUsers.items, omitted: recoveredUsers ? 0 : previousUsers.omitted }, currentUsers,
 	);
-	const S = (k: number) => Math.max(clamp(SUMMARY_RATIO * c * pre[k], SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum, c * (userFloor(k) + 300)) / c; // mandatory user text can exceed the nominal summary cap
+	const userHeadingAt = previousText.lastIndexOf("\n## User requests");
+	const userStart = userHeadingAt >= 0 ? userHeadingAt + 1 : previousText.startsWith("## User requests") ? 0 : -1;
+	const userEnd = userStart >= 0 ? previousText.indexOf("\n## ", userStart + 1) : -1;
+	const priorNonUser = userStart >= 0
+		? Math.ceil((previousText.length - ((userEnd < 0 ? previousText.length : userEnd) - userStart)) / 4)
+		: prevSum;
+	const S = (k: number) => Math.max(clamp(SUMMARY_RATIO * c * pre[k], SUMMARY_FLOOR, SUMMARY_CAP), c * prevSum, c * (priorNonUser + userSizes[currentUserCount[k]] + 300)) / c;
 	const result = (pick: number | null, summary = pick === null ? 0 : S(pick)): PlanResult => ({
 		blocks, calls, folds: pick === null ? [...folds] : folds.filter((t) => blocks.findIndex((b) => b.entryId === t.entryId) >= pick || o.carriedFolds?.some((u) => u.entryId === t.entryId)),
 		cutIdx: pick, firstKeptEntryId: pick === null ? null : blocks[pick].entryId, prefixTokens: pick === null ? 0 : pre[pick],
