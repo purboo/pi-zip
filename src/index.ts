@@ -37,6 +37,7 @@ export default function piZip(pi: ExtensionAPI) {
 				render: (width: number) => {
 					try {
 						if (d.v !== 2) return [theme.fg("dim", measure.cut(d.text, width))];
+						if (d.kind === "zipped") return width > 0 ? [theme.fg("dim", measure.cut(d.text, width))] : [];
 						if (d.kind === "state") return renderState(d.word, d.reason ?? "", width, theme, measure);
 						if (d.kind === "card" && d.card) return renderCard(d.card, width, theme, measure);
 						// once the request that carried the plan is answered, "after" is its real size; a folds-only "before" (an estimate) is rescaled with it, a summary's (Pi's "Compacted from N tokens") kept

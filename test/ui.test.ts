@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { rmSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -280,8 +281,17 @@ describe("transcript wiring", () => {
 		piZip(f.pi);
 		const { ctx, notes } = fakeCtx([], { branch });
 		const render = (e: Any, w = 120, expanded = false) => renderers.get("pi-zip/notice")({ data: e.data }, { expanded }, th).render(w);
-		return { f, ctx, notes, render };
+		return { f, ctx, notes, render, renderers };
 	};
+	test("successful compaction has a plain dim confirmation, including after transcript rebuild", async () => {
+		const { renderers } = await setup();
+		const entry = { id: "zipped-1", data: { v: 2, kind: "zipped", text: "Conversation zipped!", before: 0, after: 0, desc: "" } };
+		const build = (expanded: boolean) => renderers.get("pi-zip/notice")(entry, { expanded }, tag);
+		expect(build(false).render(80)).toEqual(["<dim>Conversation zipped!</dim>"]);
+		expect(build(true).render(80)).toEqual(build(false).render(80));
+		expect(build(false).handleMouse({ type: "click", button: "left" })).toBeUndefined();
+		for (const width of [0, 1, 5, 20, 80]) expect(fits(build(false).render(width), width, (s) => visibleWidth(s.replace(/<\/?\w+>/g, "")))).toBe(true);
+	});
 	test("/zip status is a card in the transcript; off/on/quiet are state lines", async () => {
 		const { f, ctx, notes, render } = await setup();
 		await f.handlers.get("session_start")({}, ctx);

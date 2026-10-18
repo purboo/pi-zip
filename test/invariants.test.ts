@@ -10,7 +10,7 @@ import { skeleton } from "../src/summary.ts";
 import { NATIVE_MARKER, Zip } from "../src/run.ts";
 import { A, AX, fakeCtx, fakePi, flat, longTurn, project, R, startPrompt, U, withK, type Any } from "./helpers.ts";
 
-const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_INTURN_AGE"];
+const ENV = ["PI_ZIP_TTL_SECS", "PI_ZIP_COLD_CAP", "PI_ZIP_OFF", "PI_ZIP_LEDGER", "PI_ZIP_INTURN_AGE", "PI_ZIP_NATIVE_MS"];
 let saved: Record<string, string | undefined> = {};
 beforeEach(() => { saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]])); ENV.forEach((k) => delete process.env[k]); process.env.PI_ZIP_TTL_SECS = "1"; });
 afterEach(() => ENV.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))));
@@ -484,17 +484,25 @@ describe("one producer prepares the return with one timer", () => {
 		rmSync(ledger, { force: true });
 	});
 
-	test("item 4(b): a handler that really is slow (before ours, or between ours and the append) still ends the native path", async () => {
+	test("native compaction allows a memory-saving handler past two seconds within its sixty-second default", async () => {
 		const ledger = `/tmp/pz-native-${process.pid}-${Date.now()}-b.jsonl`;
 		process.env.PI_ZIP_LEDGER = ledger;
 		const r = await rig(done, COLD_TS(), { modelRegistry: { complete: mkComplete({ calls: 0 }) } }, { registerEntryRenderer: () => {} });
 		const settled = await settle(r);
 		await sleep(200);
-		await comeBackNative(r, settled, { beforeMs: 400 });
-		await sleep(5);
-		expect(readFileSync(ledger, "utf8")).toContain("native_off");
-		expect(noticeOf(r).native).toMatch(/spent \d+ ms in session_before_compact handlers: another handler at work/);
-		rmSync(ledger, { force: true });
+		const timers = jest.spyOn(globalThis, "setTimeout");
+		try {
+			const n = await comeBackNative(r, settled, { beforeMs: 2_100 });
+			await sleep(5);
+			expect(timers.mock.calls.some((args) => args[1] === 60_000)).toBe(true);
+			expect(n.answer.compaction).toBeTruthy();
+			expect(readFileSync(ledger, "utf8")).not.toContain("native_off");
+			expect(noticeOf(r).native).toBe("ok");
+			expect(r.appended.filter((x: Any) => x.customType === "pi-zip/notice" && x.data?.kind === "zipped")).toHaveLength(1);
+		} finally {
+			timers.mockRestore();
+			rmSync(ledger, { force: true });
+		}
 	});
 
 	test("item 6: pi-zip's compaction carries a marker for other extensions' handlers; a compaction that carries it is answered or cancelled, never left to Pi's default summariser", async () => {
@@ -641,9 +649,10 @@ describe("never wait: rule A starts early; a summary is used once ready; the one
 		// a later turn_end, once it is done: the valve takes it (a draft the next request first carries)
 		await sleep(350);
 		const te = await r.fire("turn_end", turnEnd([...back, ...tail, A("a7")], "a7"));
-		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "pi-zip/commit", "pi-zip/summary"]); // the record of the call, written with the drafts (it ended inside the run)
+		expect(te.entries.map((e: Any) => e.customType ?? e.type)).toEqual(["compaction", "pi-zip/commit", "pi-zip/notice", "pi-zip/summary"]); // the record of the call, written with the drafts (it ended inside the run)
 		expect(te.entries[0]).toMatchObject({ firstKeptEntryId: "u3", details: { trigger: "valve", carried: false } });
-		expect(te.entries[2].data).toMatchObject({ key: "u3", head: "", usd: 0.02, cut: { text: te.entries[0].summary } });
+		expect(te.entries[2].data).toMatchObject({ kind: "zipped", text: "Conversation zipped!" });
+		expect(te.entries[3].data).toMatchObject({ key: "u3", head: "", usd: 0.02, cut: { text: te.entries[0].summary } });
 		expect(st.calls).toBe(1);
 		await sleep(5);
 		expect(noticeOf(r).desc).toMatch(/written while you worked$/);
