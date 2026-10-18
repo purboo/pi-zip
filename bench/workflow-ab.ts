@@ -35,6 +35,17 @@ const filler = (count: number, prefix = "context") => Array.from({ length: count
 async function fixture(name: string, replicate: number, dir: string): Promise<Any> {
 	const nonce = createHash("sha256").update(`pi-zip-workflow-ab-v1:${replicate}`).digest("hex").slice(0, 8);
 	const prefix = [user("Inspect the synthetic project read-only. No edits, commits or deployments."), call("prefix", "read", { path: "docs/inspection.txt" }), result("prefix", "read", filler(400))];
+	if (name === "user-long" || name === "user-many") {
+		const value = `hold_${nonce}`;
+		const requests = name === "user-long"
+			? ["Review only. " + "Additional background context. ".repeat(90) + ` Approval code is ${value}. ` + "More background context. ".repeat(90), "Prepare a read-only findings report."]
+			: Array.from({ length: 40 }, (_, i) => `Request ${i + 1}. ` + "Background detail for this stage. ".repeat(8) + (i === 12 ? ` Approval code is ${value}.` : " Do not change production."));
+		const messages: Any[] = [];
+		for (const [i, request] of requests.entries()) messages.push(user(request), assistant([{ type: "text", text: i === 0 ? filler(1800, "analysis") : "Acknowledged; proceeding with read-only analysis." }]));
+		const cutIdx = messages.length;
+		messages.push(user("Keep analyzing without changing files."), assistant([{ type: "text", text: "Read-only analysis continues." }]), user("What EXACT approval code did I specify earlier? Return only JSON {\"value\":\"...\"}. If it is unavailable, use null. Do not invent a code."));
+		return { messages, branch: project(messages).map(e => e.sourceEntry), expected: { value }, rereadOnly: false, cwd: dir, files: [], kind: "summary-fallback", cutIdx };
+	}
 	if (name.startsWith("arc-")) {
 		const lines = Array.from({ length: 1700 }, (_, i) => `+  registerRoute("route_${i}", "handler_${i % 97}", "internal ordinary path used by the fixture");`);
 		lines[950] = `+  const routingColor = "amber_${nonce}";`;
@@ -71,6 +82,13 @@ async function view(source: string, f: Any): Promise<Any> {
 	const p = await import(join(source, "src/plan.ts"));
 	const learn = await import(join(source, "src/learn.ts"));
 	const ph = await import(join(source, "src/placeholder.ts"));
+	if (f.kind === "summary-fallback") {
+		const summary = await import(join(source, "src/summary.ts"));
+		const blocks = p.buildBlocks(project(f.messages));
+		const cut = await summary.buildCut({ blocks, calls: p.toolCallIndex(blocks), cutIdx: f.cutIdx, summaryTokensPlanned: 8000, prefixTokens: blocks.slice(0, f.cutIdx).reduce((n: number, b: Any) => n + b.tokens, 0), sumTrigger: "cold" }, { model: { provider, id: modelId, maxTokens: 16384 }, modelRegistry: { complete: async () => ({ stopReason: "error", errorMessage: "injected narrative outage for deterministic-retention test", content: [], usage: zeroUsage() }) }, sessionManager: { getBranch: () => f.branch } });
+		const messages = [user(cut.text), ...f.messages.slice(f.cutIdx)];
+		return { messages, folded: [], chars: JSON.stringify(messages).length, summary: cut.text, narrativeOk: cut.llmOk, retentionMode: "injected-narrative-failure" };
+	}
 	if (f.kind === "regex") {
 		const messages = structuredClone(f.messages);
 		const handle = ph.handleFor("entry-2");
@@ -90,7 +108,7 @@ async function recallInChild(source: string, f: Any, params: Any, dir: string): 
 	const start = performance.now();
 	const child = Bun.spawn([process.execPath, import.meta.path, "--recall-child", source, file], { stdout: "pipe", stderr: "pipe" });
 	let timedOut = false;
-	const timer = setTimeout(() => { timedOut = true; child.kill(); }, 3000);
+	const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 3000);
 	const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
 	clearTimeout(timer);
 	if (timedOut) return { timedOut: true, ms: performance.now() - start, text: "Recall process exceeded the external 3000ms safety deadline." };
@@ -152,12 +170,12 @@ if (!option("--baseline") || !option("--candidate")) throw new Error("Pass --bas
 const out = resolve(option("--out") || mkdtempSync(join(tmpdir(), "pi-zip-ab-")));
 if (existsSync(join(out, "metadata.json"))) throw new Error("Output already contains a run; use a fresh --out directory.");
 mkdirSync(out, { recursive: true, mode: 0o700 });
-const scenarios = option("--scenarios", "arc-unneeded,arc-needed,arc-no-recall,changed-large-read,regex-hostile,regex-control").split(",");
+const scenarios = option("--scenarios", "arc-unneeded,arc-needed,arc-no-recall,changed-large-read,regex-hostile,regex-control,user-long,user-many").split(",");
 const reps = Number(option("--reps", "3"));
 if (!Number.isInteger(reps) || reps < 1 || reps > 5) throw new Error("--reps must be 1..5");
 const live = argv.includes("--live");
 const sourceHash = (path: string) => hash(readdirSync(join(path, "src")).sort().filter(n => n.endsWith(".ts")).map(n => [n, readFileSync(join(path, "src", n), "utf8")]));
-const metadata = { version: 1, provider, modelId, reasoning: "low", live, reps, scenarios, baseline, candidate, harnessHash: hash(readFileSync(import.meta.path, "utf8")), baselineSourceHash: sourceHash(baseline), candidateSourceHash: sourceHash(candidate), bunVersion: Bun.version, baselineCommit: execFileSync("git", ["-C", baseline, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), candidateCommit: execFileSync("git", ["-C", candidate, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), assumptions: ["Synthetic paired replay, not a longitudinal autonomous-agent benchmark", "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms", "No summary production or actual cache-lifetime measurement", "Fresh session ids and alternating order; provider caching still recorded", "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog", "Subscription cost metadata is not actual marginal billing"] };
+const metadata = { version: 1, provider, modelId, reasoning: "low", live, reps, scenarios, baseline, candidate, harnessHash: hash(readFileSync(import.meta.path, "utf8")), baselineSourceHash: sourceHash(baseline), candidateSourceHash: sourceHash(candidate), bunVersion: Bun.version, baselineCommit: execFileSync("git", ["-C", baseline, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), candidateCommit: execFileSync("git", ["-C", candidate, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), assumptions: ["Synthetic paired replay, not a longitudinal autonomous-agent benchmark", "Actual planner at default 40K target, automatic-cache class, cold return, fixed UNIT calibration in both arms", "No actual cache-lifetime measurement; user-* cases call real buildCut at a fixed protected cut with an injected narrative failure, independently testing deterministic retention",  "Fresh session ids and alternating order; provider caching still recorded", "External subprocess watchdog bounds baseline regex hangs; stock baseline lacks that watchdog", "Subscription cost metadata is not actual marginal billing"] };
 writeFileSync(join(out, "metadata.json"), JSON.stringify(metadata, null, 2));
 const runtime = live ? await ModelRuntime.create() : null;
 const model = runtime?.getModel(provider, modelId);

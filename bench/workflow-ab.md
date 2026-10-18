@@ -19,6 +19,8 @@ The default is dry-run. Live execution requires existing Pi credentials, makes r
 | `changed-large-read` | The previous partial read came from a file >2 MB, since modified at the same size; return the historical value, never the new value. |
 | `regex-hostile` | Execute the requested `a+a+$` query over a 100K-character nonmatching line; finish, or record an external-watchdog timeout. |
 | `regex-control` | Ordinary `ERROR|FAIL` alternation must retain its matching semantics. |
+| `user-long` | A condition in the middle of a long user request must survive even if the narrative call fails. |
+| `user-many` | An intermediate request among 40 user messages must retain its exact approval code. |
 
 Each replicate uses a fresh historical value. Both arms share the exact fixture, prompt, task grader and tool definitions except for the package's own recall definition. Order alternates by scenario and replicate. Each episode has a fresh session ID and records cache reads rather than assuming caching is disabled. Provider exceptions, truncation and timeouts remain in the artifacts; provider failures stop the campaign rather than silently changing models or rerunning successes.
 
@@ -26,8 +28,8 @@ Each replicate uses a fresh historical value. Both arms share the exact fixture,
 
 ## Interpretation limits
 
-This is a bounded replay experiment, not an end-to-end session benchmark. It exercises the real planner at the default 40K target with the automatic-cache class and a cold return, using the same fixed `UNIT` token calibration for both arms. It does not reproduce cache learning, warm returns, long autonomous runs, background summaries or TUI scheduling; integration tests cover those separately.
+This is a bounded replay experiment, not an end-to-end session benchmark. It exercises the real planner at the default 40K target with the automatic-cache class and a cold return, using the same fixed `UNIT` token calibration for both arms. It does not reproduce cache learning, warm returns, long autonomous runs, background summaries or TUI scheduling; integration tests cover those separately. The `user-*` cases exercise the real `buildCut` at a fixed cut before the two protected turns, with an explicitly injected narrative-provider failure. They isolate deterministic user-text retention: GPT-6.1-sol answers from the resulting fallback summary. They do not measure successful narrative generation or its cost.
 
 Three paired replicates per scenario are a smoke/regression sample, not proof of universal quality or latency improvements. Report failures and increased input costs alongside savings. Sum `input + cacheRead + cacheWrite` across all model calls; report output and cache usage separately. Subscription `cost` metadata is not marginal billing evidence. External watchdogs protect the benchmark from baseline hangs; they are not functionality present in the baseline package.
 
-No claim of lossless user-message summarization: long requests can still be clipped by `summary.ts`, and `zip_recall` only retrieves tool outputs.
+The baseline can clip user requests, and `zip_recall` only retrieves tool outputs. User-text preservation is checked independently of tool-output recall; this is not a guarantee that a model will obey every preserved instruction or that images are losslessly summarized.
