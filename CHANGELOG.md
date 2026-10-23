@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.14
 
 - Model-visible timestamps in folded placeholders, summary rows and narrative labels now use explicit UTC, so the same
   persisted session renders identically across process time zones and locales. Existing persisted labels remain unchanged.
