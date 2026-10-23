@@ -141,14 +141,14 @@ describe("row labels tell look-alike rows apart (2026-10-11 item 3)", () => {
 });
 
 describe("times instead of turn numbers (2026-10-11 item 4, 2026-10-10 item 5)", () => {
-	const at = (h: number, m: number) => new Date(2026, 9, 11, h, m).getTime(); // local time
-	test("a placeholder says the local time of the result, MM-DD HH:MM, not a turn that restarts at every compaction", () => {
+	const at = (h: number, m: number) => Date.UTC(2026, 9, 11, h, m);
+	test("a placeholder says the UTC time of the result, MM-DD HH:MM UTC, not a turn that restarts at every compaction", () => {
 		const out = "ok\n".repeat(400) + "done";
 		const ph = makePlaceholder(out, "bash", "make", handleFor("x"), 8, { at: at(2, 31), turn: 49, isError: false })!;
-		expect(ph.split("\n")[0]).toBe(`[folded by pi-zip · bash make · 10-11 02:31 · exit 0 · ${out.length} chars, 401 lines · handle ${handleFor("x")}]`);
+		expect(ph.split("\n")[0]).toBe(`[folded by pi-zip · bash make · 10-11 02:31 UTC · exit 0 · ${out.length} chars, 401 lines · handle ${handleFor("x")}]`);
 		expect(ph).not.toContain("turn");
 		const blocks = buildBlocks([U("u1", "go"), tcall("m", "bash", { command: "make" }), tres("m", "bash", out, at(23, 5)), A("e")]);
-		expect(makePlaceholderFor(blocks[2], toolCallIndex(blocks))!.split("\n")[0]).toContain("bash make · 10-11 23:05 · exit 0");
+		expect(makePlaceholderFor(blocks[2], toolCallIndex(blocks))!.split("\n")[0]).toContain("bash make · 10-11 23:05 UTC · exit 0");
 		// no timestamp (never in Pi; older harnesses): the turn, as before
 		expect(makePlaceholder(out, "bash", "make", handleFor("x"), 8, { turn: 4 })!.split("\n")[0]).toContain("bash make · turn 4 ·");
 	});
@@ -161,37 +161,37 @@ describe("times instead of turn numbers (2026-10-11 item 4, 2026-10-10 item 5)",
 		entries.push(A("e"));
 		const t = await cutOf(entries);
 		expect(t).not.toMatch(/turn \d/);
-		expect(sec(t, "## Other tool calls")).toContain(`web_fetch {"url":"https://x.test"} (10-11 09:08, ${handleFor("r-w")})`);
+		expect(sec(t, "## Other tool calls")).toContain(`web_fetch {"url":"https://x.test"} (10-11 09:08 UTC, ${handleFor("r-w")})`);
 		expect(sec(t, "## Other tool calls").split("\n")[0]).toBe("## Other tool calls (time, handle)");
-		expect(sec(t, "## Commands run")).toContain(`\`step 62\` -> exit 0 (10-11 10:02, ${handleFor("r-s62")})`);
-		expect(sec(t, "## Folded outputs")).toContain(`- ${handleFor("r-b")} · bash make · 10-11 09:07 · exit 0 · y`);
-		expect(sec(t, "## Handle index")).toContain(`- ${handleFor("r-s1")} · bash step 1 · 10-11 10:01`);
+		expect(sec(t, "## Commands run")).toContain(`\`step 62\` -> exit 0 (10-11 10:02 UTC, ${handleFor("r-s62")})`);
+		expect(sec(t, "## Folded outputs")).toContain(`- ${handleFor("r-b")} · bash make · 10-11 09:07 UTC · exit 0 · y`);
+		expect(sec(t, "## Handle index")).toContain(`- ${handleFor("r-s1")} · bash step 1 · 10-11 10:01 UTC`);
 		// read back: every row keeps the label it was written with
 		const rows = handleRowsOf(t);
-		expect(rows.find((r) => r.handle === handleFor("r-s62"))?.when).toBe("10-11 10:02");
-		expect(rows.find((r) => r.handle === handleFor("r-w"))?.when).toBe("10-11 09:08");
-		expect(rows.find((r) => r.handle === handleFor("r-s1"))?.when).toBe("10-11 10:01");
+		expect(rows.find((r) => r.handle === handleFor("r-s62"))?.when).toBe("10-11 10:02 UTC");
+		expect(rows.find((r) => r.handle === handleFor("r-w"))?.when).toBe("10-11 09:08 UTC");
+		expect(rows.find((r) => r.handle === handleFor("r-s1"))?.when).toBe("10-11 10:01 UTC");
 	});
 
-	test("old summaries (turn N) still parse and merge: their rows keep their turn, new rows say the time", () => {
+	test.each(["turn 4", "10-11 02:31", "10-11 02:31 UTC"])("persisted summaries (%s) still parse and merge: labels stay unchanged", (label) => {
 		const h1 = handleFor("o1"), h2 = handleFor("o2"), h3 = handleFor("o3"), h4 = handleFor("o4");
 		const old = [
 			"[summary of earlier conversation by pi-zip]",
 			"## User requests (verbatim, oldest first, continuation lines indented)", "1. OLD",
-			"## Commands run (with exit status)", `\`bun test\` -> exit 1 (turn 4, ${h1})`,
-			"## Other tool calls (turn, handle)", `web_fetch {"url":"https://x"} (turn 2, ${h2})`,
+			"## Commands run (with exit status)", `\`bun test\` -> exit 1 (${label}, ${h1})`,
+			"## Other tool calls (turn, handle)", `web_fetch {"url":"https://x"} (${label}, ${h2})`,
 			"## Errors", "(none)",
-			"## Handle index (older outputs)", `- ${h3} · read src/z.ts · turn 3`,
+			"## Handle index (older outputs)", `- ${h3} · read src/z.ts · ${label}`,
 			"## Narrative (model-written)", "n",
-			"## Folded outputs (originals recallable with zip_recall)", `- ${h4} · bash cat f · turn 7 · exit 0 · hint`,
+			"## Folded outputs (originals recallable with zip_recall)", `- ${h4} · bash cat f · ${label} · exit 0 · hint`,
 		].join("\n");
 		const t = skeleton(buildBlocks([U("u1", "NEW"), tcall("n", "bash", { command: "ls" }), tres("n", "bash", "a", at(8, 0)), A("e")]), old).text;
-		expect(t).toContain(`\`bun test\` -> exit 1 (turn 4, ${h1})`);
-		expect(t).toContain(`web_fetch {"url":"https://x"} (turn 2, ${h2})`);
-		expect(t).toContain(`\`ls\` -> exit 0 (10-11 08:00, ${handleFor("r-n")})`);
-		expect(t).toContain(`- ${h3} · read src/z.ts · turn 3`); // the index carries the old row as it was
+		expect(t).toContain(`\`bun test\` -> exit 1 (${label}, ${h1})`);
+		expect(t).toContain(`web_fetch {"url":"https://x"} (${label}, ${h2})`);
+		expect(t).toContain(`\`ls\` -> exit 0 (10-11 08:00 UTC, ${handleFor("r-n")})`);
+		expect(t).toContain(`- ${h3} · read src/z.ts · ${label}`); // the index carries the old row as it was
 		const rows = handleRowsOf(old);
-		expect(rows.map((r) => r.when)).toEqual(["turn 4", "turn 2", "turn 3", "turn 7"]);
+		expect(rows.map((r) => r.when)).toEqual([label, label, label, label]);
 	});
 });
 

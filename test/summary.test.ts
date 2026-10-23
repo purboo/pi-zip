@@ -167,20 +167,20 @@ describe("sectioned carry-forward: nested summaries, 4 levels deep", () => {
 
 	test("narrative call failed after an earlier summary: the previous narrative is carried whole, marked possibly stale, with its time; the next call merges it", async () => {
 		const t1 = await cutOver(1, null);
-		const at = new Date(2026, 9, 11, 2, 31).getTime();
+		const at = Date.UTC(2026, 9, 11, 2, 31);
 		const entries = [{ sourceEntry: { id: "comp", type: "compaction" }, messages: [{ role: "compactionSummary", summary: t1, tokensBefore: 0, timestamp: at }] }, ...level(2), U("keep2", "kept"), A("keepA2")];
 		const blocks = buildBlocks(entries);
 		const p: Any = { blocks, calls: toolCallIndex(blocks), cutIdx: blocks.findIndex((b) => b.entryId === "keep2"), prefixTokens: 50_000, summaryTokensPlanned: 7000, sumTrigger: "cold" };
 		const down = async () => ({ stopReason: "error", errorMessage: "down", content: [], usage: { cost: { total: 0 } } });
 		const cut = await buildCut(p, { model: { id: "m" }, modelRegistry: { complete: down } } as Any);
 		expect(cut.llmOk).toBe(false);
-		expect(cut.text).toContain("## Narrative (carried forward from the summary of 10-11 02:31; possibly stale: a new one could not be written: down)");
+		expect(cut.text).toContain("## Narrative (carried forward from the summary of 10-11 02:31 UTC; possibly stale: a new one could not be written: down)");
 		expect(cut.text).toContain("KEYFACT-1: value-1");
 		expect(cut.text).not.toContain("(unavailable");
 		const prompts: string[] = [];
 		await cutOver(3, cut.text, prompts);
 		expect(prevBlockOf(prompts[0])).toContain("KEYFACT-1: value-1");
-		expect(prompts[0]).toContain('<previous-narrative written="10-11 02:31">');
+		expect(prompts[0]).toContain('<previous-narrative written="10-11 02:31 UTC">');
 	});
 
 	test("no narrative (model call failed): the fallback line points at recall by handle, like the header, not at re-reading", async () => {

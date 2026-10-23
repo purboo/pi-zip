@@ -19,7 +19,7 @@ export interface HandleRow {
 	args: string;
 	hint: string;
 	turn?: number; // user turn of the output, so look-alike runs stay apart (shown only without `at`)
-	at?: number; // when the output arrived (ms), shown as local MM-DD HH:MM
+	at?: number; // when the output arrived (ms), shown as MM-DD HH:MM UTC
 	outcome?: string; // exit status / test counts (outcomeHint)
 }
 
@@ -47,8 +47,8 @@ export function handleTable(rows: HandleRow[], previous: string | null = null, f
 const newest = (xs: string[], n: number): string[] => (xs.length > n ? [`[… ${xs.length - n} older omitted …]`, ...xs.slice(-n)] : xs);
 
 const H = "[0-9a-z]{10}"; // a handle, see handleFor
-/** The time label of a row: "turn 12" (older summaries, and outputs without a timestamp) or a local time "10-11 02:31". */
-const W = "turn \\d+|\\d\\d-\\d\\d \\d\\d:\\d\\d";
+/** Row time: UTC for new rows, with local times and turn numbers accepted from older persisted summaries. */
+const W = "turn \\d+|\\d\\d-\\d\\d \\d\\d:\\d\\d(?: UTC)?";
 const CMD_ROW = new RegExp(`^\`(.*)\` -> [^(]*\\((${W}), (${H})\\)$`);
 const OTHER_ROW = new RegExp(`^(\\S+) (.*) \\((${W}), (${H})\\)$`);
 const FILE_ROW = /^- (.*) \(([^()]*)\)$/;
@@ -64,7 +64,7 @@ interface IndexRow {
 	args: string;
 	turn?: number;
 	at?: number;
-	when?: string; // the time label as an earlier summary wrote it ("turn 12" or "10-11 02:31")
+	when?: string; // the time label as an earlier summary wrote it (UTC, or an older local time / turn number)
 	hint?: string; // only for rows that would otherwise read the same: the first line of the output that tells it apart
 }
 const INDEX_HINT = 50;
@@ -422,7 +422,7 @@ function excerpt(text: string, max: number, head = 0): string {
 export interface PrevNarrative {
 	text: string; // bounded by PREV_NARRATIVE_CHARS
 	foreign: boolean; // the previous summary is free text (Pi's own compaction or another extension's), not pi-zip's sections
-	at?: string; // when it was written (local MM-DD HH:MM), if known
+	at?: string; // when it was written (MM-DD HH:MM UTC, or a persisted older label), if known
 }
 
 /**

@@ -23,12 +23,12 @@ export function clip(s: string, n: number): string {
 	return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
-/** Local time of a timestamp (ms) as MM-DD HH:MM: what placeholders and summaries say instead of a turn number (a turn count
- *  restarts at every compaction; a time matches the user's own notes and logs). */
+/** UTC time of a persisted timestamp (ms) as MM-DD HH:MM UTC. Placeholders and summaries must keep the same bytes
+ *  across process time zones and locales; a turn count restarts at every compaction. */
 export function fmtWhen(ms: number): string {
 	const d = new Date(ms);
 	const p2 = (n: number) => String(n).padStart(2, "0");
-	return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+	return `${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())} UTC`;
 }
 
 /** Test-only numeric override: PI_ZIP_<NAME>. */

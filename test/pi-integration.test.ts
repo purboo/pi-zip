@@ -2712,7 +2712,8 @@ describe("a relay keeps the session on one account: metadata.user_id", () => {
 // no-UI behaviour moves, and each move is justified in its commit: 0.3.1's (0907ceea..., 0.3.0's decisions with 0.3.1's format, where
 // these scenarios waited for their summaries in line) became this one when 0.4.0 stopped waiting.
 describe("no UI (pi -p, json): the requests and the session of three scenarios hash to a recorded digest", () => {
-	const NOUI_DIGEST = "f6d9629b3c18c8a4101cfd5d92bc94b1"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
+	// Explicit UTC labels change the rendered text and its token estimates (previous digest: f6d9629b3c18c8a4101cfd5d92bc94b1).
+	const NOUI_DIGEST = "eae5cd5dd4fadc70636e07bf5bdb9ce6"; // R5_PRINT_DIGEST=1 prints it (0.3.1: 0907ceeacca2be4a8b8f684dd6a47a96)
 	const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 	const shifted = (agoMs: number, prose: number) => {
 		const sm = SessionManager.inMemory(CWD);
@@ -2735,7 +2736,7 @@ describe("no UI (pi -p, json): the requests and the session of three scenarios h
 		r.sm.getEntries().forEach((e: Any, i: number) => {
 			s = s.split(e.id).join(`#${i}`).split(handleFor(e.id)).join(`@${i}`);
 		});
-		// 0.3.1 rows and placeholders carry the local time of the output (MM-DD HH:MM), which moves with the clock
+		// Row and placeholder timestamps (MM-DD HH:MM UTC) move with the fixture clock; keep the explicit UTC marker.
 		return s.replace(/\b\d\d-\d\d \d\d:\d\d\b/g, "D").replace(/\d+(\.\d+)? ?(ms|s)\b/g, "T").replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "U");
 	};
 	// a summary call started in the background finishes before the next event (the model answers at once): the transcript does not

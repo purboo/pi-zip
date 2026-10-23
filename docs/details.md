@@ -86,10 +86,10 @@ The working view is capped at pi-zip's room when the window is known. A protecte
 
 ## Recall
 
-A folded block says what produced it (tool, command or path with offset/limit, the local time of the output, exit status and test counts for commands), its size, a handle and its key lines, so look-alike runs stay apart. A JSON document on one line (a status call, an API response) shows key fields instead: error and status fields first, the newest record's identity, and the end of the last long string, not its first 160 characters. It also tells the model to prefer `zip_recall` (original bytes, instant, free, no side effects) over re-running or re-reading, because a re-run may give a different result:
+A folded block says what produced it (tool, command or path with offset/limit, the UTC time of the output, exit status and test counts for commands), its size, a handle and its key lines, so look-alike runs stay apart. A JSON document on one line (a status call, an API response) shows key fields instead: error and status fields first, the newest record's identity, and the end of the last long string, not its first 160 characters. It also tells the model to prefer `zip_recall` (original bytes, instant, free, no side effects) over re-running or re-reading, because a re-run may give a different result:
 
 ```
-[folded by pi-zip · bash bun test test/api.test.ts · 10-11 02:31 · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
+[folded by pi-zip · bash bun test test/api.test.ts · 10-11 02:31 UTC · exit 1, 79 passed, 2 failed · 5637 chars, 109 lines · handle k3f9a0x1qz]
 key lines kept (original line numbers; up to 8):
 1: (pass) suite 0 > case parse config ...
 106: 2 fail

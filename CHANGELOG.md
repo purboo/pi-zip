@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Model-visible timestamps in folded placeholders, summary rows and narrative labels now use explicit UTC, so the same
+  persisted session renders identically across process time zones and locales. Existing persisted labels remain unchanged.
+  On upgrade, sessions whose context contains old local-time text may see one cache miss when that text is rebuilt.
+
 ## 0.4.13
 
 - A side request that rewrites a cold prefix no longer teaches pi-zip that the provider kept the old cache alive through the

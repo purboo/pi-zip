@@ -245,11 +245,11 @@ export function blockTime(b: Block): number | undefined {
 	const t = Number(b.raw?.timestamp ?? b.msg?.timestamp);
 	return Number.isFinite(t) && t > 0 ? t : undefined;
 }
-/** The time label of an output: its local time (MM-DD HH:MM), else (no timestamp) its user turn as counted in the projection. */
+/** The time label of an output: its UTC time (MM-DD HH:MM UTC), else (no timestamp) its user turn as counted in the projection. */
 export const whenLabel = (at?: number, turn?: number): string => (at ? fmtWhen(at) : turn ? `turn ${turn}` : "");
 
 export interface PlaceholderMeta {
-	at?: number; // when the output arrived (ms): shown as local MM-DD HH:MM (a turn count restarts at every compaction)
+	at?: number; // when the output arrived (ms): shown as MM-DD HH:MM UTC (a turn count restarts at every compaction)
 	turn?: number; // user turn the output belongs to (1-based, as seen in the projection when it was folded): shown only without `at`
 	isError?: boolean;
 	noRecall?: boolean; // zip_recall is not declared to the model (`--tools` allowlist): point at re-reading instead
