@@ -3,7 +3,22 @@ import { fileURLToPath } from "node:url";
 
 const fixture = fileURLToPath(new URL("./fixtures/tz-render.ts", import.meta.url));
 
-test.each([["Bun", process.execPath], ["Node", "node"]])("%s model text is byte-identical across process time zones and locales, including summary failure and carry-forward", (runtime, executable) => {
+// The Node case needs a node on PATH that runs .ts natively; its locale check needs full ICU.
+const nodeRuns = (() => {
+	try {
+		const probe = Bun.spawnSync(["node", "--input-type=module-typescript", "-e", "const x: number = 1; process.stdout.write(String(x))"], { stdout: "pipe", stderr: "pipe" });
+		return probe.exitCode === 0 && probe.stdout.toString() === "1";
+	} catch {
+		return false;
+	}
+})();
+const nodeLocale = (locale: string) => Bun.spawnSync(["node", "-p", "Intl.DateTimeFormat().resolvedOptions().locale"], {
+	env: { ...process.env, LANG: locale, LC_ALL: locale }, stdout: "pipe", stderr: "pipe",
+}).stdout.toString().trim();
+const nodeFullIcu = nodeRuns && nodeLocale("de_DE.UTF-8") !== nodeLocale("en_US.UTF-8");
+const runtimes: [string, string][] = [["Bun", process.execPath], ...(nodeRuns ? [["Node", "node"] as [string, string]] : [])];
+
+test.each(runtimes)("%s model text is byte-identical across process time zones and locales, including summary failure and carry-forward", (runtime, executable) => {
 	const render = (TZ: string, locale: string) => {
 		const child = Bun.spawnSync([executable, fixture], {
 			env: { ...process.env, TZ, LANG: locale, LC_ALL: locale }, stdout: "pipe", stderr: "pipe",
@@ -16,7 +31,7 @@ test.each([["Bun", process.execPath], ["Node", "node"]])("%s model text is byte-
 		const other = render(tz, locale);
 		expect(other.zoneOffset).not.toBe(utc.zoneOffset); // the processes really use different local clocks
 		// Bun currently fixes its default Intl locale to en-US; Node exercises the locale changes.
-		if (runtime === "Node") expect(other.locale).not.toBe(utc.locale);
+		if (runtime === "Node" && nodeFullIcu) expect(other.locale).not.toBe(utc.locale);
 		expect(JSON.stringify(other.rendered)).toBe(JSON.stringify(utc.rendered));
 	}
 	expect(utc.rendered.formatted).toEqual(["12-31 23:58 UTC", "02-29 00:05 UTC", "03-08 06:59 UTC", "03-08 07:01 UTC"]);
