@@ -1,6 +1,7 @@
 // Summary (F11, F12): deterministic skeleton (user words verbatim + files/commands) + model-written narrative + handle table.
 // Thinking is never quoted or paraphrased: it is stripped before the model sees the prefix.
 import { randomUUID } from "node:crypto";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { blockTime, cdDirOf, clipMid, distinctLines, handleFor, keyTexts, outcomeHint, RECALL_TOOL, shortArgs, strippableCdDirs, whenLabel } from "./placeholder.ts";
 import { type Block, type Cut, type PlanResult, NARRATIVE_CALL_MAX, NARRATIVE_MAX, settings, toolCallIndex } from "./plan.ts";
 import { type FileRecall, fileRecallHow } from "./recallfile.ts";
@@ -560,14 +561,34 @@ export interface Narrative {
  *  gpt-6.1-sol answers "'none' is not supported ... Supported values are: 'low', ..."). Pi's own compaction passes the session's
  *  thinking level and never meets it. */
 export const EFFORT_REFUSED_RE = /(?:'none'|"none"|reasoning|effort)[^\n]{0,80}not supported|unsupported[^\n]{0,60}(?:reasoning|effort)/i;
-const lowEffort = new Set<string>(); // provider/model keys that need an explicit effort: the next narrative asks for "low" at once
+export interface SummaryLane {
+	sessionId: string;
+	cacheRetention: "short" | "long";
+	onPayload?: (payload: Any) => Promise<Any>;
+	onResult?: (message: Any) => void;
+}
+
+/** Resolve capability mappings before attempt 1; never discover effort support with an HTTP error. */
+export function summaryEffort(model: Any, cap: number): { level?: string; raw: Any } {
+	if (!model.reasoning) return { raw: {} };
+	const levels = getSupportedThinkingLevels(model), level = levels.includes("low") ? "low" : levels.find(l => l !== "off");
+	if (!level) throw new Error("no supported non-off summary effort");
+	const mapped = model.thinkingLevelMap?.[level] ?? level;
+	if (["none", "off", "disabled", ""].includes(mapped)) throw new Error("contradictory summary effort mapping");
+	if (!model.api || /openai|responses/.test(model.api)) return { level, raw: { reasoningEffort: level } };
+	if (model.api === "anthropic-messages") {
+		if (cap <= 2048) throw new Error("summary output budget too small for thinking");
+		return { level, raw: { thinkingEnabled: true, effort: mapped === "minimal" ? "low" : mapped, thinkingBudgetTokens: Math.min(2048, cap - 1024) } };
+	}
+	return { level, raw: null }; // use Pi's provider-neutral completeSimple adapter
+}
 
 /**
  * Narrative sections written by the current model in a separate, uncached call. Never throws. `previous` = the previous summary's
  * narrative: the call merges it with what the prefix adds into ONE narrative (newer values replace older ones, finished todos go,
  * durable facts stay), so no stale copy of an earlier narrative is carried next to the new one.
  */
-export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previous: PrevNarrative | null = null): Promise<Narrative> {
+export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number, ownSignal?: AbortSignal, previous: PrevNarrative | null = null, lane?: SummaryLane): Promise<Narrative> {
 	const t0 = Date.now();
 	const model = ctx.model;
 	if (!model) return { text: null, ok: false, ms: 0, costUsd: 0, error: "no current model" };
@@ -582,7 +603,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 	let usage: Any;
 	try {
 		const conv = await serialize(msgs);
-		const words = narrativeWords(budgetTokens, !!previous);
+		const words = narrativeWords(lane ? NARRATIVE_MAX : budgetTokens, !!previous);
 		const prev = previous
 			? `<previous-narrative${previous.at ? ` written="${previous.at}"` : ""}>\n${previous.text}\n</previous-narrative>\n\n`
 			: "";
@@ -593,9 +614,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				`previous narrative (paths, identifiers, rulings, results the work still depends on) unless the conversation superseded them. ` +
 				`Write the current state only; do not mention the previous narrative or list what changed.\n`
 			: "";
-		const prompt =
-			prev +
-			`<conversation>\n${conv}\n</conversation>\n\n` +
+		const instructions =
 			`Write the NARRATIVE part of a context summary for this conversation. A separate deterministic section already lists the user's ` +
 			`requests, files touched, commands with exit codes and errors, so do NOT repeat those. When you refer to a specific tool output, name it by its ` +
 			`tool and exact command or path so that look-alike runs stay distinguishable; never merge similar runs into one. Output only these markdown sections:\n` +
@@ -604,21 +623,36 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 			`Be concrete and keep exact paths, names and numbers. Stay under about ${words} words` +
 			(previous ? ` (a hard limit: the previous narrative and the conversation together say more, so compress: keep what the work still depends on, drop how it got there and whatever is finished)` : "") +
 			`. Do not call tools.`;
+		const prompt = prev + `<conversation>\n${conv}\n</conversation>\n\n` + instructions;
 		const signals: AbortSignal[] = [AbortSignal.timeout(240_000)];
 		// a background summary has its own signal (nothing is running, so the run's signal would be stale); a summary the user waits for follows the run's (Esc)
 		const outer = ownSignal ?? ctx.signal;
 		if (outer) signals.push(outer);
 		const signal = AbortSignal.any(signals);
-		const key = `${model.provider ?? ""}/${model.id ?? ""}`;
+		const effort = summaryEffort(model, cap);
+		const simple = model.reasoning && typeof ctx.modelRegistry.completeSimple === "function";
+		if (!simple && effort.raw === null) throw new Error("summary effort adapter unavailable");
+		// Pi's budget-based Anthropic adapter adds thinking to an explicit answer cap.
+		// Reserve that budget here so the wire total still fits our chosen ceiling.
+		const thinking = simple && model.api === "anthropic-messages" && !model.compat?.forceAdaptiveThinking ? effort.raw.thinkingBudgetTokens : 0;
+		// Pi looks up extended levels under "high", while reasoning retains the selected capability level.
+		const budgetLevel = effort.level === "xhigh" || effort.level === "max" ? "high" : effort.level!;
+		const effortOptions = simple ? { reasoning: effort.level, ...(thinking ? { thinkingBudgets: { [budgetLevel]: thinking } } : {}) } : effort.raw;
+		// Fixed instructions precede deterministic append-only conversation chunks in the speed lane.
+		const conversation = lane ? await Promise.all(msgs.map(m => serialize([m]))) : [];
+		const context = lane ? { systemPrompt: NARRATIVE_SYSTEM, messages: [
+			{ role: "user", content: [{ type: "text", text: instructions + "\n" + prev }], timestamp: 0 },
+			...conversation.map(text => ({ role: "user", content: [{ type: "text", text: `<conversation-part>\n${text}\n</conversation-part>` }], timestamp: 0 })),
+		] } : { systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] };
+		if (lane && (!(Number(model.contextWindow) > 0) || tok4(JSON.stringify(context)) + cap + 4096 > model.contextWindow)) throw new Error("summary input exceeds model budget");
 		for (let attempt = 0; attempt < 2; attempt++) {
-			const low = lowEffort.has(key);
 			try {
 				signal.throwIfAborted();
-				const res: Any = await ctx.modelRegistry.complete(
-					model,
-					{ systemPrompt: NARRATIVE_SYSTEM, messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-					{ maxTokens: cap, signal, cacheRetention: "none", sessionId: randomUUID(), ...(low ? { reasoningEffort: "low" } : {}) },
-				);
+				const complete = simple ? ctx.modelRegistry.completeSimple.bind(ctx.modelRegistry) : ctx.modelRegistry.complete.bind(ctx.modelRegistry);
+				const res: Any = await complete(model, context,
+					{ maxTokens: cap - thinking, signal, cacheRetention: lane?.cacheRetention ?? "none", sessionId: lane?.sessionId ?? randomUUID(),
+						...effortOptions, ...(lane?.onPayload ? { onPayload: lane.onPayload } : {}) });
+				lane?.onResult?.(res);
 				costUsd += Number(res.usage?.cost?.total) || 0;
 				if (res.usage) {
 					const { cost, ...tokens } = res.usage;
@@ -635,12 +669,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 				return { text, ok: true, ms: Date.now() - t0, costUsd, usage };
 			} catch (err) {
 				lastErr = err instanceof Error ? err.message : String(err);
-				if (!low && model.reasoning && EFFORT_REFUSED_RE.test(lastErr) && !signal.aborted) {
-					lowEffort.add(key); // the request itself was refused: ask again with the lowest common effort, without using up the retry
-					attempt--;
-					continue;
-				}
-				if (POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
+				if (EFFORT_REFUSED_RE.test(lastErr) || POLICY_BLOCK_RE.test(lastErr) || lastErr === CAP_ERR || signal.aborted) break; // an identical retry fails the same way
 			}
 		}
 	} catch (err) {
@@ -650,7 +679,7 @@ export async function narrative(prefix: Block[], ctx: Any, budgetTokens: number,
 }
 
 /** The cold summary (skeleton + narrative + handle table) for a planned cut. */
-export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): Promise<Cut> {
+export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal, lane?: SummaryLane): Promise<Cut> {
 	const { foldMin, keepLines } = settings();
 	const t0 = performance.now();
 	const prefix = p.blocks.slice(0, p.cutIdx!);
@@ -691,8 +720,9 @@ export async function buildCut(p: PlanResult, ctx: Any, signal?: AbortSignal): P
 	const sk = skeleton(prefix.filter((b) => b.kind !== "summary"), prev, table ?? "", file);
 	const nb = clamp(p.summaryTokensPlanned - tok4(sk.text), 300, NARRATIVE_MAX);
 	const prevAt = prefix[0]?.kind === "summary" ? Number(prefix[0].msg.timestamp) || 0 : 0;
-	const prevNarr = previousNarrative(prev, prevAt, narrativeWords(nb, true) * PREV_CHARS_PER_WORD);
-	const nar = await narrative(prefix, ctx, nb, signal, prevNarr);
+	// The adopted summary is fixed for the lane's epoch; a larger skeleton must not change its input allowance.
+	const prevNarr = previousNarrative(prev, prevAt, narrativeWords(lane ? NARRATIVE_MAX : nb, true) * PREV_CHARS_PER_WORD);
+	const nar = await narrative(prefix, ctx, nb, signal, prevNarr, lane);
 	let text = sk.text;
 	const how = file ? `read an output's file by its handle (${file.dir}/<handle>.txt)` : `${RECALL_TOOL} an output by its handle`;
 	// a narrative over its budget keeps its head and its tail (the key facts come last), not just its head

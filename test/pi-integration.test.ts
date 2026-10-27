@@ -281,7 +281,7 @@ async function rig(setup: (sm: SessionManager) => void = populate, opts: RigOpts
 		if (order === "1.2") busy = true;
 		const r = order === "1.2"
 			? await runner.emit({ type: "before_agent_start", messageType: "user", prompt: text, systemPromptOptions: { cwd: CWD } } as Any)
-			: await runner.emitBeforeAgentStart(text, undefined, { cwd: CWD } as Any);
+			: await runner.emitBeforeAgentStart({ messageType: "user", prompt: text, images: undefined }, { cwd: CWD } as Any);
 		await o.afterStart?.();
 		busy = !o.fail;
 		if (!o.fail) await runner.emit({ type: "agent_start" } as Any);
@@ -1104,8 +1104,8 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 
 	// 0.4.1-0.4.4 (P1): gateway gpt-6.1-sol refuses a request without reasoning (pi-ai sends effort "none" when none is asked for), so
 	// every narrative on it failed (84 calls in 56 minutes on one session with 0.4.1; a skeleton-only summary with 0.4.4)
-	test("a narrative on a reasoning model that refuses effort none is asked again with low effort", async () => {
-		const model = { ...MODEL, provider: "gateway", id: `refuses-none-${order}`, reasoning: true };
+	test("a reasoning narrative selects low effort before the first request", async () => {
+		const model = { ...MODEL, provider: "gateway", id: `refuses-none-${order}`, api: "openai-responses", reasoning: true };
 		const r = await rig(undefined, { file: template(240 * 60_000), tui: true, start: false, model });
 		const ctx = r.runner.createContext(), provider = ctx.modelRegistry.complete;
 		const efforts: (string | undefined)[] = [];
@@ -1119,8 +1119,8 @@ for (const order of ORDERS) describe(`real Pi: a summary prepared while the user
 			const view = r.sm.buildSessionProjection().entries;
 			const p = planContext(view, r.zip.opts(ctx, true, view, 0, true).o)!;
 			expect(r.zip.startBg(p, ctx)).toBe(true);
-			expect((await r.zip.bg.promise)?.llmOk, "a narrative refused for its reasoning effort is retried with low effort").toBe(true);
-			expect(efforts).toEqual([undefined, "low"]); // the refused call does not use up the retry
+			expect((await r.zip.bg.promise)?.llmOk, "a valid low effort is chosen before the narrative request").toBe(true);
+			expect(efforts).toEqual(["low"]); // no none/400 capability probe
 		} finally {
 			ctx.modelRegistry.complete = provider;
 			await r.shutdown();

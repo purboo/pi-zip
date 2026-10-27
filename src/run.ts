@@ -7,15 +7,16 @@ import { dirname, join } from "node:path";
 import { cacheActivity, lastMessageMs, lastPrompt, modelKey, payloadRetention, refused, ttlFor, type ColdInfo } from "./cache.ts";
 import { agentDir, curve, describe, lawPrices, loadStats, pWarm, record, sample, statsPath, GAP_EDGES, type Entry } from "./learn.ts";
 import { repairPayload } from "./guard.ts";
-import { candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, requestBranch, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
+import { artifactsOf, candidateOf, decideEdits, checkEdits, clock, decideRun, inRunClock, requestBranch, want, decideTurnEnd, grow, headOf, planOpts, readyOf, rentOf, runPlanOf, scaleOf, unusedOf, valvePlanOf, SUMMARY_CUSTOM, type Artifact, type Avail, type Env, type Learned } from "./core.ts";
 import { fmtK, Stats, noticeDesc, noticeText, type NoticeAction, type NoticeData, type ZipControl } from "./notice.ts";
 import { applyPlanToMessages, buildBlocks, countUserTurns, G0, keepRecentTokensFor, piCanCompact, piContextTokens, reserveTokensFor, sizeOf, wireTokensOf, UNIT, type Block, type Cut, type FoldTarget, type PlanOpts, type PlanResult, type RunPlan, type Scale, type SysInfo } from "./plan.ts";
 import { handleFor, PH_MARK, RECALL_TOOL } from "./placeholder.ts";
 import { branchOutputs, recalledHandlesFromBranch, resolveHandlesInBranch } from "./recall.ts";
 import { cleanupRecall, commandNamesRecall, fileRecallFor, materialize, parseRecallPath, recallRoot, recallRootShown, rewriteCommand, sidDir, type FileRecall } from "./recallfile.ts";
-import { buildCut } from "./summary.ts";
-import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, textOf, tok4, tokensOf } from "./util.ts";
+import { buildCut, type SummaryLane } from "./summary.ts";
+import { type Any, attempt, COMMIT_CUSTOM, envInt, PRODUCT, piTokensOf, textOf, tok4, tokensOf } from "./util.ts";
 import { pendingSummary, replayGrowth } from "./state.ts";
+import { afterSize, digest, prefixDigest, pressure, safeCut, speedPlan, zipMode, type SpeedStamp } from "./speed.ts";
 import { fmtLife, type CardData, type ChartBin, type StateWord } from "./ui.ts";
 
 export const PLAN_CUSTOM = "pi-zip/plan";
@@ -34,6 +35,7 @@ const CONFLICT_RE = /billion-context|bc-pi|magic-context|smart-compact|hot-compa
  *  AbortController: no run owns it. When it ends with a summary, that summary is recorded (a pi-zip/summary entry, Artifact) and is
  *  ready for any plan whose cut is not shallower (core.ts adopt); the call itself is gone. */
 interface Bg {
+	speed?: SpeedStamp; // frozen speed configuration and prefix; early policy does not use it
 	key: string; // firstKeptEntryId of the cut it is written for
 	head: string; // the head of the projection it reads (core.ts headOf)
 	aborted: boolean;
@@ -107,6 +109,15 @@ export class Zip implements ZipControl {
 	quiet = false;
 	conflict: string | null = null;
 	readonly stats = new Stats();
+	private readonly speed = zipMode() === "speed";
+	private speedTried = new Set<string>();
+	private speedRejected = new Set<string>();
+	private speedSelected: SpeedStamp | null = null;
+	private speedDurations = new Map<string, number[]>();
+	private speedVelocity = 250;
+	private speedDeltas: number[] = [];
+	private speedEpoch = "";
+	private speedSample: { head: string; model: string; tokens: number; at: number; run: number } | null = null;
 	readonly recalled = new Set<string>();
 	private cold = false;
 	private coldReason = "";
@@ -193,7 +204,7 @@ export class Zip implements ZipControl {
 		this.recallMode = mode;
 		this.recallTools = tools;
 		if (!ctx) return;
-		if (mode === "file" && this.fileRecall(ctx)) this.stateLine(ctx, "on", `a tool allowlist hides zip_recall · zipped outputs are read back from files in ${recallRootShown()}`, true, "on:file");
+		if (mode === "file" && this.fileRecall(ctx)) this.stateLine(ctx, "on", `${this.speed ? "original outputs" : "a tool allowlist hides zip_recall · zipped outputs"} are read back from files in ${recallRootShown()}`, true, "on:file");
 		else if (mode === "file") this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · no session file (--no-session), so no recall copies are written either", true, "reread-only:no-session");
 		else if (mode !== "tool") this.stateLine(ctx, "reread-only", "a tool allowlist hides zip_recall · only re-readable outputs fold · allow zip_recall, read, grep or bash to fold more");
 	}
@@ -292,7 +303,7 @@ export class Zip implements ZipControl {
 		if (ctx?.mode !== "tui" || !this.entryRenderer || this.off || this.conflict) return;
 		const flag = `${dirname(process.env.PI_ZIP_CACHE_STATS || statsPath())}/welcomed`;
 		if (attempt(() => existsSync(flag) || (mkdirSync(dirname(flag), { recursive: true }), writeFileSync(flag, new Date().toISOString() + "\n"), false), true)) return;
-		this.stateLine(ctx, "on", "older context gets zipped when the savings pay for the rewrite · /zip");
+		this.stateLine(ctx, "on", this.speed ? "native context until automatic compaction · originals stay recallable from files · /zip" : "older context gets zipped when the savings pay for the rewrite · /zip");
 	}
 
 	ledger(rec: Record<string, unknown>) {
@@ -480,6 +491,7 @@ export class Zip implements ZipControl {
 		this.model = ctx?.model;
 		this.ttlNoticed = false;
 		this.restoreState(branch);
+		if (this.speed && process.env.PI_ZIP_MODE && process.env.PI_ZIP_MODE !== "speed") this.stateLine(ctx, "on", "unknown PI_ZIP_MODE; using speed", true, "mode:invalid");
 		this.nextEdit = pendingSummary(branch) ? this.scaleOf(ctx).O : null;
 		this.detectConflict(ctx);
 		const recallFilesRemoved = attempt(cleanupRecall, 0); // recall copies older than 14 days (they can be written again from the session)
@@ -488,6 +500,7 @@ export class Zip implements ZipControl {
 
 	/** Opening a session only arms a future producer deadline; browsing old history never starts a call. */
 	armProducer(ctx: Any) {
+		if (this.speed) return this.prepareSpeed(ctx);
 		this.want("timer", ctx, undefined, undefined, true);
 	}
 
@@ -601,6 +614,7 @@ export class Zip implements ZipControl {
 	 *  as it was, apart from the compaction, which is pi-zip's own summary with its exact size before. A steer or a follow-up (Pi is
 	 *  streaming) belongs to the run in progress. */
 	async input(e: Any, ctx: Any): Promise<void> {
+		if (this.speed) return; // automatic compaction owns adoption; input has no fresh user ID yet
 		if (e?.streamingBehavior) return;
 		this.inputs++;
 		if (this.door) await this.door; // the idle door at work: it sees this input and stays shut, or its compaction (milliseconds) ends first
@@ -638,6 +652,7 @@ export class Zip implements ZipControl {
 	/** before_agent_start: the prompt's run (its input carried the decision), or on Pi 1.2.0 a run an extension's message starts
 	 *  (messageType "custom"), which begins here, once, as a driven run. */
 	async beforeAgentStart(ctx: Any, e?: Any): Promise<void> {
+		if (this.speed) { this.startKind = e?.messageType === "custom" ? "driven" : "prompt"; this.detectConflict(ctx); return; }
 		this.runStarts++;
 		if (e?.messageType === "custom") {
 			this.start = null;
@@ -652,6 +667,7 @@ export class Zip implements ZipControl {
 	 *  prompt's run takes what its input decided; a run an extension's message started (no before_agent_start on Pi 1.1.0) gets the same
 	 *  start-of-run handling, minus Pi's compaction (ctx.compact() aborts the run that is starting): a prepared summary waits for turn_end. */
 	async agentStart(ctx: Any): Promise<void> {
+		if (this.speed) { this.runStarts++; this.inRun = true; this.runUserSeen = this.startKind === "driven" ? 1 : 0; this.startKind = null; this.liveCtx = ctx; this.model = ctx.model; return; }
 		const kind = this.startKind, s = this.start;
 		this.runStarts++;
 		this.startKind = null;
@@ -771,11 +787,132 @@ export class Zip implements ZipControl {
 		else if (!carried && ready) this.nativeNote = { native: "no idle input before this prompt's run" };
 	}
 
+	/** Read the actual selected model and settings at every speed decision; unavailable information fails closed. */
+	private speedState(ctx: Any, entries?: Any[], drafts: Any[] = []) {
+		if (!this.active() || !this.recallSid(ctx)) return null;
+		if (this.recallMode !== "tool" && !this.fileRecall(ctx)) return null;
+		try {
+			const settings = this.pi.getSettings?.(), model = ctx.model;
+			if (!settings || typeof settings !== "object") return null;
+			const branch = this.branch(ctx), view = entries ?? ctx.sessionManager.buildSessionProjection().entries;
+			const epoch = digest([this.sessionId(ctx), headOf(branch), modelKey(model), model?.baseUrl]);
+			if (this.speedEpoch !== epoch) {
+				this.speedEpoch = epoch;
+				this.speedDeltas = [];
+				this.speedVelocity = 250;
+				this.speedSample = null;
+			}
+			const p = pressure(model, settings, this.speedDeltas, this.speedVelocity, this.speedDurations.get(modelKey(model)) ?? []);
+			if (!p) return null;
+			const identity = digest([this.sessionId(ctx), headOf(branch), model, settings?.compaction ?? {}, this.sysInfo(ctx), this.recallMode, this.fileRecall(ctx)]);
+			const tokens = piContextTokens(view, branch, drafts);
+			if (!Number.isFinite(tokens) || tokens < 0) return null;
+			return { p, settings, branch, view, identity, model, scale: this.scaleOf(ctx, view), tokens };
+		} catch { return null; }
+	}
+
+	/** Speed candidates are scoped by configuration as well as head/cut; keep an older valid model's artifact on a switch back. */
+	private speedArtifacts(branch: Any[]): Artifact[] {
+		const byPrefix = new Map<string, Artifact>();
+		for (const a of [...artifactsOf(branch), ...this.mine]) if (a.speed && a.head === headOf(branch)) byPrefix.set(digest([a.speed.identity, a.speed.prefix]), a);
+		return [...byPrefix.values()];
+	}
+
+	private fittingSpeed(a: Artifact, state: NonNullable<ReturnType<Zip["speedState"]>>) {
+		const { cut, speed } = a;
+		if (cut?.llmOk !== true || typeof cut.text !== "string" || !cut.text.trim() || !speed || !Number.isSafeInteger(speed.target) || speed.target <= 0 || speed.target >= state.p.T || this.speedRejected.has(digest(speed)) || speed.identity !== state.identity || a.head !== headOf(state.branch)) return null;
+		const blocks = buildBlocks(state.view, this.steerIds), at = blocks.findIndex(b => b.entryId === cut.firstKeptEntryId);
+		if (at < 1 || prefixDigest(blocks, at) !== speed.prefix || !safeCut(blocks, at, state.model)) return null;
+		if (blocks.slice(at).reduce((n, b) => n + piTokensOf(b.msg), 0) < state.p.keep) return null;
+		const after = afterSize(blocks, at, cut.text, state.scale);
+		return after <= speed.target ? { after, cut, speed } : null;
+	}
+
+	/** Fire and forget: no caller awaits a worker or its cancellation. Existing artifacts retain all charges. */
+	private prepareSpeed(ctx: Any, entries?: Any[], drafts: Any[] = [], sample = true) {
+		if (ctx?.signal?.aborted) return; // Esc belongs to the foreground; a valid worker keeps its own signal
+		this.liveCtx = ctx;
+		const state = this.speedState(ctx, entries, drafts);
+		if (!state) { this.discardBg("replaced"); return; }
+		const { branch, view, model, identity, tokens, scale } = state;
+		const head = headOf(branch);
+		// Only main boundaries observe growth. A worker wake checks readiness against the current projection.
+		if (sample) {
+			const now = performance.now(), mk = modelKey(model), prior = this.speedSample;
+			if (prior && prior.head === head && prior.model === mk && tokens > prior.tokens) {
+				const delta = tokens - prior.tokens;
+				this.speedDeltas = [...this.speedDeltas.slice(-19), delta];
+				if (this.inRun && prior.run === this.runStarts) this.speedVelocity = .9 * this.speedVelocity + .1 * delta / Math.max(.1, (now - prior.at) / 1000);
+			}
+			this.speedSample = { head, model: mk, tokens, at: now, run: this.runStarts };
+		}
+		const p = pressure(model, state.settings, this.speedDeltas, this.speedVelocity, this.speedDurations.get(modelKey(model)) ?? [])!;
+		state.p = p;
+		const artifacts = this.speedArtifacts(branch);
+		if (this.bg) {
+			const blocks = buildBlocks(view, this.steerIds), at = blocks.findIndex(b => b.entryId === this.bg!.key);
+			if (this.bg.head !== head || this.bg.speed?.identity !== identity || at < 1 || prefixDigest(blocks, at) !== this.bg.speed.prefix) this.discardBg("replaced");
+		}
+		if (tokens < p.P || this.bg || artifacts.some(a => this.fittingSpeed(a, state))) return;
+		const desired = speedPlan(view, model, p, scale, this.steerIds, identity);
+		if (!desired?.speed || artifacts.some(a => !a.cut?.llmOk && a.speed?.identity === identity && a.speed?.prefix === desired.speed!.prefix)) return;
+		// A now-oversized ready result stays immutable while a deeper legal prefix is prepared.
+		const blocks = desired.blocks;
+		const skip = new Set(artifacts.filter(a => a.cut?.llmOk && a.speed?.identity === identity && prefixDigest(blocks, blocks.findIndex(b => b.entryId === a.key)) === a.speed.prefix).map(a => a.key));
+		const plan = skip.size ? speedPlan(view, model, p, scale, this.steerIds, identity, skip) : desired;
+		if (!plan?.speed) return;
+		if (this.fileRecall(ctx)) plan.fileRecall = this.fileRecall(ctx);
+		const tried = digest([plan.speed.identity, plan.speed.prefix]);
+		if (this.speedTried.has(tried) || [...artifactsOf(branch), ...this.mine].some(a => a.head === head && a.speed?.identity === identity && a.speed?.prefix === plan.speed!.prefix)) return;
+		this.speedTried.add(tried);
+		this.startBg(plan, ctx);
+	}
+
+	private speedCompaction(e: Any, ctx: Any) {
+		if (!ctx || !["threshold", "overflow"].includes(e?.reason) || e.signal?.aborted) return undefined;
+		const state = this.speedState(ctx);
+		const miss = () => { this.ledger({ type: "missed_ready", reason: e.reason }); return undefined; };
+		if (!state || digest(e.branchEntries) !== digest(state.branch) || state.tokens < state.p.T && e.reason !== "overflow") return miss();
+		for (const a of this.speedArtifacts(state.branch).reverse()) {
+			const fit = this.fittingSpeed(a, state);
+			if (!fit) continue;
+			this.speedSelected = fit.speed;
+			return { compaction: { summary: fit.cut.text, firstKeptEntryId: fit.cut.firstKeptEntryId,
+				tokensBefore: state.tokens, usage: fit.cut.usage,
+				details: { by: PRODUCT, via: "speed", target: fit.speed.target, after: fit.after } } };
+		}
+		return miss();
+	}
+
+	sessionCompacted(e: Any, ctx: Any) {
+		if (!this.speed) return;
+		const saved = e.compactionEntry;
+		if (!this.branch(ctx).some(en => en.id === saved?.id)) return;
+		this.discardBg("replaced");
+		this.speedSelected = null;
+		this.speedEpoch = "";
+		this.speedSample = null;
+		this.speedDeltas = [];
+		this.speedVelocity = 250;
+		if (saved?.details?.by !== PRODUCT || saved.details.via !== "speed") return;
+		const a = [...this.mine, ...this.branch(ctx).filter(en => en.customType === SUMMARY_CUSTOM).map(en => en.data)].find(a => a.speed && a.cut?.text === saved.summary && a.key === saved.firstKeptEntryId);
+		if (!a || saved.details.after > a.speed!.target) return;
+		this.stats.summaries++;
+		this.ledger({ type: "summary", via: "speed", waitedMs: 0, target: a.speed!.target, after: saved.details.after });
+	}
+
+	/** Reject the selection after failure. Pi may already have changed its in-memory branch before a disk write fails. */
+	sessionCompactFailed() {
+		if (this.speedSelected) this.speedRejected.add(digest(this.speedSelected));
+		this.speedSelected = null;
+	}
+
 	/** session_before_compact: answers ONLY the compaction pi-zip itself asked for a moment ago (nativeAsk): its own summary and its own
 	 *  tokensBefore. Pi's threshold and overflow compactions, /compact and other extensions' compactions get undefined and run untouched.
 	 *  Once pi-zip has given up on its compaction (compaction null), a late ask of it is cancelled, never one with a live signal: that is
 	 *  another compaction (pi-zip's own was aborted). */
-	sessionBeforeCompact(e?: Any): Any {
+	sessionBeforeCompact(e?: Any, ctx?: Any): Any {
+		if (this.speed) return this.speedCompaction(e, ctx);
 		const a = this.nativeAsk;
 		if (typeof e?.customInstructions === "string" && e.customInstructions.startsWith(NATIVE_MARKER)) {
 			// pi-zip's own compaction: answered, once, while its ask is open; cancelled otherwise (never left to Pi's default summariser, which
@@ -1105,6 +1242,13 @@ export class Zip implements ZipControl {
 
 
 	async context(e: Any, ctx: Any): Promise<Any> {
+		if (this.speed) {
+			this.liveCtx = ctx;
+			this.detectConflict(ctx);
+			if (!this.active()) this.discardBg("replaced");
+			this.requestStart(ctx);
+			return undefined; // even malformed native payloads stay byte-identical
+		}
 		if (!this.active()) return void this.requestStart(ctx);
 		if (this.starting) await this.starting; // agent_start's start-of-run handling of a driven run
 		if (ctx?.signal?.aborted) return undefined;
@@ -1206,6 +1350,12 @@ export class Zip implements ZipControl {
 
 	/** Settle writes pending artifact records and prepares another return in every mode. */
 	async settle(e: Any, ctx: Any): Promise<Any> {
+		if (this.speed) {
+			this.inRun = false;
+			const records = this.drafts();
+			this.prepareSpeed(ctx, e.context.contextEntries, e.entries);
+			return records.length ? { entries: [...e.entries, ...records] } : undefined;
+		}
 		this.inRun = false;
 		const recs = this.drafts();
 		this.want("settle", ctx, undefined, e.context.contextEntries);
@@ -1267,6 +1417,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's idle warming is a cache touch, never a producer wake or an answer to Pi's decision. */
 	cacheWarmingDecision(e: Any, ctx: Any): undefined {
+		if (this.speed) return undefined; // Pi alone owns refresh scheduling, no content decision here
 		if (e?.action === "warm") this.lastReqMs = Date.now();
 		this.want("timer", ctx);
 		if (e?.action === "warm") this.armDoor(ctx, false); // the touch moved the door's moments
@@ -1276,12 +1427,13 @@ export class Zip implements ZipControl {
 	/** Each completed call teaches its starting model and books its artifact once, whether it ran at the room or in the background.
 	 *  A failed narrative still yields a summary (the deterministic sections, the previous narrative carried and marked possibly stale):
 	 *  dropping it left a session whose every narrative failed (a cap below the reply, 0.4.0/0.4.1) without any summary, retrying forever. */
-	private completed(c: Cut, model: string, head: string, key: string, estimated = 0, prefixReal = c.prefixTokens) {
+	private completed(c: Cut, model: string, head: string, key: string, estimated = 0, prefixReal = c.prefixTokens, speed?: SpeedStamp) {
 		const learned = record(model, { explicit: false, total: 0, call: { ms: c.ms, tokens: Math.max(1, prefixReal) } });
 		if (this.entKey === model) this.ent = learned;
 		const usd = c.llmOk || c.costUsd > 0 ? c.costUsd : estimated;
 		this.stats.summaryUsd += usd;
-		this.record({ head, key, cut: c, usd, ...(c.llmOk || c.costUsd > 0 ? {} : { estimated: true }) });
+		if (speed && c.llmOk) this.speedDurations.set(model, [...(this.speedDurations.get(model) ?? []).slice(-19), c.ms / 1000]);
+		this.record({ head, key, cut: c, usd, ...(speed ? { speed } : {}), ...(c.llmOk || c.costUsd > 0 ? {} : { estimated: true }) });
 	}
 
 	/** Write the summary for `p` in the background (its own abort signal: nothing is running, so the run's would be stale). Nothing
@@ -1290,31 +1442,40 @@ export class Zip implements ZipControl {
 		const branch = this.branch(ctx), head = headOf(branch), key = p.firstKeptEntryId, model = modelKey(ctx.model);
 		if (key === null) return false;
 		if (this.bg) {
-			if (this.bg.aborted) {
+			if (this.bg.aborted && !p.speed) {
 				const gen = this.timerGen;
 				void this.bg.promise.then(() => { if (gen === this.timerGen && this.active() && headOf(this.branch(ctx)) === head) this.startBg(p, ctx, room); });
 			}
 			return false;
 		}
-		if (!room && readyOf(branch, this.mine).some((a) => a.key === key)) return false;
+		if (!room && readyOf(branch, this.mine).some((a) => a.key === key && (!p.speed || a.speed?.identity === p.speed.identity && a.speed?.prefix === p.speed.prefix))) return false;
 		const controller = new AbortController();
 		const prevSum = p.blocks[0]?.kind === "summary" ? p.blocks[0].tokens : 0;
 		const estUsd = (p.scale.c * Math.max(0, p.prefixTokens - prevSum) * (Number(ctx?.model?.cost?.input) || 0)) / 1e6;
-		const bg: Bg = { key, head, aborted: false, promise: Promise.resolve(null), controller, estUsd };
-		const end = () => { if (this.bg === bg) this.bg = null; };
-		bg.promise = buildCut(p, ctx, controller.signal)
+		const bg: Bg = { key, head, aborted: false, promise: Promise.resolve(null), controller, estUsd, speed: p.speed };
+		const gen = this.timerGen, sid = this.sessionId(ctx);
+		const end = () => {
+			if (this.bg !== bg) return;
+			this.bg = null;
+			// Release the only worker slot first. Re-read the current projection, never the captured plan.
+			if (p.speed) queueMicrotask(() => {
+				const current = this.liveCtx ?? ctx;
+				if (gen === this.timerGen && this.active() && this.sessionId(current) === sid) this.prepareSpeed(current, undefined, [], false);
+			});
+		};
+		bg.promise = buildCut(p, ctx, controller.signal, p.speed ? this.summaryLane(ctx, head, p.speed.identity) : undefined)
 			.then((c) => {
 				if (bg.aborted || !c) return null;
-				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens);
+				this.completed(c, model, head, key, estUsd, p.scale.c * c.prefixTokens, p.speed);
 				this.ledger({ type: "away_summary", key, ms: c.ms, llmOk: c.llmOk, ...(c.llmOk ? {} : { llmError: c.llmError }), costUsd: c.costUsd, ...this.usageOf(c) });
-				if (!this.inRun) this.armDoor(this.liveCtx ?? ctx, true); // finished while Pi is idle: the door asks now (a run's settle asks otherwise)
+				if (!this.speed && !this.inRun) this.armDoor(this.liveCtx ?? ctx, true); // finished while Pi is idle: the door asks now (a run's settle asks otherwise)
 				return c;
 			})
 			.catch((err) => {
 				if (!bg.aborted) {
 					this.stats.summaryUsd += estUsd;
 					const error = err instanceof Error ? err.message : String(err);
-					this.record({ head, key, usd: estUsd, estimated: true, lost: "failed", error });
+					this.record({ head, key, usd: estUsd, estimated: true, lost: "failed", error, ...(p.speed ? { speed: p.speed } : {}) });
 					this.ledger({ type: "error", where: "away_summary", error });
 				}
 				return null;
@@ -1326,6 +1487,12 @@ export class Zip implements ZipControl {
 	}
 
 	async turnEnd(e: Any, ctx: Any): Promise<Any> {
+		if (this.speed) {
+			const fresh = this.collectSteer(e);
+			if (e.message?.stopReason !== "error" && e.message?.stopReason !== "aborted") this.prepareSpeed(ctx, e.context.contextEntries, e.entries);
+			const records = [...this.drafts(), ...(fresh.length ? [{ type: "custom", customType: STEER_CUSTOM, data: { ids: fresh } }] : [])];
+			return records.length ? { entries: [...e.entries, ...records] } : undefined;
+		}
 		this.logForeign(ctx, "turn_end");
 		if (!this.active()) return undefined;
 		try {
@@ -1511,6 +1678,7 @@ export class Zip implements ZipControl {
 
 	/** Pi's model_select (/model, cycling, restore): a switch in the middle of a run is not seen by any run start. */
 	modelSelect(model: Any) {
+		if (this.speed) this.discardBg("replaced");
 		if (model) this.model = model;
 	}
 
@@ -1547,17 +1715,51 @@ export class Zip implements ZipControl {
 		if (this.off) return undefined; // strict no-op
 		const uid = stickyFits(m, p) && this.stickyOf(sk) !== "off" ? stickyUserId(this.sessionId(ctx)) : undefined;
 		if (!uid) return this.guarded(p, false);
-		// the headers, key and base URL Pi resolves for the request (models.json headers never reach ctx.model), once per model
-		if (!this.stickyAuth.has(sk)) this.stickyAuth.set(sk, Promise.resolve(attempt(() => ctx?.modelRegistry?.getApiKeyAndHeaders?.(m), null)).then((a: Any) =>
-			/claude-cli/i.test(JSON.stringify(a?.headers ?? {})) || /sk-ant-oat/.test(String(a?.apiKey ?? "")) || /^https?:\/\/api\.anthropic\.com/i.test(String(a?.baseUrl ?? m.baseUrl ?? "")), () => false));
-		return this.stickyAuth.get(sk)!.then((cc) => {
-			if (cc) return this.guarded(p, false);
+		return this.stickyPayload(p, ctx, this.sessionId(ctx)).then((payload) => {
+			if (!payload) return this.guarded(p, false);
 			if (was !== sk) this.ledger({ type: "sticky", key: sk });
 			this.stickyKey = sk;
-			return this.guarded({ ...p, metadata: { user_id: uid } }, true);
+			return this.guarded(payload, true);
 		});
 	}
+	/** Shared routing policy; callers own their request key and refusal counter. */
+	private async stickyPayload(p: Any, ctx: Any, sid: string): Promise<Any> {
+		const m = ctx?.model ?? this.model, sk = `${modelKey(m)}@${m?.baseUrl ?? ""}`;
+		const uid = !this.off && stickyFits(m, p) && this.stickyOf(sk) !== "off" ? stickyUserId(sid) : undefined;
+		if (!uid) return undefined;
+		// Pi's resolved auth may add identity headers or a different endpoint not present on ctx.model.
+		if (!this.stickyAuth.has(sk)) this.stickyAuth.set(sk, Promise.resolve(attempt(() => ctx?.modelRegistry?.getApiKeyAndHeaders?.(m), null)).then((a: Any) =>
+			/claude-cli/i.test(JSON.stringify(a?.headers ?? {})) || /sk-ant-oat/.test(String(a?.apiKey ?? "")) || /^https?:\/\/api\.anthropic\.com/i.test(String(a?.baseUrl ?? m.baseUrl ?? "")), () => false));
+		return await this.stickyAuth.get(sk) ? undefined : { ...p, metadata: { user_id: uid } };
+	}
+	private stickyResponse(sk: string | null, m: Any, strikes: number): number {
+		const err = String(m?.errorMessage ?? ""), ok = !!sk && this.stickyOf(sk) === "ok";
+		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") {
+			strikes = 0;
+			if (!ok) { this.stickyOf(sk, "ok"); this.ledger({ type: "sticky_ok", key: sk }); }
+		}
+		const in400 = !!sk && refused(m) && /^4(00|22)\b/.test(err) && !/too long|exceed/i.test(err) && ++strikes >= (ok ? 2 : 1);
+		if (sk && refused(m) && (/metadata|user_id/i.test(err) || in400)) {
+			this.stickyOf(sk, "off");
+			strikes = 0;
+			this.ledger({ type: "sticky_off", key: sk, error: err.slice(0, 200) });
+		}
+		return strikes;
+	}
+	private summaryLane(ctx: Any, head: string, identity: string): SummaryLane {
+		const hash = digest([this.sessionId(ctx), head, identity]);
+		const laneCtx = { model: ctx.model, modelRegistry: ctx.modelRegistry };
+		// The existing relay format takes a UUID-shaped session id; keep the summary lane separate and deterministic.
+		const sid = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+		let sent = false, strikes = 0;
+		const sk = `${modelKey(ctx.model)}@${ctx.model?.baseUrl ?? ""}`;
+		return { sessionId: `zip-summary-${hash}`, cacheRetention: this.tier(ctx.model) ?? "short",
+			onPayload: async (p: Any) => { const out = await this.stickyPayload(p, laneCtx, sid); sent = !!out; return out; },
+			onResult: (m: Any) => { strikes = this.stickyResponse(sent ? sk : null, m, strikes); },
+		};
+	}
 	private guarded(p: Any, changed: boolean): Any {
+		if (this.speed) return changed ? p : undefined;
 		const r = repairPayload(p);
 		if (r) this.ledger({ type: "guard_repair", repaired: r.repaired });
 		return r ? r.payload : changed ? p : undefined;
@@ -1570,16 +1772,7 @@ export class Zip implements ZipControl {
 		}
 		if (m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted") this.lastReqMs = Date.now(); // the response is complete: the entry was refreshed when it finished
 		else if (refused(m)) this.lastReqMs = Math.max(this.reqMsBefore, lastMessageMs(requestBranch(this.branch(ctx ?? this.liveCtx)))); // the provider refused the request: it touched no cache (cache.ts lastMessageMs reads the branch the same way)
-		const sk = this.stickyKey, err = String(m?.errorMessage ?? ""), ok = !!sk && this.stickyOf(sk) === "ok";
-		if (sk && m?.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && ((this.sticky400 = 0), !ok)) (this.stickyOf(sk, "ok"), this.ledger({ type: "sticky_ok", key: sk }));
-		// a refusal that names the field; a 400 ("400 status code (no body)" too; Pi does not retry it) to a model that never answered it,
-		// or the second in a row to one that did; a prompt too long does not count
-		const in400 = !!sk && refused(m) && /^4(00|22)\b/.test(err) && !/too long|exceed/i.test(err) && ++this.sticky400 >= (ok ? 2 : 1);
-		if (sk && refused(m) && (/metadata|user_id/i.test(err) || in400)) {
-			this.stickyOf(sk, "off");
-			this.sticky400 = 0;
-			this.ledger({ type: "sticky_off", key: sk, error: err.slice(0, 200) });
-		}
+		this.sticky400 = this.stickyResponse(this.stickyKey, m, this.sticky400);
 		if (m?.role === "user" && this.active()) {
 			// the first user message of a run is the prompt; later ones (steering, follow-up) are part of that run's turn. Pi does not mark them, we do.
 			if (this.runUserSeen++ > 0 && typeof m.timestamp === "number") this.steerTs.add(m.timestamp);

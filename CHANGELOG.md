@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0-next.0
+
+- Speed mode is the default. It preserves native context and tools until Pi's automatic compaction, prepares summaries in
+  the background, and supplies only a ready, validated summary. Zip never makes the foreground wait for its worker;
+  unavailable or unsafe candidates leave Pi's native recovery available, which can wait for Pi's own summary.
+  Set `PI_ZIP_MODE=early` to select the existing economic folding policy.
+- Recent requests remain verbatim under the two-user-turn guard and recent-token floor. Unsafe retained reasoning,
+  unresolved virtual models, invalid settings, and sessions without a usable recall route defer to native recovery.
+  Default persisted sessions recall originals through the existing file tools; compaction never activates a tool.
+- Summary lanes have stable routing identity and instruction prefixes, including a fixed previous-narrative allowance
+  within each compaction epoch. Effort is selected before dispatch, and thinking budgets stay within the serialized output
+  cap for every supported level, including `xhigh` and `max`, in both modes.
+- Worker completion checks current readiness and prepares a replacement when suffix growth makes the first candidate
+  insufficient. Incompatible prefix edits cancel obsolete work. Readiness checks do not record main growth or reset its
+  clock; forecast history stays separate from economic learning and resets with its session/model/compaction epoch.
+- Offline regressions compare complete Anthropic Messages and OpenAI Responses requests against native Pi, including disk
+  reopen, opaque reasoning, a completed recall turn, and continuation. Mutation checks demonstrate that the acceptance
+  assertions detect the reviewed failures.
+- Pi 1.4.0 appends in memory before writing to disk. Native and zip compactions share that persistence limitation: a failed
+  write can leave a summary in memory that is absent after reopening the session file. Pi remains unpatched.
+- Validated offline only. Provider acceptance, reasoning quality, cache reuse, upstream contention and latency have not
+  been evaluated live; no live performance improvement is claimed. `PI_ZIP_MODE=early` restores the 0.4.15 behavior.
+
 ## 0.4.15
 
 - No behavior change. Removed local machine paths, a session name and private provider names from comments, docs and

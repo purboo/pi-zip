@@ -1,3 +1,4 @@
+import type { SpeedStamp } from "./speed.ts";
 // The decision core: view, clock, law, plan and decide as pure functions of the session branch, what pi-zip has learned (Λ) and
 // the time. Nothing here reads a file, Pi or the clock, and nothing here has an effect: run.ts (the shell) gathers the inputs at Pi's
 // events, keeps what only the process holds (the summary call in the background, the timers) and carries out what these return.
@@ -17,6 +18,7 @@ export const SUMMARY_CUSTOM = "pi-zip/summary"; // a summary call pi-zip made in
  *  fallback summary (cut.llmOk false, cut.llmError why), READY like any other. A summary is READY while its head is the branch's head;
  *  using it (a compaction with its text) or any other compaction moves the head, so it is never taken twice. */
 export interface Artifact {
+	speed?: SpeedStamp;
 	head: string;
 	key: string;
 	cut?: Cut;

@@ -12,3 +12,6 @@ writeFileSync(join(dirname(process.env.PI_ZIP_CACHE_STATS), "welcomed"), "test\n
 process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), "pi-zip-test-cache-"));
 // ... and reads Pi's global settings (cacheWarming, src/run.ts idleWarming) from a throwaway agent directory, never ~/.pi/agent.
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-zip-test-agent-"));
+
+// Historical policy suites assert the economic planner. Speed suites explicitly select the new default.
+process.env.PI_ZIP_MODE = "early";

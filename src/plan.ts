@@ -1,3 +1,4 @@
+import type { SpeedStamp } from "./speed.ts";
 // Pure planning: session projection -> which outputs to fold, whether to summarise, where to cut (F5-F10).
 import { classifyRecoverability, type Recover } from "./classify.ts";
 import { handleFor, makePlaceholderFor, pickKeyLines, RECALL_TOOL, shortArgs } from "./placeholder.ts";
@@ -622,6 +623,7 @@ export interface PlanOpts {
 }
 
 export interface PlanResult {
+	speed?: SpeedStamp;
 	blocks: Block[];
 	calls: Calls;
 	folds: FoldTarget[];

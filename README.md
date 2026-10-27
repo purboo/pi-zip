@@ -1,8 +1,8 @@
 # pi-zip
 
-Keeps long [Pi](https://github.com/earendil-works/pi) sessions cheap without losing anything.
+Prepares recallable summaries for long [Pi](https://github.com/earendil-works/pi) sessions while preserving native context until automatic compaction.
 
-pi-zip keeps recent work in full, folds older tool output and summarises older history when the savings pay for the cache rewrite. Summaries are prepared in the background, and hidden originals can be fetched back byte for byte. No configuration, no proxy process, no footer.
+The default speed mode prepares summaries in the background and uses a ready, validated result only through Pi's automatic compaction. Pending or unsafe summaries fall back to Pi's native recovery. Recent requests stay verbatim, and originals remain available from the persisted session through recall files. There is no tool activation at the switch.
 
 ## Install
 
@@ -14,7 +14,15 @@ pi install git:github.com/purboo/pi-zip
 
 Try it for one run without installing: `pi -e npm:pi-zip`.
 
-## How it works
+## Modes
+
+`PI_ZIP_MODE=speed` is the default, including when unset. Before automatic pressure compaction, model-visible context and tools match native Pi; eligible relay requests keep the existing stable routing metadata. Zip never waits for its summary worker on the foreground path. Native fallback can still wait for Pi's own summary.
+
+Default persisted sessions use recall files through `read`, `grep` or `bash`; explicit tool selections remain fixed. No-session cases, unresolved virtual routes, invalid settings, or unsafe retained reasoning keep native recovery. V1 retains the two-user-turn guard and has no deeper-cut exception. See [the speed design](docs/speed-first.md) for thresholds, offline validation and limits. Pi owns compaction persistence: a disk write failure can leave a compaction in memory without its JSONL entry, as with native automatic compaction. This mode has not received a live quality or latency evaluation.
+
+Set `PI_ZIP_MODE=early` to opt into the existing economic folding policy below.
+
+## Early folding mode
 
 - **Fold.** An old tool output (a test run, a file read, a command) is replaced by a short placeholder: what produced it, its size, its key lines and a handle. The original stays in the session file, and the model gets it back byte for byte with `zip_recall`.
 - **Summarise.** When folding is not enough, older history is replaced by one summary, written in the background while you work or are away. It quotes your first and newest requests word for word and indexes earlier outputs by handle; recall can still search every one of them.
@@ -27,7 +35,7 @@ The rules, the decision formula, what is proved about it (partly machine-checked
 
 ## Results
 
-Live A/B runs on the same coding tasks (4 task templates × 4 seeds, the user away between prompts as stated), paired by task, 95% bootstrap intervals. BC = [billion-context](https://github.com/ranxianglei/billion-context) with its defaults. These are the versions named in the table, not a live evaluation of 0.4.x.
+Live A/B runs on the same coding tasks (4 task templates × 4 seeds, the user away between prompts as stated), paired by task, 95% bootstrap intervals. BC = [billion-context](https://github.com/ranxianglei/billion-context) with its defaults. These are the historical early-policy versions named in the table, not a live evaluation of the default speed mode.
 
 | Model (pi-zip version) | Cost vs BC | Speed | Quality (task done / planted facts recalled) |
 |---|---|---|---|
@@ -49,6 +57,8 @@ Known limits:
 - **Short sessions** with small contexts have little to save.
 
 ## What you see
+
+Speed adoption uses Pi's compaction row and keeps `/zip` accounting. The folding notices below describe early mode.
 
 One mark, ƶ, and three words: **zipped**, **unzip**, **summarized**. At most one line per turn, only when the context changed:
 
@@ -124,21 +134,21 @@ zip_recall({ handle: "k3f9a0x1qz", range: "120-240" })
 zip_recall({ grep: "ECONNREFUSED" })     // no handle: searches every earlier tool output
 ```
 
-Recall is exact, paged and also reaches outputs from before a summary or compaction. When a tool allowlist hides `zip_recall`, the same originals are written on demand to files under `~/.cache/pi-zip/recall/` for `read`, `grep` or `bash`. Paging, search rules, recall files and their privacy are in [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#recall).
+Recall is exact, paged and also reaches outputs from before a summary or compaction. In default speed mode, or when a tool allowlist hides `zip_recall`, the same originals are written on demand to files under `~/.cache/pi-zip/recall/` for `read`, `grep` or `bash`. Paging, search rules, recall files and their privacy are in [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#recall).
 
 ## With other extensions
 
-If another extension that manages context is loaded (billion-context, magic-context, pi-smart-compact, pi-hot-compact, pi-context-prune, …), pi-zip pauses folding, says so once and keeps only its request guard: two writers on the same view give unpredictable results. `/zip` shows `paused`.
+If another extension that manages context is loaded (billion-context, magic-context, pi-smart-compact, pi-hot-compact, pi-context-prune, …), pi-zip pauses its context policy and says so once: two writers on the same view give unpredictable results. `/zip` shows `paused`.
 
-An extension that only writes Pi's compaction summaries (a `session_before_compact` handler) does not pause pi-zip. **If your extension handles every `session_before_compact`, return `undefined` when `event.customInstructions` starts with `[pi-zip native compaction`.** pi-zip answers its own ask.
+An extension that only writes Pi's compaction summaries (a `session_before_compact` handler) does not pause pi-zip. **If your extension handles every `session_before_compact`, return `undefined` when `event.customInstructions` starts with `[pi-zip native compaction`.** Early mode answers its own ask; speed mode answers only automatic threshold/overflow compactions with a ready result.
 
-The request guard also repairs a tool result that lost its tool call before the request is sent, instead of letting the provider reject it. Details: [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#coexistence).
+In early mode, the request guard also repairs a tool result that lost its tool call before the request is sent, instead of letting the provider reject it. Details: [docs/details.md](https://github.com/purboo/pi-zip/blob/master/docs/details.md#coexistence).
 
 ## FAQ
 
 **Will it save money?** Mostly on cold returns, where a long session pays for a full cache rewrite anyway. `/zip` shows what this session folded, what its summaries cost and how often the model recalled.
 
-**Does it cost extra?** Planning is local. A summary is one extra model call with no tools; its price is weighed before the call is made, and every call, used or not, is counted in `/zip`.
+**Does it cost extra?** Planning is local. A summary is one extra model call with no tools; early mode weighs its price before the call is made, while speed mode schedules from pressure, and every call, used or not, is counted in `/zip`.
 
 **Can the model lose information?** Folded outputs keep their key lines and a handle, and the placeholder tells the model not to guess. Summaries quote your first and newest requests word for word and never paraphrase the model's reasoning. A model that ignores the handle and guesses anyway is a failure pi-zip cannot catch, which is why recent turns are protected.
 

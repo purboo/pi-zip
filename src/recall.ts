@@ -1,3 +1,4 @@
+import { zipMode } from "./speed.ts";
 // zip_recall (F3): exact, batched retrieval of folded originals from the session file (I2).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { handleFor, RECALL_TOOL, shortArgs } from "./placeholder.ts";
@@ -246,6 +247,7 @@ export interface RecallHooks {
 export function registerRecallTool(pi: ExtensionAPI, hooks: RecallHooks) {
 	pi.registerTool({
 		name: RECALL_TOOL,
+		...(zipMode() === "speed" ? { defaultActive: false } : {}),
 		label: "Recall folded output",
 		description:
 			"Get back the EXACT original of earlier tool outputs of this session that are no longer shown in full: a [folded by pi-zip …] block, or an output " +

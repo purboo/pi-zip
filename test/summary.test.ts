@@ -460,13 +460,13 @@ describe("a reasoning model whose provider refuses effort none (gateway gpt-6.1-
 	const refusing = (efforts: (string | undefined)[]) => async (_m: Any, _c: Any, o: Any) => (efforts.push(o?.reasoningEffort), o?.reasoningEffort
 		? { stopReason: "stop", content: [{ type: "text", text: "narrative" }], usage: { cost: { total: 0.01 } } }
 		: { stopReason: "error", errorMessage: REFUSED, usage: { cost: { total: 0 } } });
-	test("asked again with low effort without using up the retry, then low at once for that model", async () => {
+	test("low effort on the first call, including a fresh model object", async () => {
 		const efforts: (string | undefined)[] = [];
 		const ctx = { model: { provider: "gateway", id: "unit-refuses-none", reasoning: true }, modelRegistry: { complete: refusing(efforts) } } as Any;
 		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);
-		expect(efforts).toEqual([undefined, "low"]);
+		expect(efforts).toEqual(["low"]);
 		expect((await narrative(buildBlocks([U("u", "work"), A("a")]), ctx, 1000)).ok).toBe(true);
-		expect(efforts).toEqual([undefined, "low", "low"]);
+		expect(efforts).toEqual(["low", "low"]);
 	});
 	test("a model without reasoning is not asked for an effort; other errors are not read as a refused effort", async () => {
 		const efforts: (string | undefined)[] = [];
